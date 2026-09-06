@@ -20,6 +20,7 @@ intera", aveva senso assegnare un id per item in coda; ora che l'unita' e'
 (tutte le posizioni della stessa finestra), quindi la sua assegnazione
 torna naturalmente a monte, nel builder che gia' conosce l'appartenenza
 alla finestra.
+
 """
 from __future__ import annotations
 
@@ -36,6 +37,11 @@ from typing import Dict, List, Optional, Tuple
 import torch
 from torch_geometric.data import Data
 
+from DatasetPipeline.Utils.position_compression import (
+    compress_position_data,
+    decompress_position_data,
+)
+
 logger = logging.getLogger("position_queue")
 
 DEFAULT_STATE_FILENAME = "position_queue_state.json"
@@ -50,7 +56,14 @@ class PositionQueueError(RuntimeError):
 
 @dataclass
 class _QueuedPosition:
-    """Una posizione in coda, in attesa di essere drenata in build_splits."""
+    """Una posizione in coda, in attesa di essere drenata in build_splits.
+
+    `data` e' sempre tenuta in formato ORIGINALE (non compresso) mentre e'
+    in memoria (coda in-memory + buffer pendente): la compressione si
+    applica esclusivamente al momento della scrittura su disco (vedi
+    _flush_pending_shard_locked), cosi' il pending_count()/drain in-memory
+    prima di un eventuale flush non richiede mai una decompressione.
+    """
     local_ref: int
     source_tag: str
     group_key: int
@@ -78,7 +91,9 @@ class PositionQueueRegistry:
     matto forzato). Questa classe si occupa di:
         1. accodare le posizioni in arrivo (FIFO, in-memory + shard su
            disco per sopravvivere a un crash, vedi docstring di modulo);
-        2. ricaricare shard non ancora drenati da run precedenti;
+        2. ricaricare shard non ancora drenati da run precedenti,
+           decomprimendoli in modo trasparente (vedi
+           position_compression.py);
         3. drenare la coda e produrre gli split train/val/test,
            stratificati per group_key (tipicamente mate_n).
 
@@ -91,6 +106,8 @@ class PositionQueueRegistry:
 
         splits = registry.build_splits(split_ratios=(0.7, 0.1, 0.2), seed=42)
         # splits = {"train": [Data...], "val": [...], "test": [...]}
+        # (Data nel formato ORIGINALE, non compresso: la compressione e'
+        # invisibile al chiamante)
     """
 
     _instance: Optional["PositionQueueRegistry"] = None
@@ -170,7 +187,8 @@ class PositionQueueRegistry:
         os.replace(tmp_path, self._state_path)
 
     # ------------------------------------------------------------------
-    # SPOOL SU DISCO (shard batch): scrittura, reload, cleanup
+    # SPOOL SU DISCO (shard batch): scrittura compressa, reload
+    # decompresso, cleanup
     # ------------------------------------------------------------------
     def _existing_shard_paths(self) -> List[str]:
         """Shard presenti sul disco, ordinati per indice crescente (ordine
@@ -184,7 +202,14 @@ class PositionQueueRegistry:
         interrotta prima di un build_splits(). Chiamato SOLO da __init__:
         una volta ricaricati, gli shard restano sul disco finche'
         build_splits() non li consuma con successo (cosi' un secondo
-        crash durante il reload stesso non perde nulla)."""
+        crash durante il reload stesso non perde nulla).
+
+        Ogni Data letta da shard e' in formato COMPRESSO (vedi
+        _flush_pending_shard_locked): viene decompressa qui, prima di
+        rientrare nella coda in-memory, cosi' il resto della classe
+        (pending_count, drain, build_splits) lavora sempre su Data nel
+        formato originale.
+        """
         shard_paths = self._existing_shard_paths()
         if not shard_paths:
             self._next_shard_index = 0
@@ -202,11 +227,12 @@ class PositionQueueRegistry:
                 )
                 continue
             for rec in records:
+                decompressed_data = decompress_position_data(rec["data"])
                 item = _QueuedPosition(
                     local_ref=self._next_local_ref,
                     source_tag=rec["source_tag"],
                     group_key=rec["group_key"],
-                    data=rec["data"],
+                    data=decompressed_data,
                 )
                 self._next_local_ref += 1
                 self._queue.put(item)
@@ -235,12 +261,30 @@ class PositionQueueRegistry:
     def _flush_pending_shard_locked(self) -> None:
         """Scrive su disco il buffer pendente come nuovo shard (scrittura
         atomica tmp+replace) e lo svuota. Il chiamante deve gia' detenere
-        self._lock."""
+        self._lock.
+
+        Ogni Data viene compressa in modo lossless (vedi
+        position_compression.compress_position_data) PRIMA di finire nello
+        shard: questo riduce byte su disco/IO per lo spool intermedio
+        senza alterare in alcun modo cio' che enqueue()/build_splits()
+        espongono al chiamante (la decompressione avviene simmetricamente
+        in _reload_existing_shards/_drain_all).
+
+        group_key viene passato anche come mate_n al comprimere: e' gia'
+        il valore di stratificazione (tipicamente la profondita' di
+        matto), quindi salvarlo come attributo uint8 sul Data compresso e'
+        gratuito e rende il dato pronto per un'eventuale stratificazione
+        futura per n senza ulteriori modifiche allo spool.
+        """
         if not self._pending_shard:
             return
 
         records = [
-            {"source_tag": item.source_tag, "group_key": item.group_key, "data": item.data}
+            {
+                "source_tag": item.source_tag,
+                "group_key": item.group_key,
+                "data": compress_position_data(item.data, mate_n=item.group_key),
+            }
             for item in self._pending_shard
         ]
 
@@ -270,12 +314,14 @@ class PositionQueueRegistry:
         """Accoda una SINGOLA posizione gia' assemblata.
 
         La posizione entra subito nella coda in-memory (visibile
-        immediatamente a pending_count()/build_splits()) e viene inoltre
-        accumulata in un buffer che, al raggiungimento di shard_size
-        elementi, viene scritto su disco come shard (vedi docstring di
-        modulo): questo garantisce che un crash del processo perda al
-        massimo le ultime shard_size-1 posizioni non ancora flushate,
-        invece dell'intera coda.
+        immediatamente a pending_count()/build_splits(), nel formato
+        ORIGINALE non compresso) e viene inoltre accumulata in un buffer
+        che, al raggiungimento di shard_size elementi, viene scritto su
+        disco come shard COMPRESSO (vedi _flush_pending_shard_locked):
+        questo garantisce che un crash del processo perda al massimo le
+        ultime shard_size-1 posizioni non ancora flushate, invece
+        dell'intera coda, riducendo nel contempo I/O e spazio su disco per
+        lo spool.
 
         Args:
             source_tag: etichetta della sorgente (es. "lichess", "fics",
@@ -296,6 +342,12 @@ class PositionQueueRegistry:
             PositionQueueError: se data non ha un game_id valido (fail
                 fast: un game_id mancante indicherebbe un bug a monte nel
                 builder, meglio scoprirlo qui che silenziosamente a valle).
+            ValueError: se data contiene valori fuori dal dominio atteso
+                per la compressione lossless (vedi
+                position_compression.compress_position_data). Propagato al
+                momento del flush su disco, non dell'enqueue stesso (la
+                validazione avviene quando la posizione lascia il buffer
+                in-memory verso lo shard).
         """
         if not hasattr(data, "game_id") or data.game_id is None:
             raise PositionQueueError(
@@ -348,7 +400,9 @@ class PositionQueueRegistry:
             # build_splits() fallisse DOPO il drain e PRIMA di ritornare,
             # non ci sarebbe piu' alcuno shard su disco da cui recuperarle
             # in una run successiva). Flush prima del drain elimina questa
-            # finestra residua.
+            # finestra residua. Le posizioni gia' in coda in-memory (mai
+            # passate da uno shard) sono gia' nel formato originale, non
+            # richiedono decompressione.
             self._flush_pending_shard_locked()
 
             drained: List[_QueuedPosition] = []
@@ -364,6 +418,13 @@ class PositionQueueRegistry:
         """Drena la coda (in-memory + shard su disco residui) e produce
         gli split train/val/test, SPLIT-SAFE per finestra (game_id) e
         stratificati per group_key (mate_n).
+
+        Le Data risultanti sono sempre nel formato ORIGINALE (non
+        compresso): quelle rimaste solo in coda in-memory non sono mai
+        state compresse; quelle ricaricate da shard residui sono gia'
+        state decompresse in _reload_existing_shards al momento del
+        reload. Il chiamante non deve fare nulla di diverso rispetto a
+        prima di questa modifica.
 
         FIX LEAKAGE (rispetto alla prima versione di questo modulo): lo
         split NON avviene piu' per singola posizione, ma per FINESTRA

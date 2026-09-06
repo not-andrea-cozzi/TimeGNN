@@ -39,7 +39,7 @@ games_pipeline:
   mate_range_min: 1
   mate_range_max: 10
   search_depth: 8
-  time_limit_seconds: 0.2
+  time_limit_seconds: 0.4
   max_piece_count: 18
   min_material_for_mate_attempt: 4
   only_decisive_games: true
