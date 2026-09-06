@@ -1,133 +1,3 @@
-"""
-PositionGraphSchema.py
-
-Schema dati per il sample scacchistico: UNA SINGOLA POSIZIONE = UN GRAFO
-SPAZIALE a 64 nodi (caselle), pensato per essere usato SENZA MODIFICHE con
-i modelli GIA' ESISTENTI in timegnn.models:
-
-    - DualGATModel            (timegnn/models/gat_basic.py)          "untimed"
-    - DualGATTimeAwareModel   (timegnn/models/gat_time_decay.py)     "timed"
-
-QUESTI DUE MODELLI, NON ALTRI: PERCHE'
-========================================
-Il progetto (proggetto_ai.md) richiede un preciso ablation study: confrontare
-un modello CON informazione temporale e uno SENZA, a parita' di tutto il
-resto, per rispondere alla research question "does incorporating timing
-information improve the model's performance?".
-
-DualGATModel e DualGATTimeAwareModel sono, tra i modelli disponibili nella
-libreria, l'UNICA coppia gia' pronta per questo confronto: hanno costruttori
-quasi identici (la seconda ha solo lambda_decay in piu'), lo stesso forward
-pass a tre path (embed/event/concat), lo stesso output shape (un logit per
-NODO, mai pooling). L'unica differenza architetturale reale e' che
-DualGATTimeAwareModel usa TimeAwareGATConv al posto di GATConv: la stessa
-identica formula di attenzione, con in piu' un decay esponenziale
-sull'attenzione pesato da un valore scalare per-arco (chiamato "time" nel
-suo forward: `edge_attr = data_event.time`).
-
-VINCOLO DI PROGETTO: i modelli non si toccano. Restano cosi' come sono,
-comprese le loro limitazioni:
-    - Nessun pooling graph-level: entrambi producono un tensore
-      [N_nodi_nel_batch, output_dim], un logit per CASELLA, non un logit
-      per l'intera board. Ottenere "una mossa per posizione" richiede un
-      passo di aggregazione ESTERNO al modello (vedi
-      position_pooling.py), scritto nel training/eval loop, non dentro
-      gat_basic.py/gat_time_decay.py.
-    - DualGATModel legge data_event.edge_attr (relazione SPAZIALE tra
-      caselle: mossa-legale/attacco/pin).
-    - DualGATTimeAwareModel legge data_event.time (un valore scalare
-      per-arco: qui e' COSTANTE su tutti gli archi della stessa board,
-      dato che "quanto tempo il giocatore ha pensato" e' un attributo
-      della MOSSA/POSIZIONE nel suo complesso, non di una singola coppia
-      di caselle. Il decay esponenziale pesa quindi l'intera rete di
-      attenzione della board in base al tempo di riflessione: piu' tempo
-      = meno decay = attenzione piena tra le caselle; poco tempo = decay
-      forte = l'informazione fluisce meno tra caselle lontane. E'
-      un'ipotesi modellistica esplicita, coerente con l'hypothesis di
-      progetto "timing helps ... by modeling urgency", non un fatto
-      dimostrato.
-
-Un SOLO schema dati (questo modulo) serve ENTRAMBI i modelli: ogni Data
-porta sia edge_attr (per DualGATModel) sia time (per DualGATTimeAwareModel)
-gia' pronti, cosi' l'ablation study usa esattamente lo stesso dataset per
-le due run, isolando la sola variabile "uso o meno del decay temporale".
-
-CAMPI DEL SAMPLE (torch_geometric.data.Data), grafo a 64 nodi:
-
-    event_ids   long[64, 1]  Categoria pezzo+colore per casella:
-                                0                        = casella vuota
-                                piece_type*2 + color + 1 = casella occupata
-                              (piece_type: 1..6 = pawn..king, color: 0=nero
-                              1=bianco; range risultante 1..12, quindi 13
-                              categorie totali incluso lo 0). Shape [64,1]
-                              (non [64]) perche' DualGATModel/DualGATTimeAwareModel
-                              derivano da forward comune che fa
-                              `self.embedding(data_event.event_ids.view(-1))`:
-                              .view(-1) accetta sia [64] sia [64,1], ma [64,1]
-                              e' la convenzione scelta qui per coerenza con
-                              PrefixGCNClassifier (che invece richiede
-                              .squeeze(-1), quindi [N,1] esplicito) nel caso
-                              in futuro si voglia riusare lo stesso schema
-                              anche li'.
-
-    x           float[64,2]  Feature per casella (path "event", input
-                              diretto GAT, NON passa per l'embedding):
-                                col 0: is_occupied_by_mover     (0.0/1.0)
-                                col 1: is_occupied_by_opponent  (0.0/1.0)
-                              Una casella vuota ha entrambe le colonne a
-                              0.0. Feature volutamente ridondanti rispetto
-                              a event_ids (che gia' codifica il colore):
-                              tenerle esplicite in x, che passa per un path
-                              GAT NON-embedding, da' al modello un segnale
-                              diretto e immediato su "di chi e' questo
-                              pezzo" senza dover imparare a decodificarlo
-                              dall'embedding.
-
-    edge_index  long[2,E]    Archi SPAZIALI tra caselle: mossa-legale,
-                              attacco, pin (stessa logica del vecchio
-                              GraphBuilder.board_to_pyg_data). E varia per
-                              posizione (non fisso), il batching PyG lo
-                              gestisce nativamente concatenando gli
-                              edge_index con offset (Batch.from_data_list).
-
-    edge_attr   long[E]      Tipo di relazione spaziale per l'arco:
-                              EDGE_LEGAL_MOVE / EDGE_ATTACK / EDGE_PIN
-                              (vedi costanti sotto). Letto da DualGATModel
-                              come edge_dim per GATConv (occhio: GATConv si
-                              aspetta un tensore edge_dim-dimensionale per
-                              arco, non un indice categorico grezzo: va
-                              quindi passato come float, one-hot o
-                              embeddato a monte -- vedi nota
-                              EDGE_ATTR_ENCODING sotto per la scelta fatta).
-
-    time        float[E]     Tempo (secondi) impiegato per la mossa che ha
-                              PORTATO a questa posizione, ripetuto
-                              IDENTICO su tutti gli E archi della board
-                              (broadcast di uno scalare per-grafo, non
-                              un'informazione per-arco reale: vedi
-                              motivazione sopra). Letto da
-                              DualGATTimeAwareModel come `data_event.time`.
-
-    y           long (scalare, NON per nodo) Mossa migliore in questa
-                              posizione, nello stesso vocabolario globale
-                              fisso a 4096 classi (from_sq*64+to_sq) usato
-                              altrove nel progetto. E' UN SOLO intero per
-                              l'intera board: dato che i modelli producono
-                              un logit per NODO, il confronto con y avviene
-                              DOPO il pooling esterno (vedi
-                              position_pooling.py), non dentro il dataset.
-
-    game_id     int64 (scalare) Id della finestra/partita di provenienza,
-                              per tracciamento a valle (queue, split). Non
-                              e' letto dal forward dei modelli.
-
-    ply         int64 (scalare) Indice del ply all'interno della finestra
-                              di matto forzato di provenienza (0-based).
-                              Serve a valle per ricostruire l'ordine delle
-                              posizioni della stessa finestra, se in futuro
-                              serve un'analisi/aggregazione sequenziale
-                              (i modelli attuali non la usano).
-"""
 from __future__ import annotations
 
 from typing import Dict, List, Optional, Tuple
@@ -259,7 +129,8 @@ def build_position_data(
     board: "chess.Board",
     best_move: "chess.Move",
     clock_seconds: float,
-    game_id: int,
+    rating: float,
+    game_id: str,
     ply: int,
 ) -> Data:
     """Assembla un torch_geometric.data.Data a grana di SINGOLA POSIZIONE
@@ -272,12 +143,18 @@ def build_position_data(
         clock_seconds: tempo (secondi) impiegato per arrivare a questa
             mossa. Diventa `time`, costante su tutti gli archi della board
             (vedi motivazione nel docstring di modulo).
-        game_id: id della finestra/partita di provenienza (tracciamento).
+        rating: rating (Elo) del giocatore di turno (mover) in questa
+            posizione. OBBLIGATORIO (mai None): il chiamante deve
+            risolvere un valore reale o di fallback prima di chiamare
+            questa funzione (vedi docstring di modulo, campo `rating`).
+        game_id: identificatore leggibile "{fonte}_{id_originale}" della
+            finestra/partita/puzzle di provenienza (es. "lichess_142",
+            "puzzle_00sHx"). Stringa, non un tensore.
         ply: indice del ply all'interno della finestra (tracciamento).
 
     Returns:
-        Data con event_ids/x/edge_index/edge_attr/time/y/game_id/ply come
-        da docstring di modulo.
+        Data con event_ids/x/edge_index/edge_attr/time/y/rating/game_id/ply
+        come da docstring di modulo.
 
     Raises:
         ValueError: se best_move non e' una mossa legale su board (il
@@ -332,7 +209,8 @@ def build_position_data(
     data.edge_attr = edge_attr
     data.time = time_tensor
     data.y = y
-    data.game_id = torch.tensor(int(game_id), dtype=torch.int64)
+    data.rating = torch.tensor(float(rating), dtype=torch.float16)
+    data.game_id = game_id
     data.ply = torch.tensor(int(ply), dtype=torch.int64)
 
     return data

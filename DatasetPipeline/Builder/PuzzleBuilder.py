@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import logging
 import os
-import uuid
+from collections import defaultdict
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -47,9 +47,13 @@ class PuzzleBuilder:
     """
     Builder per dataset puzzle Lichess, allineato al contratto di GamesBuilder.
     Ogni puzzle viene trattato come una "finestra" di posizioni (i ply alterni)
-    e ogni posizione viene accodata in PositionQueueRegistry con un game_id univoco
-    (uuid) per puzzle, in modo da garantire split coerenti (tutte le posizioni
-    di uno stesso puzzle vanno nello stesso split).
+    e ogni posizione viene accodata in PositionQueueRegistry con un game_id
+    leggibile "puzzle_{PuzzleId}" (stringa), univoco per costruzione dato che
+    PuzzleId e' gia' univoco nel CSV Lichess: garantisce split coerenti (tutte
+    le posizioni di uno stesso puzzle vanno nello stesso split) e permette di
+    risalire al puzzle originale direttamente dal game_id, senza tabelle di
+    traduzione (stesso principio di GamesBuilder, che usa
+    "{source_tag}_{provisional_game_id}").
 
     Uso tipico:
         config = PuzzleBuilderConfig(csv_path="lichess_puzzles.csv", ...)
@@ -130,10 +134,10 @@ class PuzzleBuilder:
         # Fallback lineare
         return 5.0 + (rating / 3000.0) * 55.0
 
-    def _assign_split(self, game_id: int) -> str:
+    def _assign_split(self, game_id: str) -> str:
         """Split deterministico per debug JSONL (usa lo stesso seed di GamesBuilder)."""
         import random
-        rng = random.Random(self.config.split_seed + game_id)
+        rng = random.Random(self.config.split_seed + hash(game_id))
         val = rng.random()
         train, val_ratio, _ = self.config.split_ratios
         if val < train:
@@ -169,6 +173,11 @@ class PuzzleBuilder:
             if mate_n_iniziale <= 0:
                 continue
 
+            puzzle_id_raw = row.get("PuzzleId")
+            if not puzzle_id_raw:
+                logger.warning("Riga puzzle senza PuzzleId, scartata.")
+                continue
+
             rating_raw = row.get("Rating")
             puzzle_rating = float(rating_raw) if pd.notna(rating_raw) else 1500.0
             clock_base = self._simulated_clock(puzzle_rating)
@@ -179,8 +188,10 @@ class PuzzleBuilder:
                 continue
             board.push(first_move)
 
-            # Game ID univoco per questo puzzle (come in GamesBuilder)
-            game_id = uuid.uuid4().int & ((1 << 63) - 1)
+            # Game ID leggibile e univoco per questo puzzle: "puzzle_{PuzzleId}".
+            # PuzzleId e' gia' univoco nel CSV Lichess, quindi non serve alcun
+            # contatore ne' UUID (vedi docstring di classe).
+            game_id = f"puzzle_{puzzle_id_raw}"
 
             # I puzzle hanno una sequenza di mosse: la soluzione.
             # Prendiamo solo i ply alterni (quelli in cui il solver deve muovere)
@@ -208,6 +219,7 @@ class PuzzleBuilder:
                         board=board,
                         best_move=move,
                         clock_seconds=clock_seconds,
+                        rating=puzzle_rating,
                         game_id=game_id,
                         ply=ply_idx,
                     )
@@ -295,5 +307,3 @@ class PuzzleBuilder:
             for n in sorted(mate_n_counts.keys()):
                 logger.info(f"  n={n}: {mate_n_counts[n]:,}")
         logger.info("=" * 60)
-
-

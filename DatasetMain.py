@@ -1,20 +1,3 @@
-"""
-STEP DELLA PIPELINE (con resume via PipelineState)
-    1. time_stats             — statistiche tempo medio per rating da PGN
-                                 (opzionale: se raw_data.games_zst manca,
-                                 saltato, avg_time_by_rating resta vuoto).
-    2. games_pipeline          — GamesBuilder.run(): scandisce le sorgenti
-                                 PGN, analizza le posizioni e le accoda
-                                 nel PositionQueueRegistry condiviso.
-    3. decompress_puzzles      — decomprime il CSV puzzle Lichess (.zst).
-    4. build_puzzles           — PuzzleBuilder.run(): accoda le posizioni
-                                 puzzle nel registry condiviso.
-    5. finalize_splits         — build_splits() sul registry unisce tutte
-                                 le posizioni (games + puzzles), stratifica
-                                 per mate_n e produce i tre file finali:
-                                 train.pt, val.pt, test.pt nella directory
-                                 di merged_dataset.
-"""
 from __future__ import annotations
 
 import logging
@@ -439,10 +422,10 @@ def main(config_path: str = "Yaml/main.yaml") -> None:
             f"{result.get('accepted_games', 0):,} partite accettate, "
             f"{result.get('enqueued_positions', 0):,} posizioni accodate."
         )
-        if result.get("error_counts"):
-            logger.info("Riepilogo errori/scarti durante games_pipeline:")
-            for err_name, count in sorted(result["error_counts"].items(), key=lambda kv: -kv[1]):
-                logger.info(f"    {err_name}: {count:,}")
+        if result.get("source_counts"):
+            logger.info("Riepilogo per sorgente durante games_pipeline:")
+            for tag, count in sorted(result["source_counts"].items(), key=lambda kv: -kv[1]):
+                logger.info(f"    {tag}: {count:,}")
 
     if step is None or step == "games_pipeline":
         run_step(

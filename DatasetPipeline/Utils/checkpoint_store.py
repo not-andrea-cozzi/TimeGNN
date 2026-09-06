@@ -22,7 +22,7 @@ class CheckpointStoreError(RuntimeError):
 
 @dataclass
 class _Window:
-    game_id: int
+    game_id: str
     group_key: int
     positions: List[Data] = field(default_factory=list)
 
@@ -69,8 +69,8 @@ class CheckpointStore:
         }
 
         self._lock = threading.Lock()
-        self._windows: Dict[int, _Window] = {}  # game_id -> _Window
-        self._seen_game_ids: set = set()
+        self._windows: Dict[str, _Window] = {}
+        self._seen_game_ids: set = set()   # invariato
 
         # Contatori diagnostici cumulativi (vivono per tutta la durata del
         # processo, utili nei log per capire il trend tra un checkpoint e
@@ -173,7 +173,7 @@ class CheckpointStore:
     # ------------------------------------------------------------------
     # ACCUMULO
     # ------------------------------------------------------------------
-    def add_window(self, game_id: int, group_key: int, positions: List[Data]) -> None:
+    def add_window(self, game_id: str, group_key: int, positions: List[Data]) -> None:
         """Registra una finestra completa (tutte le posizioni di una
         partita/finestra di matto accettata). Non scrive su disco: la
         persistenza avviene solo su checkpoint() esplicito."""
