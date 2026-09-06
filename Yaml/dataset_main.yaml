@@ -29,11 +29,11 @@ time_stats:
 
 games_pipeline:
   output_base_filename: "games.pt"
-  max_games: 250000
+  max_games: 1000
   skip_games_part1: 0
-  fics_max_games: 230000
+  fics_max_games: 1000
   fics_skip_games: 0
-  club_max_games: 200000
+  club_max_games: 1000
   club_skip_games: 0
   club_pgn_col: "pgn"
   mate_range_min: 1
