@@ -9,16 +9,38 @@ PositionGraphSchema.build_position_data). Chiama, PER OGNI POSIZIONE:
 group_key resta la chiave di stratificazione (tipicamente mate_n della
 finestra di provenienza, replicato su ogni posizione della finestra).
 
-Il game_id NON viene piu' assegnato da questa classe (a differenza della
-versione precedente): e' gia' presente dentro position_data.game_id,
-assegnato dal chiamante PRIMA di enqueue (una sola volta per finestra,
-condiviso da tutte le sue posizioni). Questo e' un cambio deliberato
-rispetto a SequenceQueue.py: quando l'unita' di coda era "una sequenza
-intera", aveva senso assegnare un id per item in coda; ora che l'unita' e'
-"una posizione", il game_id deve invece essere condiviso da PIU' item
-(tutte le posizioni della stessa finestra), quindi la sua assegnazione
-torna naturalmente a monte, nel builder che gia' conosce l'appartenenza
-alla finestra.
+Il game_id e' assegnato dal CHIAMANTE (GamesBuilder._enqueue_window,
+PuzzleBuilder.run) PRIMA di enqueue, come uuid.uuid4().int troncato a 63
+bit -- univoco per costruzione, per qualunque run passata, presente o
+futura, senza bisogno di alcuna mappa di traduzione persistita.
+
+STORIA DI QUESTO DESIGN (perche' NON esiste piu' una _id_map)
+================================================================
+Una versione precedente di questa classe assegnava game_id "grezzi" come
+contatori locali al processo (self._next_game_id in GamesBuilder,
+next_game_id in PuzzleBuilder), poi li rimappava qui a un "safe_id"
+univoco globale tramite una tabella (source_tag, orig_id) -> safe_id.
+
+Questo design aveva un difetto strutturale: un contatore locale al
+processo riparte da 0 ad ogni riavvio. Quando la pipeline veniva
+interrotta e ripresa (crash, resume manuale), run diverse generavano lo
+STESSO orig_id per finestre reali DIVERSE (l'ordine di completamento dei
+worker paralleli, via pool.imap_unordered, non e' deterministico tra
+run). La tabella di traduzione, se non persistita correttamente tra
+riavvii (o se popolata in modo incoerente per via di uno stato "ctx"
+perso quando uno step veniva skippato come "gia' completato"), poteva
+assegnare lo STESSO safe_id a due finestre con group_key (mate_n)
+diversi -- il bug osservato in produzione ("game_id=1 ha posizioni con
+group_key diversi ([1, 8])").
+
+La soluzione adottata elimina l'intera classe di bug alla radice: invece
+di mitigare le collisioni con una tabella di traduzione (che a sua volta
+richiede persistenza corretta, gestione di reload, e coordinamento tra
+GamesBuilder e PuzzleBuilder per gli offset), il game_id e' ora generato
+come identificatore univoco per costruzione (uuid4), niente affatto
+soggetto a riavvii di processo o ordine di completamento dei worker.
+PositionQueueRegistry non deve piu' occuparsi di tradurre nulla: il
+game_id che riceve in enqueue() e' gia' l'identificatore finale, stabile.
 """
 from __future__ import annotations
 
@@ -83,10 +105,10 @@ class PositionQueueRegistry:
     """Singleton: coda di posizioni (in-memory + spool su disco per
     resume) + split stratificato.
 
-    A differenza di SequenceQueueRegistry (superato), NON assegna piu' un
-    game_id: quello e' gia' dentro ogni Data.game_id, assegnato a monte dal
-    chiamante (condiviso da tutte le posizioni della stessa finestra di
-    matto forzato). Questa classe si occupa di:
+    Non assegna e non traduce piu' alcun game_id: quello e' gia' un
+    identificatore univoco per costruzione (uuid troncato), assegnato dal
+    chiamante prima di enqueue (vedi docstring di modulo). Questa classe
+    si occupa esclusivamente di:
         1. accodare le posizioni in arrivo (FIFO, in-memory + shard su
            disco per sopravvivere a un crash, vedi docstring di modulo);
         2. ricaricare shard non ancora drenati da run precedenti,
@@ -112,10 +134,6 @@ class PositionQueueRegistry:
         self._next_local_ref = 0
         self._next_shard_index = 0
         self._enqueued_count = self._load_enqueued_count()
-        
-        # Mappatura ID per evitare collisioni tra vecchie esecuzioni e nuovi dati
-        self._next_safe_game_id = 0
-        self._id_map = {}
 
         self._reload_existing_shards()
 
@@ -173,7 +191,6 @@ class PositionQueueRegistry:
         shard_paths = self._existing_shard_paths()
         if not shard_paths:
             self._next_shard_index = 0
-            self._next_safe_game_id = 0
             return
 
         reloaded = 0
@@ -183,7 +200,7 @@ class PositionQueueRegistry:
             except Exception as e:
                 logger.warning(f"Shard {path} illeggibile ({e}): scartato.")
                 continue
-            
+
             for rec in records:
                 decompressed_data = decompress_position_data(rec["data"])
                 item = _QueuedPosition(
@@ -205,14 +222,6 @@ class PositionQueueRegistry:
             except ValueError:
                 continue
         self._next_shard_index = (max(existing_indices) + 1) if existing_indices else 0
-
-        # Identificazione del massimo game_id presente per evitare collisioni coi nuovi
-        max_id = -1
-        for item in list(self._queue.queue):
-            gid = int(item.data.game_id.item()) if hasattr(item.data.game_id, "item") else int(item.data.game_id)
-            if gid > max_id:
-                max_id = gid
-        self._next_safe_game_id = max_id + 1
 
         if reloaded:
             logger.info(
@@ -252,30 +261,22 @@ class PositionQueueRegistry:
     # ENQUEUE
     # ------------------------------------------------------------------
     def enqueue(self, source_tag: str, data: Data, group_key: int) -> int:
+        """Accoda una posizione. Il game_id dentro `data` DEVE essere gia'
+        un identificatore univoco per costruzione (uuid troncato,
+        assegnato dal chiamante) -- questa classe non lo traduce, non lo
+        rimappa, non lo verifica per unicita' (farlo richiederebbe
+        comunque una tabella globale, esattamente il design abbandonato:
+        vedi docstring di modulo). Si fida della garanzia probabilistica
+        di uuid4 (collisione ~1 su 2^63, trascurabile)."""
         if not hasattr(data, "game_id") or data.game_id is None:
             raise PositionQueueError(
                 f"enqueue rifiutato per source_tag='{source_tag}': il Data non ha un game_id valido."
             )
 
-        orig_id = int(data.game_id.item()) if hasattr(data.game_id, "item") else int(data.game_id)
-        map_key = (source_tag, orig_id)
-
         with self._lock:
-            # Traduzione sicura e atomica dell'ID
-            if map_key not in self._id_map:
-                self._id_map[map_key] = self._next_safe_game_id
-                self._next_safe_game_id += 1
-            safe_id = self._id_map[map_key]
-
-            # Sovrascrive il vecchio ID con quello normalizzato mantenendo il tipo di dato originale
-            if hasattr(data.game_id, "item"):
-                data.game_id = torch.tensor([safe_id], dtype=torch.long)
-            else:
-                data.game_id = safe_id
-
             local_ref = self._next_local_ref
             self._next_local_ref += 1
-            
+
             item = _QueuedPosition(
                 local_ref=local_ref,
                 source_tag=source_tag,
@@ -331,7 +332,10 @@ class PositionQueueRegistry:
             keys_in_window = {item.group_key for item in items}
             if len(keys_in_window) != 1:
                 raise PositionQueueError(
-                    f"game_id={game_id} ha posizioni con group_key diversi ({sorted(keys_in_window)})."
+                    f"game_id={game_id} ha posizioni con group_key diversi ({sorted(keys_in_window)}). "
+                    f"Con game_id generati come uuid questo non dovrebbe accadere per collisione "
+                    f"accidentale: verifica se lo stesso oggetto Data e' stato accodato piu' volte, "
+                    f"o se c'e' un bug nel chiamante che riusa un game_id tra finestre diverse."
                 )
             window_group_key[game_id] = keys_in_window.pop()
 

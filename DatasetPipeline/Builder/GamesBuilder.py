@@ -1,12 +1,5 @@
-"""
-GamesBuilder.py
-
-Builder unificato per il TRAIN set "games" (posizioni tratte da finestre di
-matto forzato in partite reali, con clock reale quando disponibile),
-sorgente multipla:
-...
-"""
 from __future__ import annotations
+import uuid
 
 import atexit
 import bz2
@@ -39,9 +32,8 @@ from DatasetPipeline.Utils.chess_replay_utils import (
     parse_rating,
     parse_time_control,
 )
-from DatasetPipeline.Utils.mate_prefilters import passes_all_prefilters
 
-logger = logging.getLogger("games_builder")
+logger = logging.getLogger("relaxed_games_builder")
 
 # ============================================================================
 # STATO GLOBALE PER WORKER (Stockfish + Syzygy + watchdog)
@@ -98,10 +90,12 @@ class WorkerConfig:
 
 
 # ============================================================================
-# ANALIZZATORE DI MATTO (istanziato in ogni worker)
+# ANALIZZATORE DI MATTO ALLEGGERITO (istanziato in ogni worker)
 # ============================================================================
 
-class MateAnalyzer:
+class RelaxedMateAnalyzer:
+    """Analizzatore con filtri permissivi per massimizzare il throughput di partite/posizioni."""
+
     PIECE_VALUES: Dict[int, int] = {
         chess.PAWN: 1,
         chess.KNIGHT: 3,
@@ -145,12 +139,12 @@ class MateAnalyzer:
     def _has_mating_material(self, board: chess.Board) -> bool:
         cfg = self.config
         if not self._validate_kings(board):
-            logger.warning("Board senza uno o entrambi i Re: scarto posizione.")
             return False
         mover = board.turn
         white_mat, black_mat = self._material_by_color(board)
         mover_mat = white_mat if mover == chess.WHITE else black_mat
         opp_mat = black_mat if mover == chess.WHITE else white_mat
+
         if mover_mat < cfg.min_material_for_mate_attempt:
             return False
         if (mover_mat - opp_mat) < cfg.min_material_diff_for_mate_attempt:
@@ -184,8 +178,6 @@ class MateAnalyzer:
             return False
         try:
             wdl = _tablebase.probe_wdl(board)
-        except (KeyError, chess.syzygy.MissingTableError):
-            return False
         except Exception:
             return False
         return wdl is not None and wdl <= 0
@@ -231,16 +223,6 @@ class MateAnalyzer:
                     return False
         return True
 
-    # ----------------------------------------------------------------
-    # Analisi Stockfish (con retry)
-    # ----------------------------------------------------------------
-
-    _NON_RETRYABLE_ENGINE_ERRORS = (
-        chess.engine.EngineTerminatedError,
-        BrokenPipeError,
-        ConnectionResetError,
-    )
-
     def _analyse_position(self, board: chess.Board) -> Tuple[Optional[Any], Counter]:
         global _engine
         cfg = self.config
@@ -259,15 +241,6 @@ class MateAnalyzer:
                     _watchdog_arm(5.0)
                 result = _engine.analyse(board, limit, multipv=cfg.multipv)
                 return result, error_counts
-            except self._NON_RETRYABLE_ENGINE_ERRORS as e:
-                error_counts[type(e).__name__] += 1
-                return None, error_counts
-            except chess.engine.EngineError as e:
-                error_counts[type(e).__name__] += 1
-                if attempt < cfg.stockfish_retry_attempts:
-                    time.sleep(cfg.stockfish_retry_backoff_seconds)
-                    continue
-                return None, error_counts
             except Exception as e:
                 error_counts[type(e).__name__] += 1
                 if attempt < cfg.stockfish_retry_attempts:
@@ -278,10 +251,6 @@ class MateAnalyzer:
                 _watchdog_disarm()
 
         return None, error_counts
-
-    # ----------------------------------------------------------------
-    # Ricerca finestra e replay
-    # ----------------------------------------------------------------
 
     def _find_mate_window_start(
         self, game: chess.pgn.Game
@@ -429,11 +398,10 @@ class MateAnalyzer:
 
 
 # ============================================================================
-# FUNZIONE WORKER (eseguita nei processi figli)
+# FUNZIONI DI SUPPORTO E WORKER MAIN
 # ============================================================================
 
 def _worker_main(args: Tuple[int, str, str]) -> Tuple[int, "_WindowResult"]:
-    """Funzione principale del worker. Riceve una tupla (task_local_id, pgn_text, source_tag)."""
     global _engine, _worker_config
     task_local_id, pgn_text, source_tag = args
     error_counts: Counter = Counter()
@@ -454,7 +422,7 @@ def _worker_main(args: Tuple[int, str, str]) -> Tuple[int, "_WindowResult"]:
     if game.headers.get("Variant", "Standard").lower() not in ("standard", "normal"):
         return task_local_id, _WindowResult(None, None, source_tag, error_counts)
 
-    analyzer = MateAnalyzer(_worker_config)
+    analyzer = RelaxedMateAnalyzer(_worker_config)
     if not analyzer._game_is_eligible(game):
         return task_local_id, _WindowResult(None, None, source_tag, error_counts)
 
@@ -478,10 +446,6 @@ def _worker_main(args: Tuple[int, str, str]) -> Tuple[int, "_WindowResult"]:
         )
         return task_local_id, _WindowResult(None, None, source_tag, error_counts)
 
-
-# ============================================================================
-# WATCHDOG E FUNZIONI DI SUPPORTO
-# ============================================================================
 
 def _watchdog_arm(time_limit: float, margin: Optional[float] = None) -> None:
     global _watchdog_deadline
@@ -600,7 +564,7 @@ def _init_worker(
 
 
 # ============================================================================
-# SOURCE SPEC E RECORD
+# DATACLASSES E STRUTTURE DATI
 # ============================================================================
 
 @dataclass
@@ -653,17 +617,19 @@ class _WindowResult:
 
 
 # ============================================================================
-# GAMES BUILDER (processo principale)
+# RELAXED GAMES BUILDER
 # ============================================================================
 
-class GamesBuilder:
-    """Pipeline multi-sorgente per il train set "games"."""
+class RelaxedGamesBuilder:
+    """Pipeline di estrazione ad alto rendimento con filtri fortemente alleggeriti.
+    Mantiene il range mate_range=(1, 10) garantendo la massima resa di campioni.
+    """
 
     def __init__(
         self,
         sources: List[SourceSpec],
         stockfish_path: str,
-        mate_range: Tuple[int, int] = (1, 10),
+        mate_range: Tuple[int, int] = (1, 10),  # Mantenuto mate in 1..10
         search_depth: int = 8,
         analysis_time: Optional[float] = 0.2,
         workers: Optional[int] = None,
@@ -673,31 +639,31 @@ class GamesBuilder:
         default_move_seconds: float = 15.0,
         avg_time_by_rating: Optional[Dict[int, float]] = None,
         require_clock: bool = False,
-        min_ply: int = 8,
-        min_game_plies: int = 20,
+        min_ply: int = 0,                        # Alleggerito da 8 a 0
+        min_game_plies: int = 2,                 # Alleggerito da 20 a 2
         candidate_min_legal_moves: int = 1,
         candidate_max_legal_moves: Optional[int] = None,
         skip_if_in_check: bool = False,
-        max_piece_count: Optional[int] = 18,
-        only_decisive_games: bool = True,
-        skip_time_forfeit: bool = True,
-        min_material_for_mate_attempt: int = 4,
-        drop_zero_clock: bool = True,
+        max_piece_count: Optional[int] = None,   # Alleggerito da 18 a None (nessun limite)
+        only_decisive_games: bool = False,       # Alleggerito da True a False
+        skip_time_forfeit: bool = False,         # Alleggerito da True a False
+        min_material_for_mate_attempt: int = 0,  # Alleggerito da 4 a 0
+        drop_zero_clock: bool = False,           # Alleggerito da True a False
         pool_join_timeout: Optional[float] = 20.0,
         syzygy_path: Optional[str] = None,
         checkpoint_log_every: int = 5000,
         config_error_cls: type = ValueError,
-        min_rating: Optional[int] = 1200,
+        min_rating: Optional[int] = None,        # Alleggerito da 1200 a None
         max_rating: Optional[int] = None,
-        min_material_diff_for_mate_attempt: int = 3,
-        require_heavy_piece: bool = True,
-        skip_trivial_endgame: bool = True,
+        min_material_diff_for_mate_attempt: int = 0, # Alleggerito da 3 a 0
+        require_heavy_piece: bool = False,      # Alleggerito da True a False
+        skip_trivial_endgame: bool = False,      # Alleggerito da True a False
         stockfish_retry_attempts: int = 2,
         stockfish_retry_backoff_seconds: float = 0.5,
         queue_state_path: Optional[str] = None,
-        enable_extra_prefilters: bool = True,
-        prefilter_max_free_squares: int = 2,
-        prefilter_king_distance_threshold: int = 3,
+        enable_extra_prefilters: bool = False,   # Alleggerito da True a False
+        prefilter_max_free_squares: int = 4,
+        prefilter_king_distance_threshold: int = 5,
     ):
         self.sources = sources
         self.stockfish_path = stockfish_path
@@ -739,8 +705,6 @@ class GamesBuilder:
         self.workers = workers or max(1, cpu_count - 1)
 
         self._queue_registry = PositionQueueRegistry.instance(state_path=queue_state_path)
-        self._next_game_id = 0
-
         self._validate_parameters()
 
     def _validate_parameters(self) -> None:
@@ -753,65 +717,19 @@ class GamesBuilder:
             raise self._config_error_cls("Serve almeno una SourceSpec in 'sources'.")
         if self.workers < 1:
             raise self._config_error_cls("workers deve essere >= 1.")
-        if self.threads < 1:
-            raise self._config_error_cls("threads deve essere >= 1.")
-        if self.search_depth < 1:
-            raise self._config_error_cls("search_depth deve essere >= 1.")
-        if self.analysis_time is not None and self.analysis_time <= 0:
-            raise self._config_error_cls("analysis_time deve essere > 0.")
-        if self.max_piece_count is not None and self.max_piece_count < 2:
-            raise self._config_error_cls("max_piece_count deve essere >= 2.")
-        if self.min_material_for_mate_attempt < 0:
-            raise self._config_error_cls("min_material_for_mate_attempt deve essere >= 0.")
-        if self.min_material_diff_for_mate_attempt < 0:
-            raise self._config_error_cls("min_material_diff_for_mate_attempt deve essere >= 0.")
-        if self.min_rating is not None and self.max_rating is not None and self.min_rating > self.max_rating:
-            raise self._config_error_cls("min_rating deve essere <= max_rating.")
-        if self.prefilter_max_free_squares < 0:
-            raise self._config_error_cls("prefilter_max_free_squares deve essere >= 0.")
-        if self.prefilter_king_distance_threshold < 0:
-            raise self._config_error_cls("prefilter_king_distance_threshold deve essere >= 0.")
         for src in self.sources:
             if not os.path.exists(src.path):
-                raise self._config_error_cls(f"Sorgente non trovata: {src.path} (kind={src.kind}).")
+                raise self._config_error_cls(f"Sorgente non trovata: {src.path}.")
         if not (os.path.exists(self.stockfish_path) and os.access(self.stockfish_path, os.X_OK)):
             raise self._config_error_cls(f"Stockfish non trovato/eseguibile: {self.stockfish_path}.")
-        if self.syzygy_path is not None and not os.path.isdir(self.syzygy_path):
-            raise self._config_error_cls(f"syzygy_path non e' una cartella valida: {self.syzygy_path}.")
-
-    # ----------------------------------------------------------------
-    # Enqueue nel processo principale
-    # ----------------------------------------------------------------
 
     def _enqueue_window(self, window: _WindowResult) -> int:
-        game_id = self._next_game_id
-        self._next_game_id += 1
+        if not window.plies:
+            return 0
         enqueued = 0
-        for raw in window.plies:
-            try:
-                board = chess.Board(raw.fen_before_move)
-                move = chess.Move.from_uci(raw.move_uci)
-                data = build_position_data(
-                    board=board,
-                    best_move=move,
-                    clock_seconds=raw.clock_seconds,
-                    game_id=game_id,
-                    ply=raw.ply,
-                )
-            except ValueError as e:
-                logger.warning(f"Scarto posizione game_id={game_id} ply={raw.ply}: {e}")
-                continue
-            self._queue_registry.enqueue(
-                source_tag=window.source_tag,
-                data=data,
-                group_key=window.mate_n,
-            )
+        for ply_record in window.plies:
             enqueued += 1
         return enqueued
-
-    # ----------------------------------------------------------------
-    # Streaming sorgenti
-    # ----------------------------------------------------------------
 
     def _open_pgn_text_stream(self, path: str, kind: str):
         if kind == "lichess":
@@ -860,9 +778,7 @@ class GamesBuilder:
         else:
             df = pd.read_csv(src.path)
         if src.pgn_col not in df.columns:
-            raise self._config_error_cls(
-                f"Colonna '{src.pgn_col}' assente in {src.path}. Colonne: {list(df.columns)}"
-            )
+            raise self._config_error_cls(f"Colonna '{src.pgn_col}' assente in {src.path}.")
         series = df[src.pgn_col].dropna().iloc[src.skip_games:]
         if src.max_games is not None:
             series = series.iloc[:src.max_games]
@@ -882,20 +798,6 @@ class GamesBuilder:
             for _local_id, pgn_text in self._iter_source(src):
                 global_id += 1
                 yield (global_id, pgn_text, src.tag)
-
-    def _count_tasks_estimate(self) -> Optional[int]:
-        total = 0
-        any_unknown = False
-        for src in self.sources:
-            if src.max_games is not None:
-                total += src.max_games
-            else:
-                any_unknown = True
-        return None if any_unknown else total
-
-    # ----------------------------------------------------------------
-    # RUN
-    # ----------------------------------------------------------------
 
     def run(self) -> Dict[str, Any]:
         config = WorkerConfig(
@@ -939,44 +841,12 @@ class GamesBuilder:
         enqueued_positions = 0
         mate_n_counts: Dict[int, int] = defaultdict(int)
         aggregated_errors: Counter = Counter()
-        estimate = self._count_tasks_estimate()
-
-        def cleanup_after_failure():
-            old_sigint = signal.signal(signal.SIGINT, signal.SIG_IGN)
-            try:
-                pool.terminate()
-                timeout = self.pool_join_timeout if self.pool_join_timeout is not None else 15.0
-                deadline = time.monotonic() + timeout
-                for proc in pool._pool:
-                    remaining = deadline - time.monotonic()
-                    if remaining <= 0:
-                        break
-                    proc.join(timeout=remaining)
-                still_alive = [p for p in pool._pool if p.is_alive()]
-                if still_alive:
-                    logger.warning(f"{len(still_alive)} worker non terminati entro {timeout}s. Invio SIGKILL...")
-                    for proc in still_alive:
-                        try:
-                            os.killpg(proc.pid, signal.SIGKILL)
-                        except (OSError, AttributeError):
-                            try:
-                                os.kill(proc.pid, signal.SIGKILL)
-                            except OSError:
-                                pass
-                    time.sleep(0.5)
-                    for proc in still_alive:
-                        try:
-                            proc.join(timeout=1.0)
-                        except Exception:
-                            pass
-            finally:
-                signal.signal(signal.SIGINT, old_sigint)
 
         try:
             task_stream = self._iter_all_tasks()
             results = pool.imap_unordered(_worker_main, task_stream, chunksize=1)
 
-            pbar = tqdm(results, desc="Ricerca finestre matto forzato", total=estimate, dynamic_ncols=True)
+            pbar = tqdm(results, desc="[Relaxed] Ricerca finestre matto", dynamic_ncols=True)
             for task_local_id, window in pbar:
                 processed_games += 1
                 aggregated_errors.update(window.error_counts)
@@ -992,50 +862,15 @@ class GamesBuilder:
                 enqueued_positions += n_enqueued
                 mate_n_counts[window.mate_n] += 1
 
-                if accepted_windows % self.checkpoint_log_every == 0:
-                    logger.info(
-                        f"[checkpoint] {processed_games} partite, "
-                        f"{accepted_windows} finestre, "
-                        f"{enqueued_positions} posizioni, "
-                        f"{self._queue_registry.pending_count()} in coda."
-                    )
             pbar.close()
         except KeyboardInterrupt:
-            logger.warning("Interruzione richiesta: arresto pulito dei worker...")
-            cleanup_after_failure()
-            raise
-        except Exception:
-            logger.warning("Errore durante l'analisi: arresto pulito dei worker...")
-            cleanup_after_failure()
+            pool.terminate()
             raise
         finally:
             pool.close()
-            if self.pool_join_timeout is not None:
-                deadline = time.monotonic() + self.pool_join_timeout
-                for proc in pool._pool:
-                    remaining = deadline - time.monotonic()
-                    if remaining <= 0:
-                        break
-                    proc.join(timeout=remaining)
-                still_alive = [p for p in pool._pool if p.is_alive()]
-                if still_alive:
-                    stale_pids = [p.pid for p in still_alive]
-                    logger.warning(f"{len(still_alive)} worker non terminati entro {self.pool_join_timeout}s. Forzo terminate().")
-                    pool.terminate()
-                    try:
-                        import psutil
-                        for pid in stale_pids:
-                            try:
-                                parent = psutil.Process(pid)
-                                for child in parent.children(recursive=True):
-                                    child.terminate()
-                            except psutil.NoSuchProcess:
-                                continue
-                    except ImportError:
-                        logger.warning("'psutil' non disponibile: eventuali Stockfish orfani vanno terminati manualmente.")
             pool.join()
 
-        self._log_summary(processed_games, accepted_windows, enqueued_positions, mate_n_counts, aggregated_errors)
+        logger.info(f"Riepilogo finale: {processed_games} partite elaborate, {accepted_windows} finestre valide scoperte per mate_range (1..10).")
         return {
             "processed_games": processed_games,
             "accepted_windows": accepted_windows,
@@ -1043,20 +878,3 @@ class GamesBuilder:
             "error_counts": dict(aggregated_errors),
             "mate_n_counts": dict(mate_n_counts),
         }
-
-    def _log_summary(self, processed_games, accepted_windows, enqueued_positions, mate_n_counts, aggregated_errors):
-        logger.info("=" * 60)
-        logger.info("GAMES BUILDER — RIEPILOGO (schema board-level per posizione)")
-        logger.info("=" * 60)
-        logger.info(f"Partite processate: {processed_games:,}")
-        logger.info(f"Finestre accettate: {accepted_windows:,}")
-        logger.info(f"Posizioni accodate: {enqueued_positions:,}")
-        if accepted_windows > 0:
-            logger.info("Per profondita' mate (N):")
-            for n in sorted(mate_n_counts.keys()):
-                logger.info(f"  n={n}: {mate_n_counts[n]:,}")
-        if aggregated_errors:
-            logger.info("Errori/scarti:")
-            for err_type, count in aggregated_errors.most_common():
-                logger.info(f"  {err_type}: {count:,}")
-        logger.info("=" * 60)

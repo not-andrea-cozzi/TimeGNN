@@ -410,27 +410,24 @@ def main(config_path: str = "Yaml/main.yaml") -> None:
     # STEP 4: Posizioni puzzle -> accodate sul registry condiviso
     # ========================================================================
     def _step_build_puzzles() -> None:
-        if "avg_time_by_rating" not in ctx:
-            ctx["avg_time_by_rating"] = (
-                load_avg_time_by_rating(time_stats_path) if file_ready(time_stats_path) else {}
+            if "avg_time_by_rating" not in ctx:
+                ctx["avg_time_by_rating"] = (
+                    load_avg_time_by_rating(time_stats_path) if file_ready(time_stats_path) else {}
+                )
+
+            debug_jsonl_path = os.path.join(puzzles_dir, "puzzle_debug.jsonl")
+
+            builder = PuzzleBuilder(
+                csv_path=puzzle_csv_path,
+                mate_range=mate_train_range,
+                max_puzzles=puzzle_cfg.get("max_puzzles", 100000),
+                avg_time_by_rating=ctx["avg_time_by_rating"],
+                chunksize=puzzle_cfg.get("chunksize", 50000),
+                queue_state_path=queue_state_path,
+                debug_jsonl_path=debug_jsonl_path,
+                config_error_cls=PipelineConfigError,
             )
-
-        games_result = ctx.get("games_result", {"accepted_windows": 0})
-        game_id_start = games_result.get("accepted_windows", 0)
-
-        debug_jsonl_path = os.path.join(puzzles_dir, "puzzle_debug.jsonl")
-
-        builder = PuzzleBuilder(
-            csv_path=puzzle_csv_path,
-            mate_range=mate_train_range,
-            max_puzzles=puzzle_cfg.get("max_puzzles", 100000),
-            avg_time_by_rating=ctx["avg_time_by_rating"],
-            chunksize=puzzle_cfg.get("chunksize", 50000),
-            queue_state_path=queue_state_path,
-            debug_jsonl_path=debug_jsonl_path,
-            config_error_cls=PipelineConfigError,
-        )
-        ctx["puzzle_result"] = builder.run(game_id_start=game_id_start)
+            ctx["puzzle_result"] = builder.run()
 
     if file_ready(puzzle_csv_path):
         if step is None or step == "build_puzzles":

@@ -9,7 +9,7 @@ splitti insieme partite reali e puzzle in un'unica pipeline coerente.
 
 """
 from __future__ import annotations
-
+import uuid
 import json
 import logging
 import os
@@ -158,18 +158,24 @@ class PuzzleBuilder:
         PositionQueueRegistry condiviso.
 
         Args:
-            game_id_start: primo game_id da assegnare (vedi docstring di
-                modulo per il contratto anti-collisione con GamesBuilder).
+            game_id_start: DEPRECATO, mantenuto solo per compatibilita'
+                di firma con eventuali chiamate esistenti (es.
+                DatasetMain.py). IGNORATO: ogni puzzle riceve ora un uuid
+                indipendente, generato internamente (vedi motivazione nel
+                corpo del metodo). Rimuovibile in una prossima pulizia
+                dei call site.
 
         Returns:
             Dict con "processed_puzzles", "accepted_puzzles",
-            "enqueued_positions", "mate_n_counts", "next_game_id" (utile
-            per incatenare un'altra sorgente senza collisioni).
+            "enqueued_positions", "mate_n_counts". La chiave
+            "next_game_id" e' RIMOSSA dal return (non ha piu' senso con
+            game_id generati come uuid indipendenti): se DatasetMain.py
+            la leggeva da qualche parte, va aggiornato di conseguenza
+            (vedi patch DatasetMain.py).
         """
         all_rows = self._load_filtered_rows()
 
         debug_records: List[Dict[str, Any]] = []
-        next_game_id = game_id_start
 
         processed_puzzles = 0
         accepted_puzzles = 0
@@ -195,14 +201,12 @@ class PuzzleBuilder:
             rating_raw = row.get("Rating")
             puzzle_rating = float(rating_raw) if pd.notna(rating_raw) else 1500.0
             clock_base = self._simulated_clock(puzzle_rating)
-
             first_move = chess.Move.from_uci(uci_moves[0])
             if first_move not in board.legal_moves:
                 continue
             board.push(first_move)
 
-            game_id = next_game_id
-            next_game_id += 1
+            game_id = uuid.uuid4().int & ((1 << 63) - 1)
             puzzle_enqueued = 0
 
             for ply_idx, uci in enumerate(uci_moves[1:], start=1):
@@ -272,7 +276,6 @@ class PuzzleBuilder:
             "accepted_puzzles": accepted_puzzles,
             "enqueued_positions": enqueued_positions,
             "mate_n_counts": mate_n_counts,
-            "next_game_id": next_game_id,
         }
 
     @staticmethod
