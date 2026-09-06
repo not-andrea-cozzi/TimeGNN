@@ -447,6 +447,14 @@ class GamesBuilder:
             raise self._config_error_cls(f"Stockfish non trovato/eseguibile: {self.stockfish_path}.")
         if self.syzygy_path is not None and not os.path.isdir(self.syzygy_path):
             raise self._config_error_cls(f"syzygy_path non e' una cartella valida: {self.syzygy_path}.")
+    
+    def __getstate__(self) -> Dict[str, Any]:
+        state = self.__dict__.copy()
+        state["_queue_registry"] = None 
+        return state
+
+    def __setstate__(self, state: Dict[str, Any]) -> None:
+        self.__dict__.update(state)
 
     # ================================================================
     # WORKER INIT (Stockfish + Syzygy + watchdog + signal handling)
