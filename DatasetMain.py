@@ -483,6 +483,7 @@ def main(config_path: str = "Yaml/main.yaml") -> None:
             mate_range=mate_train_range,
             max_puzzles=puzzle_cfg.get("max_puzzles", 100000),
             avg_time_by_rating=ctx["avg_time_by_rating"],
+            max_puzzles_per_theme=puzzle_cfg.get("max_puzzles_per_theme", 20000),
             chunksize=puzzle_cfg.get("chunksize", 50000),
             queue_state_path=queue_state_path,
             shard_size=puzzle_cfg.get("shard_size", 500),

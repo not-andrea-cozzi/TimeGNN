@@ -481,6 +481,15 @@ class GamesBuilder:
         seen_positions: set = set()
         full_game_id = f"{source_tag}_{game_id}"
 
+        # FIX: group_key deve restare COSTANTE per tutta la partita, per
+        # rispettare l'invariante "stesso game_id -> stesso group_key"
+        # richiesta da PositionQueueRegistry.build_splits (stratificazione
+        # per finestra, non per singola posizione). Il mate_n REALE di
+        # ciascuna posizione resta comunque salvato in debug_entry["mate_n"]
+        # (non si perde nulla): cambia solo quale valore guida lo split.
+        # Si fissa al mate_n della PRIMA posizione accettata della partita.
+        window_group_key: Optional[int] = None
+
         try:
             while node.variations:
                 next_node = node.variation(0)
@@ -572,11 +581,20 @@ class GamesBuilder:
                     )
                 except ValueError: node = next_node; continue
 
+                # FIX: fissa il group_key della FINESTRA alla prima
+                # posizione accettata; le successive posizioni della
+                # stessa partita riusano questo stesso valore, cosi'
+                # enqueue/build_splits vedono un solo group_key per
+                # game_id (vedi commento sopra al loop).
+                if window_group_key is None:
+                    window_group_key = int(mate_n)
+
                 debug_entry = {
                     "problem_id": f"{full_game_id}_{node.ply()}",
                     "fen": board.fen(),
                     "best_move_uci": best_move.uci(),
                     "mate_n": int(mate_n),
+                    "mate_n_window": window_group_key,
                     "ply": int(node.ply()),
                     "source": source_tag,
                     "clock_source": clock_source or "unknown",
@@ -763,7 +781,7 @@ class GamesBuilder:
                 for rec in records:
                     data = rec["data"]
                     debug_entry = rec["debug"]
-                    group_key = debug_entry["mate_n"]
+                    group_key = debug_entry["mate_n_window"]
 
                     self._registry.enqueue(
                         source_tag=debug_entry["source"],

@@ -23,7 +23,8 @@ class PuzzleBuilderConfig:
     """Configurazione per PuzzleBuilder (allineata a GamesBuilderConfig)."""
     csv_path: str
     mate_range: Tuple[int, int] = (1, 5)          # mateInN da includere
-    max_puzzles: Optional[int] = None             # limite dopo il filtro tematico
+    max_puzzles: Optional[int] = None             # limite TOTALE dopo il filtro tematico (usato solo se max_puzzles_per_theme è None)
+    max_puzzles_per_theme: Optional[int] = None   # NUOVO: tetto per singolo tema mateInN, per campionamento stratificato
     avg_time_by_rating: Dict[int, float] = field(default_factory=dict)  # da TimeStatBuilder
     chunksize: int = 50_000                       # lettura chunk CSV
 
@@ -55,8 +56,38 @@ class PuzzleBuilder:
     traduzione (stesso principio di GamesBuilder, che usa
     "{source_tag}_{provisional_game_id}").
 
+    NOTA GROUP_KEY (fix stratificazione split): il group_key passato a
+    registry.enqueue() per OGNI posizione di uno stesso puzzle e' COSTANTE
+    (= mate_n_iniziale, il tema dichiarato dal puzzle), perche'
+    PositionQueueRegistry.build_splits impone l'invariante "un game_id -> un
+    solo group_key" (stratifica per finestra intera, non per singola
+    posizione). Il mate_n REALE per-posizione (current_mate_n, che decresce
+    ad ogni mossa-solver: e' corretto che lo faccia, vedi sotto) resta
+    comunque salvato nel debug JSONL.
+
+    NOTA CAMPIONAMENTO STRATIFICATO (fix distribuzione mate_n):
+    current_mate_n = mate_n_iniziale - (mosse_solver_gia'_fatte) e' calcolato
+    CORRETTAMENTE: la prima mossa-solver di un puzzle mateIn4 e' davvero "a
+    4 mosse dal matto", l'ultima e' davvero "matto in 1". Il problema NON e'
+    questo calcolo, ma la SELEZIONE dei puzzle a monte: se _load_filtered_rows
+    taglia le prime `max_puzzles` righe del CSV che matchano il pattern
+    combinato "mateIn1|mateIn2|...|mateIn10", e la maggioranza dei puzzle
+    Lichess sono mateIn1/mateIn2 (vero per composizione naturale del dataset),
+    il campione finale conterra' quasi solo puzzle brevi, da cui derivano
+    quasi solo posizioni a mate_n basso -- gli n alti (8,9,10) restano vuoti
+    non perche' rari nel calcolo, ma perche' i puzzle SORGENTE mateIn8/9/10
+    non vengono mai pescati nel taglio non stratificato.
+    Fix: si campiona un tetto di puzzle per OGNI tema mateInN separatamente
+    (max_puzzles_per_theme), cosi' ogni bucket riceve una quota garantita di
+    puzzle sorgente, e le posizioni intermedie che ne derivano popolano anche
+    gli n alti.
+
     Uso tipico:
-        config = PuzzleBuilderConfig(csv_path="lichess_puzzles.csv", ...)
+        config = PuzzleBuilderConfig(
+            csv_path="lichess_puzzles.csv",
+            mate_range=(1, 10),
+            max_puzzles_per_theme=500,   # es. fino a 500 puzzle per ciascun mateInN
+        )
         builder = PuzzleBuilder(config)
         result = builder.run()
         # poi, insieme a GamesBuilder, chiamare:
@@ -96,6 +127,8 @@ class PuzzleBuilder:
             raise ValueError(f"CSV puzzle non trovato: {cfg.csv_path}.")
         if cfg.max_puzzles is not None and cfg.max_puzzles < 1:
             raise ValueError("max_puzzles deve essere >= 1 se specificato.")
+        if cfg.max_puzzles_per_theme is not None and cfg.max_puzzles_per_theme < 1:
+            raise ValueError("max_puzzles_per_theme deve essere >= 1 se specificato.")
         if cfg.chunksize < 1:
             raise ValueError("chunksize deve essere >= 1.")
 
@@ -103,11 +136,30 @@ class PuzzleBuilder:
     # LETTURA E FILTRO CSV
     # ------------------------------------------------------------------
     def _load_filtered_rows(self) -> List[Dict]:
+        """Legge il CSV a chunk, filtra per tema mateInN nel range configurato.
+
+        Se `max_puzzles_per_theme` e' impostato, il campionamento e'
+        STRATIFICATO: si accumulano fino a quel tetto di righe per CIASCUN
+        valore di mateInN separatamente (in ordine di apparizione nel CSV,
+        nessuno shuffle: sufficiente a garantire che ogni bucket riceva una
+        quota, vedi docstring di classe). Altrimenti si ricade sul
+        comportamento storico: taglio secco a `max_puzzles` righe totali sul
+        pattern combinato, che NON garantisce copertura di tutti i temi.
+        """
         lo, hi = self.config.mate_range
-        theme_pattern = "|".join(f"mateIn{n}" for n in range(lo, hi + 1))
-        rows: List[Dict] = []
+        themes_wanted = [f"mateIn{n}" for n in range(lo, hi + 1)]
+        theme_pattern = "|".join(themes_wanted)
+
         reader = pd.read_csv(self.config.csv_path, chunksize=self.config.chunksize)
-        pbar = tqdm(desc="Lettura CSV puzzle", unit=" righe valide")
+
+        if self.config.max_puzzles_per_theme is not None:
+            return self._load_filtered_rows_stratified(reader, themes_wanted, theme_pattern)
+        return self._load_filtered_rows_flat(reader, theme_pattern)
+
+    def _load_filtered_rows_flat(self, reader, theme_pattern: str) -> List[Dict]:
+        """Comportamento storico: taglio secco a max_puzzles righe totali."""
+        rows: List[Dict] = []
+        pbar = tqdm(desc="Lettura CSV puzzle (flat)", unit=" righe valide")
         for chunk in reader:
             mask = chunk["Themes"].str.contains(theme_pattern, na=False)
             filtered = chunk[mask]
@@ -118,6 +170,72 @@ class PuzzleBuilder:
                 break
         pbar.close()
         return rows
+
+    def _load_filtered_rows_stratified(self, reader, themes_wanted: List[str], theme_pattern: str) -> List[Dict]:
+        """Campionamento stratificato: fino a max_puzzles_per_theme righe per
+        CIASCUN tema mateInN, cosi' ogni bucket di profondita' mate riceve
+        una quota garantita di puzzle sorgente (vedi NOTA CAMPIONAMENTO
+        STRATIFICATO nel docstring di classe)."""
+        cap = self.config.max_puzzles_per_theme
+        rows_by_theme: Dict[str, List[Dict]] = {t: [] for t in themes_wanted}
+
+        pbar = tqdm(desc="Lettura CSV puzzle (stratificato)", unit=" righe valide")
+        for chunk in reader:
+            mask = chunk["Themes"].str.contains(theme_pattern, na=False)
+            filtered = chunk[mask]
+            if filtered.empty:
+                continue
+
+            for record in filtered.to_dict("records"):
+                theme_found = self._extract_theme_tag(str(record.get("Themes", "")), themes_wanted)
+                if theme_found is None:
+                    continue
+                bucket = rows_by_theme[theme_found]
+                if len(bucket) < cap:
+                    bucket.append(record)
+                    pbar.update(1)
+
+            # Stop anticipato se TUTTI i bucket sono pieni
+            if all(len(v) >= cap for v in rows_by_theme.values()):
+                break
+        pbar.close()
+
+        all_rows: List[Dict] = []
+        for theme in themes_wanted:
+            found = len(rows_by_theme[theme])
+            if found < cap:
+                logger.warning(
+                    f"Tema '{theme}': solo {found}/{cap} puzzle trovati nel CSV "
+                    f"(il dataset Lichess ne contiene meno di quanti richiesti)."
+                )
+            all_rows.extend(rows_by_theme[theme])
+
+        if self.config.max_puzzles is not None and len(all_rows) > self.config.max_puzzles:
+            logger.info(
+                f"Campionamento stratificato ha prodotto {len(all_rows)} righe, "
+                f"troncate a max_puzzles={self.config.max_puzzles} (taglio finale, "
+                f"puo' rompere la stratificazione se applicato qui: valuta di "
+                f"alzare max_puzzles invece)."
+            )
+            all_rows = all_rows[: self.config.max_puzzles]
+
+        logger.info(
+            "Distribuzione puzzle sorgente per tema (prima della generazione posizioni): "
+            + ", ".join(f"{t}={len(rows_by_theme[t])}" for t in themes_wanted)
+        )
+        return all_rows
+
+    @staticmethod
+    def _extract_theme_tag(themes: str, themes_wanted: List[str]) -> Optional[str]:
+        """Ritorna il PRIMO tema tra quelli cercati (mateIn1..mateInN) presente
+        nella stringa Themes della riga, o None se nessuno matcha (non
+        dovrebbe succedere se la riga e' gia' passata dal filtro .str.contains,
+        ma per sicurezza in caso di match parziale/overlap)."""
+        tokens = set(themes.split())
+        for t in themes_wanted:
+            if t in tokens:
+                return t
+        return None
 
     @staticmethod
     def _extract_mate_n(themes: str) -> int:
@@ -156,6 +274,7 @@ class PuzzleBuilder:
         accepted_puzzles = 0
         enqueued_positions = 0
         mate_n_counts: Dict[int, int] = defaultdict(int)
+        source_mate_n_counts: Dict[int, int] = defaultdict(int)  # NUOVO: quanti PUZZLE sorgente per mate_n_iniziale (diagnostico)
 
         for row in tqdm(all_rows, desc="Costruzione posizioni puzzle"):
             processed += 1
@@ -173,6 +292,8 @@ class PuzzleBuilder:
             if mate_n_iniziale <= 0:
                 continue
 
+            source_mate_n_counts[mate_n_iniziale] += 1
+
             puzzle_id_raw = row.get("PuzzleId")
             if not puzzle_id_raw:
                 logger.warning("Riga puzzle senza PuzzleId, scartata.")
@@ -189,9 +310,12 @@ class PuzzleBuilder:
             board.push(first_move)
 
             # Game ID leggibile e univoco per questo puzzle: "puzzle_{PuzzleId}".
-            # PuzzleId e' gia' univoco nel CSV Lichess, quindi non serve alcun
-            # contatore ne' UUID (vedi docstring di classe).
             game_id = f"puzzle_{puzzle_id_raw}"
+
+            # group_key COSTANTE per l'intera finestra/puzzle (vedi NOTA
+            # GROUP_KEY nel docstring di classe): mate_n_iniziale, non
+            # current_mate_n (che varia per-posizione).
+            window_group_key = mate_n_iniziale
 
             # I puzzle hanno una sequenza di mosse: la soluzione.
             # Prendiamo solo i ply alterni (quelli in cui il solver deve muovere)
@@ -232,11 +356,13 @@ class PuzzleBuilder:
                     board.push(move)
                     continue
 
-                # Accoda la posizione nel registry condiviso
+                # Accoda la posizione nel registry condiviso.
+                # group_key=window_group_key (costante per il puzzle), NON
+                # current_mate_n (varierebbe per-posizione, vedi sopra).
                 self._registry.enqueue(
                     source_tag="puzzle",
                     data=data,
-                    group_key=current_mate_n,
+                    group_key=window_group_key,
                 )
                 puzzle_enqueued += 1
                 mate_n_counts[current_mate_n] += 1
@@ -249,6 +375,7 @@ class PuzzleBuilder:
                         "fen": board.fen(),
                         "best_move_uci": move.uci(),
                         "mate_n": current_mate_n,
+                        "mate_n_window": window_group_key,
                         "rating": puzzle_rating,
                         "ply_idx": ply_idx,
                         "game_id": game_id,
@@ -273,13 +400,14 @@ class PuzzleBuilder:
         if self.config.save_debug_jsonl and self._debug_jsonl_path:
             self._write_debug_jsonl()
 
-        self._log_summary(processed, accepted_puzzles, enqueued_positions, mate_n_counts)
+        self._log_summary(processed, accepted_puzzles, enqueued_positions, mate_n_counts, source_mate_n_counts)
 
         return {
             "processed_puzzles": processed,
             "accepted_puzzles": accepted_puzzles,
             "enqueued_positions": enqueued_positions,
             "mate_n_counts": dict(mate_n_counts),
+            "source_mate_n_counts": dict(source_mate_n_counts),
         }
 
     def _write_debug_jsonl(self) -> None:
@@ -295,15 +423,19 @@ class PuzzleBuilder:
         os.replace(tmp_path, self._debug_jsonl_path)
         logger.info(f"Debug JSONL puzzle scritto in {self._debug_jsonl_path} ({len(all_records)} record)")
 
-    def _log_summary(self, processed, accepted, enqueued, mate_n_counts):
+    def _log_summary(self, processed, accepted, enqueued, mate_n_counts, source_mate_n_counts):
         logger.info("=" * 60)
         logger.info("PUZZLE BUILDER — RIEPILOGO (allineato a GamesBuilder)")
         logger.info("=" * 60)
         logger.info(f"Puzzle processati: {processed:,}")
         logger.info(f"Puzzle accettati (almeno una posizione): {accepted:,}")
         logger.info(f"Posizioni accodate: {enqueued:,}")
+        if source_mate_n_counts:
+            logger.info("Puzzle SORGENTE per tema mateInN dichiarato (prima della generazione posizioni):")
+            for n in sorted(source_mate_n_counts.keys()):
+                logger.info(f"  mateIn{n}: {source_mate_n_counts[n]:,} puzzle")
         if mate_n_counts:
-            logger.info("Per profondità mate (N, mosse intere):")
+            logger.info("Posizioni GENERATE per profondità mate REALE (current_mate_n, N mosse intere):")
             for n in sorted(mate_n_counts.keys()):
                 logger.info(f"  n={n}: {mate_n_counts[n]:,}")
         logger.info("=" * 60)
