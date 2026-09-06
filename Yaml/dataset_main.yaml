@@ -40,25 +40,25 @@ games_pipeline:
   mate_range_max: 10                       # Invariato (Mate in 1..10)
   search_depth: 8
   time_limit_seconds: 0.4
-  max_piece_count: null                    # Alleggerito: nessun limite di pezzi (era 18)
-  min_material_for_mate_attempt: 0         # Alleggerito: accetta qualsiasi materiale (era 4)
-  only_decisive_games: false               # Alleggerito: accetta tutte le partite (era true)
-  skip_time_forfeit: false                 # Alleggerito: accetta partite concluse per tempo (era true)
+  max_piece_count: 12                    # Alleggerito: nessun limite di pezzi (era 18)
+  min_material_for_mate_attempt: 4         # Alleggerito: accetta qualsiasi materiale (era 4)
+  only_decisive_games: true               # Alleggerito: accetta tutte le partite (era true)
+  skip_time_forfeit: true                 # Alleggerito: accetta partite concluse per tempo (era true)
   ply_sample_step: 3
-  min_ply: 0                               # Alleggerito: accetta matti dall'inizio (era 8)
+  min_ply: 6                               # Alleggerito: accetta matti dall'inizio (era 8)
   max_positions_per_game: 20
   require_clock: false
-  drop_zero_clock: false                   # Alleggerito: include mosse con tempo zero (era true)
+  drop_zero_clock: true                   # Alleggerito: include mosse con tempo zero (era true)
   workers: null
   checkpoint_every: 5000
   pool_join_timeout: 20.0
-  min_rating: null                         # Alleggerito: accetta qualsiasi ELO (era 1200)
+  min_rating: 600                         # Alleggerito: accetta qualsiasi ELO (era 1200)
   max_rating: null
-  min_material_diff_for_mate_attempt: 0    # Alleggerito: accetta matti da sacrificio (era 3)
-  require_heavy_piece: false               # Alleggerito: accetta matti con soli pezzi leggeri (era true)
+  min_material_diff_for_mate_attempt: 3    # Alleggerito: accetta matti da sacrificio (era 3)
+  require_heavy_piece: true               # Alleggerito: accetta matti con soli pezzi leggeri (era true)
   skip_forced_moves: false
   dedupe_positions: true
-  skip_trivial_endgame: false              # Alleggerito: include finali semplificati (era true)
+  skip_trivial_endgame: true              # Alleggerito: include finali semplificati (era true)
 
 puzzle_pipeline:
   decompressed_csv_filename: "lichess_puzzles.csv"

@@ -1,5 +1,4 @@
 from __future__ import annotations
-import uuid
 
 import atexit
 import bz2
@@ -9,6 +8,7 @@ import os
 import signal
 import threading
 import time
+import uuid
 import zipfile
 import multiprocessing as mp
 from collections import Counter, defaultdict
@@ -21,19 +21,31 @@ import chess.pgn
 import pandas as pd
 import zstandard as zstd
 from tqdm import tqdm
+from torch_geometric.data import Data
 
 from DatasetPipeline.Model.PositionGraphSchema import build_position_data
-from DatasetPipeline.PositionQueue import PositionQueueRegistry
+from DatasetPipeline.Utils.checkpoint_store import CheckpointStore
+from DatasetPipeline.Utils.compatibility_filters import (
+    QualityFilterConfig,
+    has_valid_ratings,
+    is_game_hard_eligible,
+    is_window_hard_valid,
+    parse_rating_strict,
+    passes_all_quality_filters_for_candidate,
+    passes_decisive_game_filter,
+    passes_forced_move_filter,
+    passes_rating_range_filter,
+    passes_time_forfeit_filter,
+)
 from DatasetPipeline.Utils.chess_replay_utils import (
     closest_bucket_time,
     compute_move_duration,
     parse_clk,
     parse_emt,
-    parse_rating,
     parse_time_control,
 )
 
-logger = logging.getLogger("relaxed_games_builder")
+logger = logging.getLogger("games_builder")
 
 # ============================================================================
 # STATO GLOBALE PER WORKER (Stockfish + Syzygy + watchdog)
@@ -62,167 +74,44 @@ _worker_config: Optional["WorkerConfig"] = None
 class WorkerConfig:
     mate_range: Tuple[int, int]
     min_ply: int
-    require_heavy_piece: bool
-    min_material_for_mate_attempt: int
-    min_material_diff_for_mate_attempt: int
-    skip_trivial_endgame: bool
-    enable_extra_prefilters: bool
-    prefilter_max_free_squares: int
-    prefilter_king_distance_threshold: int
+    quality: QualityFilterConfig
+
     candidate_min_legal_moves: int
     candidate_max_legal_moves: Optional[int]
     skip_if_in_check: bool
     max_piece_count: Optional[int]
+
     require_clock: bool
     default_move_seconds: float
     avg_time_by_rating: Dict[int, float]
     drop_zero_clock: bool
+
     stockfish_retry_attempts: int
     stockfish_retry_backoff_seconds: float
     analysis_time: Optional[float]
     search_depth: int
     multipv: int
+
     min_game_plies: int
-    only_decisive_games: bool
-    skip_time_forfeit: bool
-    min_rating: Optional[int]
-    max_rating: Optional[int]
 
 
 # ============================================================================
-# ANALIZZATORE DI MATTO ALLEGGERITO (istanziato in ogni worker)
+# ANALIZZATORE DI MATTO (istanziato in ogni worker)
 # ============================================================================
 
-class RelaxedMateAnalyzer:
-    """Analizzatore con filtri permissivi per massimizzare il throughput di partite/posizioni."""
-
-    PIECE_VALUES: Dict[int, int] = {
-        chess.PAWN: 1,
-        chess.KNIGHT: 3,
-        chess.BISHOP: 3,
-        chess.ROOK: 5,
-        chess.QUEEN: 9,
-    }
+class MateWindowAnalyzer:
+    """Cerca, dentro una singola partita, la prima finestra di matto
+    forzato che soddisfa i requisiti HARD + i filtri SOFT configurati, e
+    la rigioca costruendo direttamente i Data (PositionGraphSchema) per
+    ogni ply della finestra.
+    """
 
     def __init__(self, config: WorkerConfig):
         self.config = config
 
-    def _validate_kings(self, board: chess.Board) -> bool:
-        return board.king(chess.WHITE) is not None and board.king(chess.BLACK) is not None
-
-    def _material_by_color(self, board: chess.Board) -> Tuple[int, int]:
-        white = 0
-        black = 0
-        for p in board.piece_map().values():
-            val = self.PIECE_VALUES.get(p.piece_type, 0)
-            if p.color == chess.WHITE:
-                white += val
-            else:
-                black += val
-        return white, black
-
-    def _get_candidate_legal_moves(self, board: chess.Board) -> Optional[List[chess.Move]]:
-        cfg = self.config
-        if board.is_checkmate() or board.is_stalemate() or board.is_insufficient_material():
-            return None
-        if cfg.max_piece_count is not None and len(board.piece_map()) > cfg.max_piece_count:
-            return None
-        moves = list(board.legal_moves)
-        if len(moves) < cfg.candidate_min_legal_moves:
-            return None
-        if cfg.candidate_max_legal_moves is not None and len(moves) > cfg.candidate_max_legal_moves:
-            return None
-        if cfg.skip_if_in_check and board.is_check():
-            return None
-        return moves
-
-    def _has_mating_material(self, board: chess.Board) -> bool:
-        cfg = self.config
-        if not self._validate_kings(board):
-            return False
-        mover = board.turn
-        white_mat, black_mat = self._material_by_color(board)
-        mover_mat = white_mat if mover == chess.WHITE else black_mat
-        opp_mat = black_mat if mover == chess.WHITE else white_mat
-
-        if mover_mat < cfg.min_material_for_mate_attempt:
-            return False
-        if (mover_mat - opp_mat) < cfg.min_material_diff_for_mate_attempt:
-            return False
-        return True
-
-    def _mover_has_heavy_piece(self, board: chess.Board) -> bool:
-        mover = board.turn
-        for pt in (chess.QUEEN, chess.ROOK):
-            if board.pieces(pt, mover):
-                return True
-        return False
-
-    def _is_trivially_drawn_endgame(self, board: chess.Board) -> bool:
-        piece_map = board.piece_map()
-        has_heavy_or_pawn = any(
-            p.piece_type in (chess.QUEEN, chess.ROOK, chess.PAWN)
-            for p in piece_map.values()
-        )
-        if has_heavy_or_pawn:
-            return False
-        white_minors = sum(1 for p in piece_map.values() if p.color == chess.WHITE and p.piece_type in (chess.BISHOP, chess.KNIGHT))
-        black_minors = sum(1 for p in piece_map.values() if p.color == chess.BLACK and p.piece_type in (chess.BISHOP, chess.KNIGHT))
-        return white_minors <= 1 and black_minors <= 1
-
-    def _syzygy_says_no_mate(self, board: chess.Board) -> bool:
-        global _tablebase
-        if _tablebase is None:
-            return False
-        if board.has_castling_rights(chess.WHITE) or board.has_castling_rights(chess.BLACK):
-            return False
-        try:
-            wdl = _tablebase.probe_wdl(board)
-        except Exception:
-            return False
-        return wdl is not None and wdl <= 0
-
-    def _passes_extra_prefilters(self, board: chess.Board) -> bool:
-        cfg = self.config
-        if not cfg.enable_extra_prefilters:
-            return True
-        return passes_all_prefilters(
-            board,
-            mate_n_upper_bound=cfg.mate_range[1],
-            max_free_squares=cfg.prefilter_max_free_squares,
-            king_distance_threshold=cfg.prefilter_king_distance_threshold,
-        )
-
-    def _game_is_eligible(self, game: chess.pgn.Game) -> bool:
-        cfg = self.config
-        if game is None:
-            return False
-        try:
-            ply_count = game.end().ply()
-        except Exception:
-            return False
-        if ply_count < cfg.min_game_plies:
-            return False
-        if cfg.only_decisive_games:
-            result = game.headers.get("Result", "")
-            if result not in ("1-0", "0-1"):
-                return False
-        if cfg.skip_time_forfeit:
-            termination = game.headers.get("Termination", "")
-            if "Time forfeit" in termination:
-                return False
-        if cfg.min_rating is not None or cfg.max_rating is not None:
-            white_elo = parse_rating(game.headers.get("WhiteElo", ""))
-            black_elo = parse_rating(game.headers.get("BlackElo", ""))
-            ratings = [r for r in (white_elo, black_elo) if r is not None]
-            if ratings:
-                best_rating = max(ratings)
-                if cfg.min_rating is not None and best_rating < cfg.min_rating:
-                    return False
-                if cfg.max_rating is not None and min(ratings) > cfg.max_rating:
-                    return False
-        return True
-
+    # ------------------------------------------------------------------
+    # RICERCA DELLA FINESTRA (scansione della partita, ply per ply)
+    # ------------------------------------------------------------------
     def _analyse_position(self, board: chess.Board) -> Tuple[Optional[Any], Counter]:
         global _engine
         cfg = self.config
@@ -252,6 +141,18 @@ class RelaxedMateAnalyzer:
 
         return None, error_counts
 
+    def _syzygy_says_no_mate(self, board: chess.Board) -> bool:
+        global _tablebase
+        if _tablebase is None:
+            return False
+        if board.has_castling_rights(chess.WHITE) or board.has_castling_rights(chess.BLACK):
+            return False
+        try:
+            wdl = _tablebase.probe_wdl(board)
+        except Exception:
+            return False
+        return wdl is not None and wdl <= 0
+
     def _find_mate_window_start(
         self, game: chess.pgn.Game
     ) -> Tuple[Optional[chess.pgn.GameNode], Optional[int], Counter]:
@@ -267,27 +168,11 @@ class RelaxedMateAnalyzer:
                 node = next_node
                 continue
 
-            if self._get_candidate_legal_moves(board) is None:
-                node = next_node
-                continue
-
-            if cfg.require_heavy_piece and not self._mover_has_heavy_piece(board):
-                node = next_node
-                continue
-
-            if not self._has_mating_material(board):
-                node = next_node
-                continue
-
-            if cfg.skip_trivial_endgame and self._is_trivially_drawn_endgame(board):
+            if not passes_all_quality_filters_for_candidate(board, cfg.quality):
                 node = next_node
                 continue
 
             if self._syzygy_says_no_mate(board):
-                node = next_node
-                continue
-
-            if not self._passes_extra_prefilters(board):
                 node = next_node
                 continue
 
@@ -315,11 +200,21 @@ class RelaxedMateAnalyzer:
 
         return None, None, error_counts
 
-    def _replay_mate_window(
+    # ------------------------------------------------------------------
+    # REPLAY DELLA FINESTRA -> COSTRUZIONE DIRETTA DEI Data
+    # ------------------------------------------------------------------
+    def _replay_and_build_positions(
         self,
         start_node: chess.pgn.GameNode,
         mate_n: int,
-    ) -> Tuple[Optional[List["_RawPlyRecord"]], Counter]:
+        game_id: int,
+    ) -> Tuple[Optional[List[Data]], Counter]:
+        """Rigioca la finestra di matto forzato (target_plies = 2*mate_n-1
+        ply) e costruisce direttamente un Data per ogni ply, tramite
+        build_position_data. Ritorna None se un requisito HARD non e'
+        soddisfatto in un punto qualsiasi del replay (mossa illegale,
+        finestra troncata, matto finale non reale, nessun arco spaziale
+        per una posizione)."""
         cfg = self.config
         error_counts: Counter = Counter()
         target_plies = 2 * mate_n - 1
@@ -335,11 +230,12 @@ class RelaxedMateAnalyzer:
             chess.BLACK: base_time if base_time > 0 else None,
         }
 
-        white_elo = parse_rating(game_root.headers.get("WhiteElo", ""))
-        black_elo = parse_rating(game_root.headers.get("BlackElo", ""))
+        white_elo = parse_rating_strict(game_root.headers.get("WhiteElo"))
+        black_elo = parse_rating_strict(game_root.headers.get("BlackElo"))
         mover_rating = {chess.WHITE: white_elo, chess.BLACK: black_elo}
 
-        raw_plies: List[_RawPlyRecord] = []
+        positions: List[Data] = []
+        window_boards: List[chess.Board] = []
 
         for step in range(target_plies):
             if not node.variations:
@@ -379,64 +275,114 @@ class RelaxedMateAnalyzer:
             if cfg.drop_zero_clock and clock_seconds == 0.0 and not duration_is_real:
                 return None, error_counts
 
-            raw_plies.append(
-                _RawPlyRecord(
-                    fen_before_move=board.fen(),
-                    move_uci=move.uci(),
+            window_boards.append(board.copy(stack=False))
+
+            try:
+                data = build_position_data(
+                    board=board,
+                    best_move=move,
                     clock_seconds=float(clock_seconds),
+                    game_id=game_id,
                     ply=step,
                 )
-            )
+            except ValueError:
+                # Requisito HARD (6): nessun arco spaziale costruibile.
+                error_counts["no_spatial_edges"] += 1
+                return None, error_counts
+
+            positions.append(data)
 
             board.push(move)
             node = next_node
 
-        if not board.is_checkmate():
+        # HARD (3)+(1)+(4): matto reale, Re presenti, mate_n nel range.
+        if not is_window_hard_valid(board, mate_n, cfg.mate_range):
+            error_counts["window_not_hard_valid"] += 1
             return None, error_counts
 
-        return raw_plies, error_counts
+        # SOFT: sequenza a mossa forzata su tutta la finestra (default ON).
+        if not passes_forced_move_filter(window_boards, cfg.quality):
+            error_counts["skipped_forced_move_window"] += 1
+            return None, error_counts
+
+        return positions, error_counts
 
 
 # ============================================================================
 # FUNZIONI DI SUPPORTO E WORKER MAIN
 # ============================================================================
 
-def _worker_main(args: Tuple[int, str, str]) -> Tuple[int, "_WindowResult"]:
+@dataclass
+class _WindowBuildResult:
+    positions: Optional[List[Data]]
+    mate_n: Optional[int]
+    game_id: Optional[int]
+    source_tag: str
+    error_counts: Counter = field(default_factory=Counter)
+
+
+def _worker_main(args: Tuple[int, str, str]) -> Tuple[int, "_WindowBuildResult"]:
     global _engine, _worker_config
     task_local_id, pgn_text, source_tag = args
     error_counts: Counter = Counter()
 
     if _engine is None:
         error_counts["engine_unavailable"] += 1
-        return task_local_id, _WindowResult(None, None, source_tag, error_counts)
+        return task_local_id, _WindowBuildResult(None, None, None, source_tag, error_counts)
 
     try:
         game = chess.pgn.read_game(io.StringIO(pgn_text))
     except Exception as e:
         error_counts[f"pgn_parse:{type(e).__name__}"] += 1
-        return task_local_id, _WindowResult(None, None, source_tag, error_counts)
+        return task_local_id, _WindowBuildResult(None, None, None, source_tag, error_counts)
 
     if game is None:
-        return task_local_id, _WindowResult(None, None, source_tag, error_counts)
+        return task_local_id, _WindowBuildResult(None, None, None, source_tag, error_counts)
 
     if game.headers.get("Variant", "Standard").lower() not in ("standard", "normal"):
-        return task_local_id, _WindowResult(None, None, source_tag, error_counts)
+        return task_local_id, _WindowBuildResult(None, None, None, source_tag, error_counts)
 
-    analyzer = RelaxedMateAnalyzer(_worker_config)
-    if not analyzer._game_is_eligible(game):
-        return task_local_id, _WindowResult(None, None, source_tag, error_counts)
+    cfg = _worker_config
+
+    # HARD: partita eleggibile (non vuota/corrotta) + rating validi per
+    # ENTRAMBI i giocatori (requisito esplicito, non negoziabile).
+    if not is_game_hard_eligible(game, min_plies=cfg.min_game_plies):
+        error_counts["missing_or_invalid_ratings_or_too_short"] += 1
+        return task_local_id, _WindowBuildResult(None, None, None, source_tag, error_counts)
+
+    # SOFT (default ON): esclude partite terminate per tempo scaduto.
+    if not passes_time_forfeit_filter(game.headers, cfg.quality):
+        error_counts["skipped_time_forfeit"] += 1
+        return task_local_id, _WindowBuildResult(None, None, None, source_tag, error_counts)
+
+    # SOFT (default OFF, disponibile se riattivato): solo partite decisive.
+    if not passes_decisive_game_filter(game.headers, cfg.quality):
+        error_counts["skipped_not_decisive"] += 1
+        return task_local_id, _WindowBuildResult(None, None, None, source_tag, error_counts)
+
+    # SOFT (default OFF, disponibile se riattivato): range di rating.
+    if not passes_rating_range_filter(game.headers, cfg.quality):
+        error_counts["skipped_rating_range"] += 1
+        return task_local_id, _WindowBuildResult(None, None, None, source_tag, error_counts)
+
+    analyzer = MateWindowAnalyzer(cfg)
 
     try:
         start_node, mate_n, search_errors = analyzer._find_mate_window_start(game)
         error_counts.update(search_errors)
 
         if start_node is None:
-            return task_local_id, _WindowResult(None, None, source_tag, error_counts)
+            return task_local_id, _WindowBuildResult(None, None, None, source_tag, error_counts)
 
-        raw_plies, replay_errors = analyzer._replay_mate_window(start_node, mate_n)
+        game_id = uuid.uuid4().int & ((1 << 63) - 1)
+
+        positions, replay_errors = analyzer._replay_and_build_positions(start_node, mate_n, game_id)
         error_counts.update(replay_errors)
 
-        return task_local_id, _WindowResult(raw_plies, mate_n, source_tag, error_counts)
+        if not positions:
+            return task_local_id, _WindowBuildResult(None, None, None, source_tag, error_counts)
+
+        return task_local_id, _WindowBuildResult(positions, mate_n, game_id, source_tag, error_counts)
 
     except Exception as e:
         error_counts[f"unexpected:{type(e).__name__}"] += 1
@@ -444,7 +390,7 @@ def _worker_main(args: Tuple[int, str, str]) -> Tuple[int, "_WindowResult"]:
             f"Errore inatteso nel worker per task_local_id={task_local_id} "
             f"(source={source_tag}): {type(e).__name__}: {e}"
         )
-        return task_local_id, _WindowResult(None, None, source_tag, error_counts)
+        return task_local_id, _WindowBuildResult(None, None, None, source_tag, error_counts)
 
 
 def _watchdog_arm(time_limit: float, margin: Optional[float] = None) -> None:
@@ -600,36 +546,31 @@ class _ClosingStream:
         return False
 
 
-@dataclass
-class _RawPlyRecord:
-    fen_before_move: str
-    move_uci: str
-    clock_seconds: float
-    ply: int
-
-
-@dataclass
-class _WindowResult:
-    plies: Optional[List[_RawPlyRecord]]
-    mate_n: Optional[int]
-    source_tag: str
-    error_counts: Counter = field(default_factory=Counter)
-
-
 # ============================================================================
-# RELAXED GAMES BUILDER
+# GAMES BUILDER
 # ============================================================================
 
-class RelaxedGamesBuilder:
-    """Pipeline di estrazione ad alto rendimento con filtri fortemente alleggeriti.
-    Mantiene il range mate_range=(1, 10) garantendo la massima resa di campioni.
+class GamesBuilder:
+    """Estrae finestre di matto forzato da sorgenti PGN (Lichess/FICS/Club),
+    costruisce i Data (PositionGraphSchema) e li accumula in un
+    CheckpointStore che mantiene sempre e solo 3 file di output:
+    train_games.pt, val_games.pt, test_games.pt, riscritti stratificati
+    per mate_n ad ogni checkpoint (vedi checkpoint_store.py).
+
+    Rispetto alla precedente RelaxedGamesBuilder:
+      - i filtri sono esternalizzati in compatibility_filters.py, con
+        distinzione esplicita hard/soft (vedi docstring di modulo);
+      - i Data vengono davvero costruiti e accodati (bug corretto);
+      - non usa piu' PositionQueueRegistry/shard: la persistenza a
+        checkpoint e' gestita da CheckpointStore.
     """
 
     def __init__(
         self,
         sources: List[SourceSpec],
         stockfish_path: str,
-        mate_range: Tuple[int, int] = (1, 10),  # Mantenuto mate in 1..10
+        output_dir: str,
+        mate_range: Tuple[int, int] = (1, 10),
         search_depth: int = 8,
         analysis_time: Optional[float] = 0.2,
         workers: Optional[int] = None,
@@ -639,34 +580,21 @@ class RelaxedGamesBuilder:
         default_move_seconds: float = 15.0,
         avg_time_by_rating: Optional[Dict[int, float]] = None,
         require_clock: bool = False,
-        min_ply: int = 0,                        # Alleggerito da 8 a 0
-        min_game_plies: int = 2,                 # Alleggerito da 20 a 2
-        candidate_min_legal_moves: int = 1,
-        candidate_max_legal_moves: Optional[int] = None,
-        skip_if_in_check: bool = False,
-        max_piece_count: Optional[int] = None,   # Alleggerito da 18 a None (nessun limite)
-        only_decisive_games: bool = False,       # Alleggerito da True a False
-        skip_time_forfeit: bool = False,         # Alleggerito da True a False
-        min_material_for_mate_attempt: int = 0,  # Alleggerito da 4 a 0
-        drop_zero_clock: bool = False,           # Alleggerito da True a False
+        min_ply: int = 0,
+        min_game_plies: int = 2,
+        quality: Optional[QualityFilterConfig] = None,
         pool_join_timeout: Optional[float] = 20.0,
         syzygy_path: Optional[str] = None,
-        checkpoint_log_every: int = 5000,
+        checkpoint_every: int = 5000,
         config_error_cls: type = ValueError,
-        min_rating: Optional[int] = None,        # Alleggerito da 1200 a None
-        max_rating: Optional[int] = None,
-        min_material_diff_for_mate_attempt: int = 0, # Alleggerito da 3 a 0
-        require_heavy_piece: bool = False,      # Alleggerito da True a False
-        skip_trivial_endgame: bool = False,      # Alleggerito da True a False
+        split_ratios: Tuple[float, float, float] = (0.7, 0.1, 0.2),
+        split_seed: int = 42,
         stockfish_retry_attempts: int = 2,
         stockfish_retry_backoff_seconds: float = 0.5,
-        queue_state_path: Optional[str] = None,
-        enable_extra_prefilters: bool = False,   # Alleggerito da True a False
-        prefilter_max_free_squares: int = 4,
-        prefilter_king_distance_threshold: int = 5,
     ):
         self.sources = sources
         self.stockfish_path = stockfish_path
+        self.output_dir = output_dir
         self.mate_range = mate_range
         self.search_depth = search_depth
         self.analysis_time = analysis_time
@@ -678,33 +606,23 @@ class RelaxedGamesBuilder:
         self.require_clock = require_clock
         self.min_ply = max(0, min_ply)
         self.min_game_plies = min_game_plies
-        self.candidate_min_legal_moves = candidate_min_legal_moves
-        self.candidate_max_legal_moves = candidate_max_legal_moves
-        self.skip_if_in_check = skip_if_in_check
-        self.max_piece_count = max_piece_count
-        self.only_decisive_games = only_decisive_games
-        self.skip_time_forfeit = skip_time_forfeit
-        self.min_material_for_mate_attempt = min_material_for_mate_attempt
-        self.drop_zero_clock = drop_zero_clock
+        self.quality = quality or QualityFilterConfig()
         self.pool_join_timeout = pool_join_timeout
         self.syzygy_path = syzygy_path
-        self.checkpoint_log_every = checkpoint_log_every
+        self.checkpoint_every = checkpoint_every
         self._config_error_cls = config_error_cls
-        self.min_rating = min_rating
-        self.max_rating = max_rating
-        self.min_material_diff_for_mate_attempt = min_material_diff_for_mate_attempt
-        self.require_heavy_piece = require_heavy_piece
-        self.skip_trivial_endgame = skip_trivial_endgame
         self.stockfish_retry_attempts = max(1, stockfish_retry_attempts)
         self.stockfish_retry_backoff_seconds = stockfish_retry_backoff_seconds
-        self.enable_extra_prefilters = enable_extra_prefilters
-        self.prefilter_max_free_squares = prefilter_max_free_squares
-        self.prefilter_king_distance_threshold = prefilter_king_distance_threshold
 
         cpu_count = os.cpu_count() or 2
         self.workers = workers or max(1, cpu_count - 1)
 
-        self._queue_registry = PositionQueueRegistry.instance(state_path=queue_state_path)
+        self._store = CheckpointStore(
+            output_dir=output_dir,
+            split_ratios=split_ratios,
+            seed=split_seed,
+        )
+
         self._validate_parameters()
 
     def _validate_parameters(self) -> None:
@@ -723,14 +641,10 @@ class RelaxedGamesBuilder:
         if not (os.path.exists(self.stockfish_path) and os.access(self.stockfish_path, os.X_OK)):
             raise self._config_error_cls(f"Stockfish non trovato/eseguibile: {self.stockfish_path}.")
 
-    def _enqueue_window(self, window: _WindowResult) -> int:
-        if not window.plies:
-            return 0
-        enqueued = 0
-        for ply_record in window.plies:
-            enqueued += 1
-        return enqueued
-
+    # ------------------------------------------------------------------
+    # LETTURA SORGENTI (invariata nella logica rispetto alla versione
+    # precedente)
+    # ------------------------------------------------------------------
     def _open_pgn_text_stream(self, path: str, kind: str):
         if kind == "lichess":
             raw_file = open(path, "rb")
@@ -799,35 +713,28 @@ class RelaxedGamesBuilder:
                 global_id += 1
                 yield (global_id, pgn_text, src.tag)
 
+    # ------------------------------------------------------------------
+    # RUN
+    # ------------------------------------------------------------------
     def run(self) -> Dict[str, Any]:
         config = WorkerConfig(
             mate_range=self.mate_range,
             min_ply=self.min_ply,
-            require_heavy_piece=self.require_heavy_piece,
-            min_material_for_mate_attempt=self.min_material_for_mate_attempt,
-            min_material_diff_for_mate_attempt=self.min_material_diff_for_mate_attempt,
-            skip_trivial_endgame=self.skip_trivial_endgame,
-            enable_extra_prefilters=self.enable_extra_prefilters,
-            prefilter_max_free_squares=self.prefilter_max_free_squares,
-            prefilter_king_distance_threshold=self.prefilter_king_distance_threshold,
-            candidate_min_legal_moves=self.candidate_min_legal_moves,
-            candidate_max_legal_moves=self.candidate_max_legal_moves,
-            skip_if_in_check=self.skip_if_in_check,
-            max_piece_count=self.max_piece_count,
+            quality=self.quality,
+            candidate_min_legal_moves=self.quality.candidate_min_legal_moves,
+            candidate_max_legal_moves=self.quality.candidate_max_legal_moves,
+            skip_if_in_check=self.quality.skip_if_in_check,
+            max_piece_count=self.quality.max_piece_count,
             require_clock=self.require_clock,
             default_move_seconds=self.default_move_seconds,
             avg_time_by_rating=self.avg_time_by_rating,
-            drop_zero_clock=self.drop_zero_clock,
+            drop_zero_clock=False,
             stockfish_retry_attempts=self.stockfish_retry_attempts,
             stockfish_retry_backoff_seconds=self.stockfish_retry_backoff_seconds,
             analysis_time=self.analysis_time,
             search_depth=self.search_depth,
             multipv=self.multipv,
             min_game_plies=self.min_game_plies,
-            only_decisive_games=self.only_decisive_games,
-            skip_time_forfeit=self.skip_time_forfeit,
-            min_rating=self.min_rating,
-            max_rating=self.max_rating,
         )
 
         pool = mp.Pool(
@@ -842,25 +749,42 @@ class RelaxedGamesBuilder:
         mate_n_counts: Dict[int, int] = defaultdict(int)
         aggregated_errors: Counter = Counter()
 
+        # chunksize dinamico: riduce l'overhead IPC quando ci sono molte
+        # task piccole, senza sacrificare il bilanciamento del carico tra
+        # worker (chunksize troppo alto farebbe attendere i worker piu'
+        # lenti). Euristica semplice: qualche centinaio di task per worker
+        # al massimo, non piu' di 50 per chunk.
+        dynamic_chunksize = max(1, min(50, self.workers * 4))
+
         try:
             task_stream = self._iter_all_tasks()
-            results = pool.imap_unordered(_worker_main, task_stream, chunksize=1)
+            results = pool.imap_unordered(_worker_main, task_stream, chunksize=dynamic_chunksize)
 
-            pbar = tqdm(results, desc="[Relaxed] Ricerca finestre matto", dynamic_ncols=True)
+            pbar = tqdm(results, desc="[GamesBuilder] Ricerca finestre matto", dynamic_ncols=True)
             for task_local_id, window in pbar:
                 processed_games += 1
                 aggregated_errors.update(window.error_counts)
 
-                if window.plies is None:
+                if window.positions is None:
                     continue
 
-                n_enqueued = self._enqueue_window(window)
-                if n_enqueued == 0:
-                    continue
+                self._store.add_window(
+                    game_id=window.game_id,
+                    group_key=window.mate_n,
+                    positions=window.positions,
+                )
 
                 accepted_windows += 1
-                enqueued_positions += n_enqueued
+                enqueued_positions += len(window.positions)
                 mate_n_counts[window.mate_n] += 1
+
+                if processed_games % self.checkpoint_every == 0:
+                    self._store.checkpoint()
+                    pbar.set_postfix(
+                        accepted=accepted_windows,
+                        positions=enqueued_positions,
+                        refresh=False,
+                    )
 
             pbar.close()
         except KeyboardInterrupt:
@@ -870,11 +794,20 @@ class RelaxedGamesBuilder:
             pool.close()
             pool.join()
 
-        logger.info(f"Riepilogo finale: {processed_games} partite elaborate, {accepted_windows} finestre valide scoperte per mate_range (1..10).")
+        # Checkpoint finale, garantisce che l'ultimo batch parziale (sotto
+        # checkpoint_every) sia comunque scritto sui 3 file di output.
+        window_counts = self._store.finalize()
+
+        logger.info(
+            f"Riepilogo finale: {processed_games} partite elaborate, "
+            f"{accepted_windows} finestre valide accettate (mate_range={self.mate_range})."
+        )
         return {
             "processed_games": processed_games,
             "accepted_windows": accepted_windows,
             "enqueued_positions": enqueued_positions,
             "error_counts": dict(aggregated_errors),
             "mate_n_counts": dict(mate_n_counts),
+            "final_window_counts": window_counts,
+            "output_paths": self._store.final_paths,
         }
