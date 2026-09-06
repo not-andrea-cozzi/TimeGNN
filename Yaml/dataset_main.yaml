@@ -36,6 +36,7 @@
     club_max_games: 1000
     club_skip_games: 0
     club_pgn_col: "pgn"
+    analysis_time: null
 
     # --- Parametri critici ---
     mate_range_min: 1
@@ -46,15 +47,15 @@
     min_material_for_mate_attempt: 3      # ⬇ abbassato per includere più matti
     only_decisive_games: true             # invariato
     skip_time_forfeit: true               # invariato
-    ply_sample_step: 3                    # invariato
+    ply_sample_step: 8                    # invariato
     min_ply: 6                            # invariato
     max_positions_per_game: 20            # invariato
     require_clock: true                   # SEMPRE TRUE
     drop_zero_clock: true                 # invariato
-    workers: 4                         # invariato (auto)
+    workers: null                        # invariato (auto)
     checkpoint_every: 2000                # invariato
     pool_join_timeout: 20.0               # invariato
-    min_rating: 1000                      # ⬆ alza leggermente per escludere partite troppo casuali
+    min_rating: 1200                      # ⬆ alza leggermente per escludere partite troppo casuali
     max_rating: null                      # invariato
     min_material_diff_for_mate_attempt: 2 # ⬇ abbassato per accettare più sacrifici
     require_heavy_piece: false            # ⬅ **FALSE** per includere matti con soli pezzi leggeri

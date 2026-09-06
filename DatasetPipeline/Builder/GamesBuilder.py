@@ -3,6 +3,7 @@ from __future__ import annotations
 import atexit
 import bz2
 import io
+from multiprocessing import pool
 import os
 import re
 import signal
@@ -692,16 +693,52 @@ class GamesBuilder:
 
         estimate = self._count_tasks_estimate()
 
-        def cleanup_after_failure() -> None:
+        def _force_shutdown_pool() -> None:
+            """Chiude il pool con un timeout GARANTITO su ogni fase: mai un
+            join bloccante indefinito, a costo di finire con SIGKILL diretto
+            sui pid se i worker non rispondono a terminate()."""
             old_sigint = signal.signal(signal.SIGINT, signal.SIG_IGN)
             try:
-                pool.terminate()
                 timeout = cfg.pool_join_timeout if cfg.pool_join_timeout is not None else 15.0
                 deadline = time.monotonic() + timeout
+
+                # Fase 1: attesa "pulita" di terminazione naturale.
                 for proc in pool._pool:
                     remaining = deadline - time.monotonic()
-                    if remaining <= 0: break
+                    if remaining <= 0:
+                        break
                     proc.join(timeout=remaining)
+
+                # Fase 2: SIGTERM ai processi ancora vivi (chi e' appeso
+                # dentro _engine.analyse() con Stockfish non responsivo
+                # non torna mai al loop del pool da solo).
+                pool.terminate()
+
+                kill_deadline = time.monotonic() + 5.0
+                for proc in pool._pool:
+                    remaining = kill_deadline - time.monotonic()
+                    proc.join(timeout=max(remaining, 0.1))
+
+                # Fase 3: rete di sicurezza. Se anche dopo terminate()
+                # qualcuno e' ancora vivo, SIGKILL diretto sul pid.
+                for proc in pool._pool:
+                    if proc.is_alive():
+                        logger.warning(
+                            f"[GamesBuilder] Worker pid={proc.pid} ancora vivo dopo "
+                            f"terminate(): invio SIGKILL diretto."
+                        )
+                        try:
+                            os.kill(proc.pid, signal.SIGKILL)
+                        except ProcessLookupError:
+                            pass
+                        except Exception as e:
+                            logger.warning(f"[GamesBuilder] SIGKILL su pid={proc.pid} fallito: {e}")
+
+                # Join finale, breve: a questo punto i processi sono morti
+                # o morenti. Non deve mai bloccare a lungo; se scade
+                # comunque si prosegue (zombie residui li ripulisce l'OS).
+                for proc in pool._pool:
+                    proc.join(timeout=2.0)
             finally:
                 signal.signal(signal.SIGINT, old_sigint)
 
@@ -718,7 +755,8 @@ class GamesBuilder:
                 processed_games += 1
 
                 records: List[Dict[str, Any]] = decode_from_ipc(payload)
-                if not records: continue
+                if not records:
+                    continue
 
                 accepted_games += 1
 
@@ -743,16 +781,20 @@ class GamesBuilder:
                         self._debug_records[split_name].append(debug_entry)
 
         except KeyboardInterrupt:
-            print("\n[WARNING] Interruzione richiesta: arresto pulito dei worker in corso...")
-            cleanup_after_failure()
+            print("\n[WARNING] Interruzione richiesta: arresto forzato dei worker in corso...")
+            _force_shutdown_pool()
             raise
         except Exception:
-            print("\n[WARNING] Errore durante l'analisi: arresto pulito dei worker in corso...")
-            cleanup_after_failure()
+            print("\n[WARNING] Errore durante l'analisi: arresto forzato dei worker in corso...")
+            _force_shutdown_pool()
             raise
-        finally:
+        else:
+            # Percorso "normale": pool.close() (niente nuovi task), poi
+            # comunque la stessa chiusura con timeout garantito, perche' il
+            # blocco visto in produzione avveniva PROPRIO qui, non solo sui
+            # rami d'eccezione.
             pool.close()
-            pool.join()
+            _force_shutdown_pool()
 
         self._registry.flush()
 
