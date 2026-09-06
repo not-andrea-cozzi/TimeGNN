@@ -1,0 +1,13 @@
+--index-url https://download.pytorch.org/whl/cu128
+torch
+torchvision
+torchaudio
+
+# Dipendenze generali
+zstandard
+python-chess
+pandas
+tqdm
+scikit-learn
+seaborn
+pyyaml

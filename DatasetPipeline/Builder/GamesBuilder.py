@@ -99,9 +99,9 @@ import pandas as pd
 import zstandard as zstd
 from tqdm import tqdm
 
-from PositionGraphSchema import build_position_data
-from PositionQueue import PositionQueueRegistry
-from chess_replay_utils import (
+from DatasetPipeline.Model.PositionGraphSchema import build_position_data
+from DatasetPipeline.PositionQueue import PositionQueueRegistry
+from DatasetPipeline.Utils.chess_replay_utils import (
     closest_bucket_time,
     compute_move_duration,
     parse_clk,

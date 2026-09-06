@@ -1,29 +1,6 @@
 """
-PositionQueue.py
 
-Sostituisce SequenceQueue.py (schema a grafo-sequenza, superato) con il
-contratto aggiornato al nuovo PositionGraphSchema.py: un item in coda e'
-ora UNA SINGOLA POSIZIONE (grafo spaziale a 64 nodi), non piu' un'intera
-finestra di matto forzato collassata in un solo Data a nodo=ply.
-
-MOTIVO DEL CAMBIO (vedi discussione di design): DualGATModel e
-DualGATTimeAwareModel, i due modelli su cui verte l'ablation study
-richiesto dal progetto, sono modelli PER-NODO su un grafo SPAZIALE (board),
-non modelli di next-event-prediction su sequenze. Ogni ply di una finestra
-di matto forzato diventa quindi un CAMPIONE INDIPENDENTE: la board a quel
-ply, con la mossa migliore (quella realmente giocata nel PGN) come target.
-
-game_id e ply (entrambi scalari dentro ogni Data, vedi PositionGraphSchema)
-restano il modo per tracciare quali posizioni appartengono alla stessa
-finestra/partita: lo split e la stratificazione avvengono per POSIZIONE
-(ogni posizione e' un campione a se' nel train/val/test), ma un'analisi
-futura che voglia raggruppare le posizioni per partita puo' sempre
-raggrupparle per game_id (come gia' fa oggi PuzzleSequenceDataset per lo
-schema precedente).
-
-CONTRATTO
-=========
-Il chiamante (GamesBuilder, PuzzleGraphDataset) ha gia' calcolato, per una
+Il chiamante (GamesBuilder, PuzzleBuilder) ha gia' calcolato, per una
 finestra di matto forzato accettata, la lista di posizioni che la
 compongono (ognuna gia' un torch_geometric.data.Data pronto, costruito con
 PositionGraphSchema.build_position_data). Chiama, PER OGNI POSIZIONE:
@@ -43,13 +20,10 @@ intera", aveva senso assegnare un id per item in coda; ora che l'unita' e'
 (tutte le posizioni della stessa finestra), quindi la sua assegnazione
 torna naturalmente a monte, nel builder che gia' conosce l'appartenenza
 alla finestra.
-
-PERSISTENZA, SPLIT, SINGLETON: stesso design di SequenceQueue.py (vedi
-quel modulo per la discussione completa di persistenza differita e
-concorrenza), qui non ripetuta.
 """
 from __future__ import annotations
 
+import glob
 import json
 import logging
 import os
@@ -65,6 +39,9 @@ from torch_geometric.data import Data
 logger = logging.getLogger("position_queue")
 
 DEFAULT_STATE_FILENAME = "position_queue_state.json"
+DEFAULT_SHARD_SIZE = 500
+SHARD_FILENAME_TEMPLATE = "shard_{:08d}.pt"
+SHARD_GLOB_PATTERN = "shard_*.pt"
 
 
 class PositionQueueError(RuntimeError):
@@ -80,15 +57,29 @@ class _QueuedPosition:
     data: Data
 
 
+def _spool_dir_for(state_path: str) -> str:
+    """Deriva la directory di spool dal path del file di stato JSON:
+    stessa cartella, sottocartella dedicata basata sul nome del file di
+    stato (senza estensione) + '_spool', cosi' piu' registry con
+    state_path diversi (es. in test) non condividono lo spool per errore.
+    """
+    base_dir = os.path.dirname(os.path.abspath(state_path)) or "."
+    stem = os.path.splitext(os.path.basename(state_path))[0]
+    return os.path.join(base_dir, f"{stem}_spool")
+
+
 class PositionQueueRegistry:
-    """Singleton: coda in-memory di posizioni + split stratificato.
+    """Singleton: coda di posizioni (in-memory + spool su disco per
+    resume) + split stratificato.
 
     A differenza di SequenceQueueRegistry (superato), NON assegna piu' un
     game_id: quello e' gia' dentro ogni Data.game_id, assegnato a monte dal
     chiamante (condiviso da tutte le posizioni della stessa finestra di
-    matto forzato). Questa classe si occupa solo di:
-        1. accodare le posizioni in arrivo (FIFO, in-memory);
-        2. drenare la coda e produrre gli split train/val/test,
+    matto forzato). Questa classe si occupa di:
+        1. accodare le posizioni in arrivo (FIFO, in-memory + shard su
+           disco per sopravvivere a un crash, vedi docstring di modulo);
+        2. ricaricare shard non ancora drenati da run precedenti;
+        3. drenare la coda e produrre gli split train/val/test,
            stratificati per group_key (tipicamente mate_n).
 
     Uso tipico:
@@ -105,30 +96,40 @@ class PositionQueueRegistry:
     _instance: Optional["PositionQueueRegistry"] = None
     _instance_lock = threading.Lock()
 
-    def __init__(self, state_path: str) -> None:
+    def __init__(self, state_path: str, shard_size: int = DEFAULT_SHARD_SIZE) -> None:
         """Non chiamare direttamente: usare PositionQueueRegistry.instance()."""
         self._state_path = state_path
+        self._shard_size = max(1, shard_size)
+        self._spool_dir = _spool_dir_for(state_path)
+        os.makedirs(self._spool_dir, exist_ok=True)
+
         self._lock = threading.Lock()
         self._queue: "Queue[_QueuedPosition]" = Queue()
+        self._pending_shard: List[_QueuedPosition] = []
         self._next_local_ref = 0
+        self._next_shard_index = 0
         self._enqueued_count = self._load_enqueued_count()
+
+        self._reload_existing_shards()
 
     # ------------------------------------------------------------------
     # SINGLETON
     # ------------------------------------------------------------------
     @classmethod
-    def instance(cls, state_path: Optional[str] = None) -> "PositionQueueRegistry":
+    def instance(cls, state_path: Optional[str] = None, shard_size: int = DEFAULT_SHARD_SIZE) -> "PositionQueueRegistry":
         """Ritorna l'unica istanza del registry, creandola al primo uso.
 
         Args:
             state_path: percorso del file di stato (contatore diagnostico
-                di posizioni processate; NON un contatore di id, dato che
-                il game_id non e' piu' allocato qui). Usato SOLO alla
-                primissima creazione dell'istanza nel processo.
+                di posizioni processate). Usato SOLO alla primissima
+                creazione dell'istanza nel processo. La directory di spool
+                (shard su disco) viene derivata da questo path.
+            shard_size: numero di posizioni accumulate in memoria prima di
+                un flush su disco. Usato SOLO alla primissima creazione.
         """
         with cls._instance_lock:
             if cls._instance is None:
-                cls._instance = cls(state_path or DEFAULT_STATE_FILENAME)
+                cls._instance = cls(state_path or DEFAULT_STATE_FILENAME, shard_size=shard_size)
             elif state_path is not None and state_path != cls._instance._state_path:
                 logger.warning(
                     f"PositionQueueRegistry gia' istanziato con state_path="
@@ -145,7 +146,7 @@ class PositionQueueRegistry:
             cls._instance = None
 
     # ------------------------------------------------------------------
-    # PERSISTENZA (solo contatore diagnostico, nessun id da allocare qui)
+    # PERSISTENZA (contatore diagnostico)
     # ------------------------------------------------------------------
     def _load_enqueued_count(self) -> int:
         if not os.path.exists(self._state_path):
@@ -169,10 +170,112 @@ class PositionQueueRegistry:
         os.replace(tmp_path, self._state_path)
 
     # ------------------------------------------------------------------
+    # SPOOL SU DISCO (shard batch): scrittura, reload, cleanup
+    # ------------------------------------------------------------------
+    def _existing_shard_paths(self) -> List[str]:
+        """Shard presenti sul disco, ordinati per indice crescente (ordine
+        di scrittura, irrilevante per la correttezza ma utile per log
+        deterministici)."""
+        pattern = os.path.join(self._spool_dir, SHARD_GLOB_PATTERN)
+        return sorted(glob.glob(pattern))
+
+    def _reload_existing_shards(self) -> None:
+        """Ricarica in coda gli shard lasciati da una run precedente
+        interrotta prima di un build_splits(). Chiamato SOLO da __init__:
+        una volta ricaricati, gli shard restano sul disco finche'
+        build_splits() non li consuma con successo (cosi' un secondo
+        crash durante il reload stesso non perde nulla)."""
+        shard_paths = self._existing_shard_paths()
+        if not shard_paths:
+            self._next_shard_index = 0
+            return
+
+        reloaded = 0
+        for path in shard_paths:
+            try:
+                records = torch.load(path, weights_only=False)
+            except Exception as e:
+                logger.warning(
+                    f"Shard {path} presente ma illeggibile ({e}): scartato "
+                    f"(le posizioni in questo shard sono perse, ma il resto "
+                    f"dello spool resta valido)."
+                )
+                continue
+            for rec in records:
+                item = _QueuedPosition(
+                    local_ref=self._next_local_ref,
+                    source_tag=rec["source_tag"],
+                    group_key=rec["group_key"],
+                    data=rec["data"],
+                )
+                self._next_local_ref += 1
+                self._queue.put(item)
+                reloaded += 1
+
+        # Prossimo indice shard: continua dopo l'ultimo gia' presente, cosi'
+        # non si rischia di sovrascrivere shard esistenti non ancora
+        # ripuliti (es. se il reload di uno shard e' fallito sopra).
+        existing_indices = []
+        for path in shard_paths:
+            name = os.path.basename(path)
+            try:
+                idx = int(name[len("shard_"):-len(".pt")])
+                existing_indices.append(idx)
+            except ValueError:
+                continue
+        self._next_shard_index = (max(existing_indices) + 1) if existing_indices else 0
+
+        if reloaded:
+            logger.info(
+                f"[PositionQueueRegistry] Ricaricate {reloaded:,} posizioni da "
+                f"{len(shard_paths)} shard residui in {self._spool_dir} "
+                f"(run precedente interrotta prima di build_splits)."
+            )
+
+    def _flush_pending_shard_locked(self) -> None:
+        """Scrive su disco il buffer pendente come nuovo shard (scrittura
+        atomica tmp+replace) e lo svuota. Il chiamante deve gia' detenere
+        self._lock."""
+        if not self._pending_shard:
+            return
+
+        records = [
+            {"source_tag": item.source_tag, "group_key": item.group_key, "data": item.data}
+            for item in self._pending_shard
+        ]
+
+        shard_path = os.path.join(self._spool_dir, SHARD_FILENAME_TEMPLATE.format(self._next_shard_index))
+        tmp_path = shard_path + ".tmp"
+        torch.save(records, tmp_path)
+        os.replace(tmp_path, shard_path)
+
+        self._next_shard_index += 1
+        self._pending_shard = []
+
+    def _clear_spool(self) -> None:
+        """Rimuove tutti gli shard su disco: chiamato SOLO dopo che
+        build_splits() ha gia' prodotto con successo gli split finali,
+        quindi le posizioni sono ormai al sicuro nel risultato restituito
+        al chiamante (che tipicamente le salva subito in merged_*.pt)."""
+        for path in self._existing_shard_paths():
+            try:
+                os.remove(path)
+            except OSError as e:
+                logger.warning(f"Impossibile rimuovere lo shard consumato {path}: {e}")
+
+    # ------------------------------------------------------------------
     # ENQUEUE
     # ------------------------------------------------------------------
     def enqueue(self, source_tag: str, data: Data, group_key: int) -> int:
         """Accoda una SINGOLA posizione gia' assemblata.
+
+        La posizione entra subito nella coda in-memory (visibile
+        immediatamente a pending_count()/build_splits()) e viene inoltre
+        accumulata in un buffer che, al raggiungimento di shard_size
+        elementi, viene scritto su disco come shard (vedi docstring di
+        modulo): questo garantisce che un crash del processo perda al
+        massimo le ultime shard_size-1 posizioni non ancora flushate,
+        invece dell'intera coda.
 
         Args:
             source_tag: etichetta della sorgente (es. "lichess", "fics",
@@ -212,20 +315,43 @@ class PositionQueueRegistry:
                 data=data,
             )
             self._queue.put(item)
+            self._pending_shard.append(item)
             self._enqueued_count += 1
+
+            if len(self._pending_shard) >= self._shard_size:
+                self._flush_pending_shard_locked()
 
         return local_ref
 
     def pending_count(self) -> int:
-        """Numero di posizioni attualmente in coda, non ancora drenate."""
+        """Numero di posizioni attualmente in coda, non ancora drenate
+        (indipendentemente dal fatto che siano gia' state flushate su
+        disco come shard o solo nel buffer in-memory)."""
         return self._queue.qsize()
+
+    def flush(self) -> None:
+        """Forza la scrittura su disco del buffer pendente, anche se sotto
+        soglia shard_size. Utile per checkpoint espliciti (es. log
+        periodici in GamesBuilder.run()) senza dover aspettare
+        build_splits()."""
+        with self._lock:
+            self._flush_pending_shard_locked()
 
     # ------------------------------------------------------------------
     # DRAIN + SPLIT STRATIFICATO
     # ------------------------------------------------------------------
     def _drain_all(self) -> List[_QueuedPosition]:
-        drained: List[_QueuedPosition] = []
         with self._lock:
+            # Flush finale del buffer parziale: senza questo, le ultime
+            # posizioni sotto shard_size resterebbero SOLO in coda
+            # in-memory (drenate correttamente in questa run, ma se
+            # build_splits() fallisse DOPO il drain e PRIMA di ritornare,
+            # non ci sarebbe piu' alcuno shard su disco da cui recuperarle
+            # in una run successiva). Flush prima del drain elimina questa
+            # finestra residua.
+            self._flush_pending_shard_locked()
+
+            drained: List[_QueuedPosition] = []
             while not self._queue.empty():
                 drained.append(self._queue.get())
         return drained
@@ -235,8 +361,9 @@ class PositionQueueRegistry:
         split_ratios: Tuple[float, float, float] = (0.7, 0.1, 0.2),
         seed: int = 42,
     ) -> Dict[str, List[Data]]:
-        """Drena la coda e produce gli split train/val/test, SPLIT-SAFE
-        per finestra (game_id) e stratificati per group_key (mate_n).
+        """Drena la coda (in-memory + shard su disco residui) e produce
+        gli split train/val/test, SPLIT-SAFE per finestra (game_id) e
+        stratificati per group_key (mate_n).
 
         FIX LEAKAGE (rispetto alla prima versione di questo modulo): lo
         split NON avviene piu' per singola posizione, ma per FINESTRA
@@ -257,6 +384,15 @@ class PositionQueueRegistry:
         STESSA partizione in gruppi: la differenza pratica sta solo nel
         fatto che qui il campionamento/shuffle per split opera su BLOCCHI
         (finestre), non su singole posizioni.
+
+        Lo spool su disco (shard residui) viene ripulito SOLO se lo split
+        va a buon fine: un'eccezione durante il calcolo lascia gli shard
+        intatti, recuperabili da una run successiva (le posizioni gia'
+        drenate dalla coda in-memory in QUESTA chiamata fallita non
+        vengono pero' extra-persistite: se build_splits() solleva
+        un'eccezione DOPO il drain, si assume che il chiamante rilanci
+        l'intero processo, che ricarichera' gli shard rimasti al prossimo
+        avvio di instance()).
 
         Args:
             split_ratios: proporzioni (train, val, test), devono sommare a
@@ -349,6 +485,10 @@ class PositionQueueRegistry:
             result[split_name] = [data_list[i] for i in perm.tolist()]
 
         self._persist_enqueued_count()
+        # Solo ora le posizioni drenate sono al sicuro nel risultato che
+        # sta per essere ritornato al chiamante: gli shard su disco che le
+        # contenevano non servono piu' come backup.
+        self._clear_spool()
         self._log_distribution(result, groups_of_windows, window_counts)
 
         return result
