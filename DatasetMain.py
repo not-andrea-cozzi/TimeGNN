@@ -1,34 +1,19 @@
 """
-
 STEP DELLA PIPELINE (con resume via PipelineState)
     1. time_stats             — statistiche tempo medio per rating da PGN
                                  (opzionale: se raw_data.games_zst manca,
                                  saltato, avg_time_by_rating resta vuoto).
-    2. games_pipeline          — GamesBuilder.run(): scansiona le sorgenti
-                                 partite, costruisce le posizioni
-                                 (PositionGraphSchema) e le accumula in un
-                                 CheckpointStore interno che scrive e
-                                 mantiene aggiornati, ad ogni checkpoint,
-                                 SOLO 3 file finali (non piu' shard):
-                                 train_games.pt / val_games.pt /
-                                 test_games.pt in games_pipeline_dir,
-                                 stratificati per mate_n. Questo step,
-                                 quindi, produce GIA' l'output finale dei
-                                 games: non serve piu' un finalize_splits
-                                 successivo per loro (vedi CheckpointStore
-                                 in DatasetPipeline/Builder/checkpoint_store.py).
+    2. games_pipeline          — GamesBuilder.run(): scandisce le sorgenti
+                                 PGN, analizza le posizioni e le accoda
+                                 nel PositionQueueRegistry condiviso.
     3. decompress_puzzles      — decomprime il CSV puzzle Lichess (.zst).
     4. build_puzzles           — PuzzleBuilder.run(): accoda le posizioni
-                                 puzzle sul registry condiviso
-                                 (PositionQueueRegistry), INVARIATO
-                                 rispetto a prima: i puzzle restano un
-                                 flusso separato dai games (decisione
-                                 esplicita di progetto), in attesa di un
-                                 eventuale merge futuro.
-    5. finalize_splits         — build_splits() SOLO per i puzzle: drena
-                                 il registry puzzle e produce/salva
-                                 train.pt/val.pt/test.pt in
-                                 puzzles_pipeline_dir.
+                                 puzzle nel registry condiviso.
+    5. finalize_splits         — build_splits() sul registry unisce tutte
+                                 le posizioni (games + puzzles), stratifica
+                                 per mate_n e produce i tre file finali:
+                                 train.pt, val.pt, test.pt nella directory
+                                 di merged_dataset.
 """
 from __future__ import annotations
 
@@ -36,7 +21,7 @@ import logging
 import os
 import sys
 import time
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional
 
 import torch
 import zstandard as zstd
@@ -47,9 +32,8 @@ try:
 except ImportError:
     yaml = None
 
-from DatasetPipeline.Builder.GamesBuilder import GamesBuilder, SourceSpec
-from DatasetPipeline.Utils.compatibility_filters import QualityFilterConfig
-from DatasetPipeline.Builder.PuzzleBuilder import PuzzleBuilder
+from DatasetPipeline.Builder.GamesBuilder import GamesBuilder, GamesBuilderConfig, SourceSpec
+from DatasetPipeline.Builder.PuzzleBuilder import PuzzleBuilder, PuzzleBuilderConfig
 from DatasetPipeline.PositionQueue import PositionQueueRegistry
 from DatasetPipeline.TimeStatBuilder import TimeStatsBuilder, load_avg_time_by_rating
 from DatasetPipeline.PipelineState import PipelineState, retry, file_ready, torch_pt_ready
@@ -277,7 +261,7 @@ def main(config_path: str = "Yaml/main.yaml") -> None:
     setup_logging(log_level, log_file)
 
     logger.info("=" * 70)
-    logger.info("AVVIO PIPELINE DATASET TIMEGNN")
+    logger.info("AVVIO PIPELINE DATASET TIMEGNN (con PositionQueueRegistry)")
     logger.info("=" * 70)
 
     step = pipe_cfg.get("step")
@@ -289,15 +273,16 @@ def main(config_path: str = "Yaml/main.yaml") -> None:
 
     stockfish_path = engine_cfg["stockfish_path"]
     dataset_dir = pipe_cfg.get("dataset_dir", "Dataset")
-    puzzles_dir = os.path.join(dataset_dir, pipe_cfg.get("puzzles_subfolder", "Puzzles"))
     merged_dir = os.path.join(dataset_dir, pipe_cfg.get("merged_subfolder", "Train"))
     games_output_dir = os.path.join(dataset_dir, pipe_cfg.get("games_subfolder", "Games"))
+    puzzles_dir = os.path.join(dataset_dir, pipe_cfg.get("puzzles_subfolder", "Puzzles"))
 
-    for d in (dataset_dir, puzzles_dir, merged_dir, games_output_dir):
+    for d in (dataset_dir, games_output_dir, puzzles_dir, merged_dir):
         os.makedirs(d, exist_ok=True)
     logger.info(
-        f"Directory pipeline pronte: dataset_dir='{dataset_dir}', puzzles_dir='{puzzles_dir}', "
-        f"merged_dir='{merged_dir}', games_output_dir='{games_output_dir}'."
+        f"Directory pipeline pronte: dataset_dir='{dataset_dir}', "
+        f"games_output_dir='{games_output_dir}', puzzles_dir='{puzzles_dir}', "
+        f"merged_dir='{merged_dir}'."
     )
 
     state_file = pipe_cfg.get("state_file", "pipeline_state.json")
@@ -309,6 +294,13 @@ def main(config_path: str = "Yaml/main.yaml") -> None:
     if force and os.path.exists(state_path):
         logger.warning(f"Flag FORCE attivo: azzeramento stato precedente ('{state_path}').")
         os.remove(state_path)
+        # Reset anche il registry
+        if os.path.exists(queue_state_path):
+            os.remove(queue_state_path)
+        spool_dir = os.path.join(os.path.dirname(queue_state_path), "position_queue_state_spool")
+        if os.path.exists(spool_dir):
+            import shutil
+            shutil.rmtree(spool_dir)
 
     state = PipelineState(state_path)
     logger.info(f"Stato pipeline caricato da '{state_path}'.")
@@ -326,9 +318,9 @@ def main(config_path: str = "Yaml/main.yaml") -> None:
 
     ctx: Dict[str, Any] = {}
 
-    # ========================================================================
-    # STEP 1: Statistiche tempo medio per rating
-    # ========================================================================
+    # --------------------------------------------------------------------
+    # STEP 1: time_stats
+    # --------------------------------------------------------------------
     logger.info("-" * 70)
     logger.info("STEP 1/5: time_stats")
     logger.info("-" * 70)
@@ -365,18 +357,12 @@ def main(config_path: str = "Yaml/main.yaml") -> None:
         ctx["avg_time_by_rating"] = load_avg_time_by_rating(time_stats_path)
         logger.info(f"avg_time_by_rating ricaricato da '{time_stats_path}': {len(ctx['avg_time_by_rating'])} bucket.")
 
-    # ========================================================================
-    # STEP 2: GamesBuilder — costruisce e scrive GIA' i 3 file finali
-    # (train_games.pt/val_games.pt/test_games.pt) via CheckpointStore interno.
-    # ========================================================================
+    # --------------------------------------------------------------------
+    # STEP 2: games_pipeline
+    # --------------------------------------------------------------------
     logger.info("-" * 70)
-    logger.info("STEP 2/5: games_pipeline (GamesBuilder, output diretto a 3 file stratificati)")
+    logger.info("STEP 2/5: games_pipeline (GamesBuilder con PositionQueueRegistry)")
     logger.info("-" * 70)
-
-    games_final_paths = {
-        split: os.path.join(games_output_dir, f"{split}_games.pt")
-        for split in ("train", "val", "test")
-    }
 
     def _step_games_pipeline() -> None:
         require_executable(stockfish_path, "Eseguibile Stockfish mancante o non avviabile.")
@@ -387,104 +373,88 @@ def main(config_path: str = "Yaml/main.yaml") -> None:
                 "Nessuna sorgente (Lichess, FICS o Club) configurata o trovata: "
                 "step 'games_pipeline' non produce alcuna posizione."
             )
-            ctx["games_result"] = {"accepted_windows": 0, "enqueued_positions": 0, "output_paths": games_final_paths}
+            ctx["games_result"] = {"processed_games": 0, "accepted_games": 0, "enqueued_positions": 0}
             return
 
-        quality = QualityFilterConfig(
-            skip_time_forfeit=games_cfg.get("skip_time_forfeit", True),
-            skip_forced_single_move_window=games_cfg.get("skip_forced_single_move_window", True),
-            only_decisive_games=games_cfg.get("only_decisive_games", False),
-            min_material_for_mate_attempt=games_cfg.get("min_material_for_mate_attempt", 0),
-            min_material_diff_for_mate_attempt=games_cfg.get("min_material_diff_for_mate_attempt", 0),
-            require_heavy_piece=games_cfg.get("require_heavy_piece", False),
-            skip_trivial_endgame=games_cfg.get("skip_trivial_endgame", False),
-            min_rating=games_cfg.get("min_rating"),
-            max_rating=games_cfg.get("max_rating"),
-            max_piece_count=games_cfg.get("max_piece_count"),
-            candidate_min_legal_moves=games_cfg.get("candidate_min_legal_moves", 1),
-            candidate_max_legal_moves=games_cfg.get("candidate_max_legal_moves"),
-            skip_if_in_check=games_cfg.get("skip_if_in_check", False),
-        )
-        logger.info(f"QualityFilterConfig risolta: {quality}")
-
-        logger.info(
-            f"Costruzione GamesBuilder: {len(sources)} sorgenti, stockfish_path='{stockfish_path}', "
-            f"mate_range={mate_train_range}, workers={games_cfg.get('workers') or '(auto: cpu_count-1)'}, "
-            f"checkpoint_every={games_cfg.get('checkpoint_every', 5000)}, output_dir='{games_output_dir}'."
-        )
-
-        builder = GamesBuilder(
+        gb_config = GamesBuilderConfig(
             sources=sources,
             stockfish_path=stockfish_path,
-            output_dir=games_output_dir,
             mate_range=mate_train_range,
-
             search_depth=games_cfg.get("search_depth", 8),
             analysis_time=games_cfg.get("time_limit_seconds", 0.2),
-
-            workers=games_cfg.get("workers"),
+            workers=games_cfg.get("workers", 4),
             threads=engine_cfg.get("threads", 1),
             hash_mb=engine_cfg.get("hash_mb", 128),
             multipv=1,
-
-            default_move_seconds=15.0,
-            avg_time_by_rating=ctx.get("avg_time_by_rating", {}),
-            require_clock=games_cfg.get("require_clock", False),
-
-            min_ply=games_cfg.get("min_ply", 0),
-            min_game_plies=games_cfg.get("min_game_plies", 2),
-
-            quality=quality,
-
-            pool_join_timeout=games_cfg.get("pool_join_timeout", 20.0),
             syzygy_path=engine_cfg.get("syzygy_path"),
-            checkpoint_every=games_cfg.get("checkpoint_every", 5000),
-            config_error_cls=PipelineConfigError,
+            stockfish_retry_attempts=games_cfg.get("stockfish_retry_attempts", 2),
+            stockfish_retry_backoff_seconds=games_cfg.get("stockfish_retry_backoff_seconds", 0.5),
+
+            candidate_min_legal_moves=games_cfg.get("candidate_min_legal_moves", 1),
+            candidate_max_legal_moves=games_cfg.get("candidate_max_legal_moves"),
+            skip_if_in_check=games_cfg.get("skip_if_in_check", False),
+            max_piece_count=games_cfg.get("max_piece_count", 18),
+            min_material_for_mate_attempt=games_cfg.get("min_material_for_mate_attempt", 4),
+            min_material_diff_for_mate_attempt=games_cfg.get("min_material_diff_for_mate_attempt", 3),
+            require_heavy_piece=games_cfg.get("require_heavy_piece", True),
+            skip_forced_moves=games_cfg.get("skip_forced_moves", True),
+            skip_trivial_endgame=games_cfg.get("skip_trivial_endgame", True),
+            dedupe_positions=games_cfg.get("dedupe_positions", True),
+
+            require_clock=games_cfg.get("require_clock", False),
+            default_move_seconds=games_cfg.get("default_move_seconds", 15.0),
+            avg_time_by_rating=ctx.get("avg_time_by_rating", {}),
+            drop_zero_clock=games_cfg.get("drop_zero_clock", True),
+            min_rating=games_cfg.get("min_rating"),
+            max_rating=games_cfg.get("max_rating"),
+
+            min_ply=games_cfg.get("min_ply", 8),
+            ply_sample_step=games_cfg.get("ply_sample_step", 3),
+            max_positions_per_game=games_cfg.get("max_positions_per_game", 20),
+
+            only_decisive_games=games_cfg.get("only_decisive_games", True),
+            skip_time_forfeit=games_cfg.get("skip_time_forfeit", True),
+            min_game_plies=games_cfg.get("min_game_plies", 20),
+
+            queue_state_path=queue_state_path,
+            shard_size=games_cfg.get("shard_size", 500),
+
+            save_debug_jsonl=games_cfg.get("save_debug_jsonl", True),
+            debug_jsonl_dir=games_output_dir,
+
             split_ratios=split_ratios,
             split_seed=pipe_cfg.get("seed", 42),
         )
 
+        builder = GamesBuilder(gb_config)
         logger.info("GamesBuilder pronto, avvio run()...")
         t0 = time.monotonic()
         result = builder.run()
         elapsed = time.monotonic() - t0
 
         ctx["games_result"] = result
-
         logger.info(
             f"games_pipeline completato in {elapsed:.2f}s: "
-            f"{result['processed_games']:,} partite elaborate, "
-            f"{result['accepted_windows']:,} finestre accettate, "
-            f"{result['enqueued_positions']:,} posizioni totali."
+            f"{result.get('processed_games', 0):,} partite elaborate, "
+            f"{result.get('accepted_games', 0):,} partite accettate, "
+            f"{result.get('enqueued_positions', 0):,} posizioni accodate."
         )
-        if result["processed_games"] > 0:
-            resa_pct = 100.0 * result["accepted_windows"] / result["processed_games"]
-            logger.info(f"Resa (finestre accettate / partite elaborate): {resa_pct:.2f}%.")
-
         if result.get("error_counts"):
             logger.info("Riepilogo errori/scarti durante games_pipeline:")
             for err_name, count in sorted(result["error_counts"].items(), key=lambda kv: -kv[1]):
                 logger.info(f"    {err_name}: {count:,}")
 
-        if not result.get("accepted_windows"):
-            logger.warning(
-                "games_pipeline non ha accettato alcuna finestra: "
-                "train_games.pt/val_games.pt/test_games.pt potrebbero essere assenti o vuoti."
-            )
-
     if step is None or step == "games_pipeline":
         run_step(
             state,
             "games_pipeline",
-            is_ready_fn=lambda: state.is_done("games_pipeline") and all(
-                torch_pt_ready(p) for p in games_final_paths.values()
-            ),
+            is_ready_fn=lambda: state.is_done("games_pipeline"),
             do_fn=_step_games_pipeline,
         )
 
-    # ========================================================================
-    # STEP 3: Decompressione puzzle Lichess
-    # ========================================================================
+    # --------------------------------------------------------------------
+    # STEP 3: decompress_puzzles
+    # --------------------------------------------------------------------
     logger.info("-" * 70)
     logger.info("STEP 3/5: decompress_puzzles")
     logger.info("-" * 70)
@@ -512,46 +482,45 @@ def main(config_path: str = "Yaml/main.yaml") -> None:
             do_fn=_step_decompress_puzzles,
         )
 
-    # ========================================================================
-    # STEP 4: Posizioni puzzle -> accodate sul registry condiviso (INVARIATO)
-    # ========================================================================
+    # --------------------------------------------------------------------
+    # STEP 4: build_puzzles
+    # --------------------------------------------------------------------
     logger.info("-" * 70)
-    logger.info("STEP 4/5: build_puzzles")
+    logger.info("STEP 4/5: build_puzzles (PuzzleBuilder con PositionQueueRegistry)")
     logger.info("-" * 70)
-
-    queue_registry = PositionQueueRegistry.instance(state_path=queue_state_path)
 
     def _step_build_puzzles() -> None:
-            if "avg_time_by_rating" not in ctx:
-                ctx["avg_time_by_rating"] = (
-                    load_avg_time_by_rating(time_stats_path) if file_ready(time_stats_path) else {}
-                )
-
-            debug_jsonl_path = os.path.join(puzzles_dir, "puzzle_debug.jsonl")
-            logger.info(
-                f"Costruzione PuzzleBuilder: csv_path='{puzzle_csv_path}', mate_range={mate_train_range}, "
-                f"max_puzzles={puzzle_cfg.get('max_puzzles', 100000)}, debug_jsonl='{debug_jsonl_path}'."
+        if "avg_time_by_rating" not in ctx:
+            ctx["avg_time_by_rating"] = (
+                load_avg_time_by_rating(time_stats_path) if file_ready(time_stats_path) else {}
             )
 
-            builder = PuzzleBuilder(
-                csv_path=puzzle_csv_path,
-                mate_range=mate_train_range,
-                max_puzzles=puzzle_cfg.get("max_puzzles", 100000),
-                avg_time_by_rating=ctx["avg_time_by_rating"],
-                chunksize=puzzle_cfg.get("chunksize", 50000),
-                queue_state_path=queue_state_path,
-                debug_jsonl_path=debug_jsonl_path,
-                config_error_cls=PipelineConfigError,
-            )
-            t0 = time.monotonic()
-            result = builder.run()
-            elapsed = time.monotonic() - t0
-            ctx["puzzle_result"] = result
-            logger.info(
-                f"build_puzzles completato in {elapsed:.2f}s: "
-                f"{result.get('accepted_puzzles', 0):,} puzzle accettati, "
-                f"{result.get('enqueued_positions', 0):,} posizioni accodate."
-            )
+        pb_config = PuzzleBuilderConfig(
+            csv_path=puzzle_csv_path,
+            mate_range=mate_train_range,
+            max_puzzles=puzzle_cfg.get("max_puzzles", 100000),
+            avg_time_by_rating=ctx["avg_time_by_rating"],
+            chunksize=puzzle_cfg.get("chunksize", 50000),
+            queue_state_path=queue_state_path,
+            shard_size=puzzle_cfg.get("shard_size", 500),
+            save_debug_jsonl=puzzle_cfg.get("save_debug_jsonl", True),
+            debug_jsonl_dir=puzzles_dir,
+            split_ratios=split_ratios,
+            split_seed=pipe_cfg.get("seed", 42),
+            max_positions_per_puzzle=puzzle_cfg.get("max_positions_per_puzzle"),
+        )
+
+        builder = PuzzleBuilder(pb_config)
+        logger.info("PuzzleBuilder pronto, avvio run()...")
+        t0 = time.monotonic()
+        result = builder.run()
+        elapsed = time.monotonic() - t0
+        ctx["puzzle_result"] = result
+        logger.info(
+            f"build_puzzles completato in {elapsed:.2f}s: "
+            f"{result.get('accepted_puzzles', 0):,} puzzle accettati, "
+            f"{result.get('enqueued_positions', 0):,} posizioni accodate."
+        )
 
     if file_ready(puzzle_csv_path):
         if step is None or step == "build_puzzles":
@@ -564,55 +533,53 @@ def main(config_path: str = "Yaml/main.yaml") -> None:
     else:
         logger.info("puzzle_csv non pronto: step 'build_puzzles' saltato.")
 
-    # ========================================================================
-    # STEP 5: FINALIZE — SOLO per i puzzle (i games sono gia' scritti dallo
-    # step 2 tramite CheckpointStore, con split stratificato aggiornato ad
-    # ogni checkpoint durante games_pipeline stesso).
-    # ========================================================================
+    # --------------------------------------------------------------------
+    # STEP 5: finalize_splits
+    # --------------------------------------------------------------------
     logger.info("-" * 70)
-    logger.info("STEP 5/5: finalize_splits (solo puzzle)")
+    logger.info("STEP 5/5: finalize_splits (merge games + puzzles e salvataggio)")
     logger.info("-" * 70)
 
-    puzzle_final_paths = {
-        split: os.path.join(puzzles_dir, f"{split}.pt")
+    final_paths = {
+        split: os.path.join(merged_dir, f"{split}.pt")
         for split in ("train", "val", "test")
     }
 
     def _step_finalize_splits() -> None:
-        logger.info("Drenaggio registry puzzle e calcolo split stratificato...")
-        splits = queue_registry.build_splits(split_ratios=split_ratios, seed=pipe_cfg.get("seed", 42))
+        registry = PositionQueueRegistry.instance(state_path=queue_state_path)
+        logger.info("Drenaggio registry e calcolo split stratificato...")
+        splits = registry.build_splits(split_ratios=split_ratios, seed=pipe_cfg.get("seed", 42))
 
-        os.makedirs(puzzles_dir, exist_ok=True)
+        os.makedirs(merged_dir, exist_ok=True)
         for split_name, data_list in splits.items():
-            out_path = puzzle_final_paths[split_name]
+            out_path = final_paths[split_name]
             tmp_path = out_path + ".tmp"
             torch.save(data_list, tmp_path)
             os.replace(tmp_path, out_path)
             size_mb = os.path.getsize(out_path) / (1024 * 1024)
-            logger.info(f"Salvato {split_name} (puzzle): {len(data_list)} posizioni in '{out_path}' ({size_mb:.2f} MB).")
+            logger.info(f"Salvato {split_name}: {len(data_list)} posizioni in '{out_path}' ({size_mb:.2f} MB).")
 
         if not splits.get("train"):
-            raise PipelineConfigError("Split 'train' (puzzle) vuoto dopo finalize_splits: nessuna posizione disponibile.")
+            raise PipelineConfigError("Split 'train' vuoto: nessuna posizione disponibile.")
 
     if step is None or step == "finalize_splits":
         run_step(
             state,
             "finalize_splits",
-            is_ready_fn=lambda: all(torch_pt_ready(p) for p in puzzle_final_paths.values()),
+            is_ready_fn=lambda: all(torch_pt_ready(p) for p in final_paths.values()),
             do_fn=_step_finalize_splits,
         )
 
     logger.info("=" * 70)
     logger.info("PIPELINE COMPLETATA CON SUCCESSO")
-    logger.info(f"Dataset games (train/val/test) in: {games_output_dir}")
-    logger.info(f"Dataset puzzle (train/val/test) in: {puzzles_dir}")
+    logger.info(f"Dataset finale (train/val/test) in: {merged_dir}")
     logger.info("=" * 70)
 
 
 if __name__ == "__main__":
     import argparse
 
-    parser = argparse.ArgumentParser(description="Costruzione dataset TimeGNN (schema board-level per posizione).")
+    parser = argparse.ArgumentParser(description="Costruzione dataset TimeGNN (schema board-level con PositionQueueRegistry).")
     parser.add_argument("--config", default="Yaml/dataset_main.yaml", help="Percorso del file YAML di configurazione.")
     args = parser.parse_args()
 

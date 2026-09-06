@@ -1,22 +1,15 @@
-"""
-Sostituisce PuzzleGraphDataset.py (schema compresso a sequenza, superato,
-basato su GraphBuilder/SequenceIdAllocator) con un BUILDER allineato al
-contratto di GamesBuilder.py: usa PositionGraphSchema.build_position_data
-per costruire ogni singola posizione (grafo spaziale a 64 caselle) e
-PositionQueueRegistry.enqueue per accodarla, condividendo la STESSA coda
-di GamesBuilder cosi' che PositionQueueRegistry.build_splits() unisca e
-splitti insieme partite reali e puzzle in un'unica pipeline coerente.
-
-"""
 from __future__ import annotations
-import uuid
+
 import json
 import logging
 import os
+import uuid
+from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
 
 import chess
 import pandas as pd
+import torch
 from tqdm import tqdm
 
 from DatasetPipeline.Model.PositionGraphSchema import build_position_data
@@ -25,108 +18,99 @@ from DatasetPipeline.PositionQueue import PositionQueueRegistry
 logger = logging.getLogger("puzzle_builder")
 
 
+@dataclass(frozen=True)
+class PuzzleBuilderConfig:
+    """Configurazione per PuzzleBuilder (allineata a GamesBuilderConfig)."""
+    csv_path: str
+    mate_range: Tuple[int, int] = (1, 5)          # mateInN da includere
+    max_puzzles: Optional[int] = None             # limite dopo il filtro tematico
+    avg_time_by_rating: Dict[int, float] = field(default_factory=dict)  # da TimeStatBuilder
+    chunksize: int = 50_000                       # lettura chunk CSV
+
+    # Queue condivisa
+    queue_state_path: Optional[str] = None        # se None usa default di PositionQueueRegistry
+    shard_size: int = 500
+
+    # Debug
+    save_debug_jsonl: bool = True
+    debug_jsonl_dir: Optional[str] = None         # se None usa dir del queue_state_path
+
+    # Split per debug (usato solo per scrivere JSONL separati, lo split reale è in registry)
+    split_ratios: Tuple[float, float, float] = (0.7, 0.1, 0.2)
+    split_seed: int = 42
+
+    # Numero massimo di posizioni per puzzle (None = tutte)
+    max_positions_per_puzzle: Optional[int] = None
+
+
 class PuzzleBuilder:
-    """Builder per il dataset puzzle Lichess, allineato al contratto
-    board-level di GamesBuilder (vedi docstring di modulo).
+    """
+    Builder per dataset puzzle Lichess, allineato al contratto di GamesBuilder.
+    Ogni puzzle viene trattato come una "finestra" di posizioni (i ply alterni)
+    e ogni posizione viene accodata in PositionQueueRegistry con un game_id univoco
+    (uuid) per puzzle, in modo da garantire split coerenti (tutte le posizioni
+    di uno stesso puzzle vanno nello stesso split).
 
-    Uso tipico (dopo GamesBuilder.run(), per condividere il registry e
-    conoscere il prossimo game_id libero):
-
-        games_result = games_builder.run()
-
-        puzzle_builder = PuzzleBuilder(
-            csv_path="lichess_puzzles.csv",
-            mate_range=(1, 5),
-            max_puzzles=100_000,
-            avg_time_by_rating=avg_time_by_rating,
-            queue_state_path="Dataset/position_queue_state.json",
-            debug_jsonl_path="Dataset/Puzzles/puzzle_debug.jsonl",
-        )
-        puzzle_result = puzzle_builder.run(game_id_start=games_result["accepted_windows"])
-
-        splits = PositionQueueRegistry.instance().build_splits(split_ratios=(0.7, 0.1, 0.2))
+    Uso tipico:
+        config = PuzzleBuilderConfig(csv_path="lichess_puzzles.csv", ...)
+        builder = PuzzleBuilder(config)
+        result = builder.run()
+        # poi, insieme a GamesBuilder, chiamare:
+        registry = PositionQueueRegistry.instance()
+        splits = registry.build_splits(...)
     """
 
-    def __init__(
-        self,
-        csv_path: str,
-        mate_range: Tuple[int, int] = (1, 5),
-        max_puzzles: Optional[int] = None,
-        avg_time_by_rating: Optional[Dict[int, float]] = None,
-        chunksize: int = 50_000,
-        queue_state_path: Optional[str] = None,
-        debug_jsonl_path: Optional[str] = None,
-        config_error_cls: type = ValueError,
-    ) -> None:
-        """
-        Args:
-            csv_path: percorso del CSV puzzle Lichess (PuzzleId, FEN,
-                Moves, Rating, Themes, ...).
-            mate_range: (min, max) inclusivi di N per il tema "mateInN"
-                da includere.
-            max_puzzles: limite superiore di righe CSV processate (dopo il
-                filtro tema), None = nessun limite.
-            avg_time_by_rating: mappa {bucket_rating: secondi_medi} da
-                TimeStatBuilder, usata per simulare clock_seconds quando il
-                puzzle non ha un tempo reale (i puzzle non hanno mai clock
-                reale: e' sempre simulato, vedi _simulated_clock).
-            chunksize: dimensione dei chunk di lettura del CSV (righe).
-            queue_state_path: path del file di stato di
-                PositionQueueRegistry, per ottenere la STESSA istanza
-                condivisa (via PositionQueueRegistry.instance()) usata da
-                GamesBuilder. Se None, usa l'istanza gia' eventualmente
-                creata nel processo (o il default della classe).
-            debug_jsonl_path: se fornito, scrive un file .jsonl di audit
-                (fen, best_move_uci, puzzle_id, mate_n, rating, ply_idx,
-                game_id) accanto ai dati accodati, un record per posizione,
-                nello stesso ordine di accodamento.
-            config_error_cls: classe di eccezione da sollevare per errori
-                di configurazione (permette all'orchestratore di
-                distinguere errori di config da altri errori).
-        """
-        self.csv_path = csv_path
-        self.mate_range = mate_range
-        self.max_puzzles = max_puzzles
-        self.avg_time_by_rating = avg_time_by_rating or {}
-        self.chunksize = chunksize
-        self.debug_jsonl_path = debug_jsonl_path
-        self._config_error_cls = config_error_cls
+    def __init__(self, config: PuzzleBuilderConfig):
+        self.config = config
+        self._validate_config()
 
-        self._queue_registry = PositionQueueRegistry.instance(state_path=queue_state_path)
+        # Ottieni istanza condivisa del registry
+        self._registry = PositionQueueRegistry.instance(
+            state_path=config.queue_state_path,
+            shard_size=config.shard_size
+        )
 
-        self._validate_parameters()
+        # Preparazione debug JSONL
+        self._debug_records: Dict[str, List[Dict]] = {"train": [], "val": [], "test": []}
+        self._debug_jsonl_path = None
+        if config.save_debug_jsonl:
+            if config.debug_jsonl_dir:
+                os.makedirs(config.debug_jsonl_dir, exist_ok=True)
+                self._debug_jsonl_path = os.path.join(config.debug_jsonl_dir, "puzzle_debug.jsonl")
+            else:
+                state_dir = os.path.dirname(config.queue_state_path) if config.queue_state_path else "."
+                os.makedirs(state_dir, exist_ok=True)
+                self._debug_jsonl_path = os.path.join(state_dir, "puzzle_debug.jsonl")
 
-    def _validate_parameters(self) -> None:
-        lo, hi = self.mate_range
-        if lo < 1:
-            raise self._config_error_cls("mate_range deve iniziare da almeno 1.")
-        if hi < lo:
-            raise self._config_error_cls("mate_range non valido.")
-        if not os.path.exists(self.csv_path):
-            raise self._config_error_cls(f"CSV puzzle non trovato: {self.csv_path}.")
-        if self.max_puzzles is not None and self.max_puzzles < 1:
-            raise self._config_error_cls("max_puzzles deve essere >= 1 se specificato.")
+    def _validate_config(self) -> None:
+        cfg = self.config
+        if cfg.mate_range[0] < 1:
+            raise ValueError("mate_range deve iniziare da almeno 1.")
+        if cfg.mate_range[1] < cfg.mate_range[0]:
+            raise ValueError("mate_range non valido.")
+        if not os.path.exists(cfg.csv_path):
+            raise ValueError(f"CSV puzzle non trovato: {cfg.csv_path}.")
+        if cfg.max_puzzles is not None and cfg.max_puzzles < 1:
+            raise ValueError("max_puzzles deve essere >= 1 se specificato.")
+        if cfg.chunksize < 1:
+            raise ValueError("chunksize deve essere >= 1.")
 
     # ------------------------------------------------------------------
-    # LETTURA E FILTRO CSV (invariati nella logica rispetto alla versione
-    # precedente: filtro per tema mateInN dentro mate_range, limite
-    # max_puzzles applicato DOPO il filtro).
+    # LETTURA E FILTRO CSV
     # ------------------------------------------------------------------
-    def _load_filtered_rows(self) -> List[dict]:
-        lo, hi = self.mate_range
+    def _load_filtered_rows(self) -> List[Dict]:
+        lo, hi = self.config.mate_range
         theme_pattern = "|".join(f"mateIn{n}" for n in range(lo, hi + 1))
-        rows: List[dict] = []
-        reader = pd.read_csv(self.csv_path, chunksize=self.chunksize)
+        rows: List[Dict] = []
+        reader = pd.read_csv(self.config.csv_path, chunksize=self.config.chunksize)
         pbar = tqdm(desc="Lettura CSV puzzle", unit=" righe valide")
-
         for chunk in reader:
             mask = chunk["Themes"].str.contains(theme_pattern, na=False)
             filtered = chunk[mask]
             rows.extend(filtered.to_dict("records"))
             pbar.update(len(filtered))
-
-            if self.max_puzzles and len(rows) >= self.max_puzzles:
-                rows = rows[: self.max_puzzles]
+            if self.config.max_puzzles and len(rows) >= self.config.max_puzzles:
+                rows = rows[:self.config.max_puzzles]
                 break
         pbar.close()
         return rows
@@ -139,51 +123,38 @@ class PuzzleBuilder:
         return 0
 
     def _simulated_clock(self, rating: float) -> float:
-        """Tempo simulato per un puzzle (i puzzle non hanno clock reale):
-        se disponibili statistiche per rating (da TimeStatBuilder), usa il
-        bucket piu' vicino; altrimenti una rampa lineare semplice in
-        funzione del rating come fallback grezzo."""
-        if self.avg_time_by_rating:
+        """Tempo simulato per puzzle (i puzzle non hanno clock reale)."""
+        if self.config.avg_time_by_rating:
             bucket = round(rating / 100) * 100
-            return self.avg_time_by_rating.get(bucket, 15.0)
+            return self.config.avg_time_by_rating.get(bucket, 15.0)
+        # Fallback lineare
         return 5.0 + (rating / 3000.0) * 55.0
 
-    # ------------------------------------------------------------------
-    # PROCESSING: per ogni puzzle, replay ply-per-ply -> build_position_data
-    # -> enqueue, esattamente come GamesBuilder fa per le finestre di
-    # matto forzato da partite reali.
-    # ------------------------------------------------------------------
-    def run(self, game_id_start: int = 0) -> Dict[str, Any]:
-        """Processa il CSV puzzle e accoda ogni posizione risultante sul
-        PositionQueueRegistry condiviso.
+    def _assign_split(self, game_id: int) -> str:
+        """Split deterministico per debug JSONL (usa lo stesso seed di GamesBuilder)."""
+        import random
+        rng = random.Random(self.config.split_seed + game_id)
+        val = rng.random()
+        train, val_ratio, _ = self.config.split_ratios
+        if val < train:
+            return "train"
+        if val < train + val_ratio:
+            return "val"
+        return "test"
 
-        Args:
-            game_id_start: DEPRECATO, mantenuto solo per compatibilita'
-                di firma con eventuali chiamate esistenti (es.
-                DatasetMain.py). IGNORATO: ogni puzzle riceve ora un uuid
-                indipendente, generato internamente (vedi motivazione nel
-                corpo del metodo). Rimuovibile in una prossima pulizia
-                dei call site.
-
-        Returns:
-            Dict con "processed_puzzles", "accepted_puzzles",
-            "enqueued_positions", "mate_n_counts". La chiave
-            "next_game_id" e' RIMOSSA dal return (non ha piu' senso con
-            game_id generati come uuid indipendenti): se DatasetMain.py
-            la leggeva da qualche parte, va aggiornato di conseguenza
-            (vedi patch DatasetMain.py).
-        """
+    # ------------------------------------------------------------------
+    # RUN
+    # ------------------------------------------------------------------
+    def run(self) -> Dict[str, Any]:
+        """Processa il CSV, accoda le posizioni nel registry condiviso."""
         all_rows = self._load_filtered_rows()
-
-        debug_records: List[Dict[str, Any]] = []
-
-        processed_puzzles = 0
+        processed = 0
         accepted_puzzles = 0
         enqueued_positions = 0
-        mate_n_counts: Dict[int, int] = {}
+        mate_n_counts: Dict[int, int] = defaultdict(int)
 
         for row in tqdm(all_rows, desc="Costruzione posizioni puzzle"):
-            processed_puzzles += 1
+            processed += 1
             uci_moves = str(row["Moves"]).split()
             if not uci_moves:
                 continue
@@ -201,26 +172,35 @@ class PuzzleBuilder:
             rating_raw = row.get("Rating")
             puzzle_rating = float(rating_raw) if pd.notna(rating_raw) else 1500.0
             clock_base = self._simulated_clock(puzzle_rating)
+
+            # Prima mossa (quella del puzzle) – la applichiamo subito per partire dalla posizione successiva
             first_move = chess.Move.from_uci(uci_moves[0])
             if first_move not in board.legal_moves:
                 continue
             board.push(first_move)
 
+            # Game ID univoco per questo puzzle (come in GamesBuilder)
             game_id = uuid.uuid4().int & ((1 << 63) - 1)
-            puzzle_enqueued = 0
 
+            # I puzzle hanno una sequenza di mosse: la soluzione.
+            # Prendiamo solo i ply alterni (quelli in cui il solver deve muovere)
+            puzzle_enqueued = 0
             for ply_idx, uci in enumerate(uci_moves[1:], start=1):
                 move = chess.Move.from_uci(uci)
 
+                # Se è una mossa del solver (ply dispari nel contesto del puzzle)
                 if ply_idx % 2 == 0:
+                    # È la risposta dell'avversario: la applichiamo e continuiamo
                     if move in board.legal_moves:
                         board.push(move)
                     continue
 
+                # Questa è una mossa che il solver deve trovare (ply dispari)
                 if move not in board.legal_moves:
                     break
 
                 current_mate_n = max(1, mate_n_iniziale - (ply_idx // 2))
+                # Simuliamo clock crescente con il numero di mosse
                 clock_seconds = clock_base * (1 + 0.1 * ply_idx)
 
                 try:
@@ -236,29 +216,32 @@ class PuzzleBuilder:
                         f"PuzzleId={row.get('PuzzleId')} ply={ply_idx}: "
                         f"scarto la posizione ({e})."
                     )
+                    # Continuiamo comunque con la prossima mossa
                     board.push(move)
                     continue
 
-                self._queue_registry.enqueue(
+                # Accoda la posizione nel registry condiviso
+                self._registry.enqueue(
                     source_tag="puzzle",
                     data=data,
                     group_key=current_mate_n,
                 )
                 puzzle_enqueued += 1
-                mate_n_counts[current_mate_n] = mate_n_counts.get(current_mate_n, 0) + 1
+                mate_n_counts[current_mate_n] += 1
 
-                if self.debug_jsonl_path is not None:
-                    debug_records.append(
-                        {
-                            "puzzle_id": row.get("PuzzleId"),
-                            "fen": board.fen(),
-                            "best_move_uci": move.uci(),
-                            "mate_n": current_mate_n,
-                            "rating": puzzle_rating,
-                            "ply_idx": ply_idx,
-                            "game_id": game_id,
-                        }
-                    )
+                # Accumula debug
+                if self.config.save_debug_jsonl:
+                    split_name = self._assign_split(game_id)
+                    self._debug_records[split_name].append({
+                        "puzzle_id": row.get("PuzzleId"),
+                        "fen": board.fen(),
+                        "best_move_uci": move.uci(),
+                        "mate_n": current_mate_n,
+                        "rating": puzzle_rating,
+                        "ply_idx": ply_idx,
+                        "game_id": game_id,
+                        "source": "puzzle",
+                    })
 
                 board.push(move)
 
@@ -266,42 +249,51 @@ class PuzzleBuilder:
                 accepted_puzzles += 1
                 enqueued_positions += puzzle_enqueued
 
-        if self.debug_jsonl_path is not None and debug_records:
-            self._write_debug_jsonl(debug_records, self.debug_jsonl_path)
+            # Limite opzionale per puzzle (posizioni)
+            if (self.config.max_positions_per_puzzle is not None and
+                enqueued_positions >= self.config.max_positions_per_puzzle):
+                break
 
-        self._log_summary(processed_puzzles, accepted_puzzles, enqueued_positions, mate_n_counts)
+        # Flush coda (scrive shard residui)
+        self._registry.flush()
+
+        # Scrive debug JSONL
+        if self.config.save_debug_jsonl and self._debug_jsonl_path:
+            self._write_debug_jsonl()
+
+        self._log_summary(processed, accepted_puzzles, enqueued_positions, mate_n_counts)
 
         return {
-            "processed_puzzles": processed_puzzles,
+            "processed_puzzles": processed,
             "accepted_puzzles": accepted_puzzles,
             "enqueued_positions": enqueued_positions,
-            "mate_n_counts": mate_n_counts,
+            "mate_n_counts": dict(mate_n_counts),
         }
 
-    @staticmethod
-    def _write_debug_jsonl(records: List[Dict[str, Any]], path: str) -> None:
-        os.makedirs(os.path.dirname(os.path.abspath(path)) or ".", exist_ok=True)
-        tmp_path = path + ".tmp"
+    def _write_debug_jsonl(self) -> None:
+        all_records = []
+        for split in ("train", "val", "test"):
+            all_records.extend(self._debug_records.get(split, []))
+        if not all_records:
+            return
+        tmp_path = self._debug_jsonl_path + ".tmp"
         with open(tmp_path, "w", encoding="utf-8") as f:
-            for rec in records:
+            for rec in all_records:
                 f.write(json.dumps(rec, ensure_ascii=False) + "\n")
-        os.replace(tmp_path, path)
+        os.replace(tmp_path, self._debug_jsonl_path)
+        logger.info(f"Debug JSONL puzzle scritto in {self._debug_jsonl_path} ({len(all_records)} record)")
 
-    def _log_summary(
-        self,
-        processed_puzzles: int,
-        accepted_puzzles: int,
-        enqueued_positions: int,
-        mate_n_counts: Dict[int, int],
-    ) -> None:
+    def _log_summary(self, processed, accepted, enqueued, mate_n_counts):
         logger.info("=" * 60)
-        logger.info("PUZZLE BUILDER — RIEPILOGO (schema board-level per posizione)")
+        logger.info("PUZZLE BUILDER — RIEPILOGO (allineato a GamesBuilder)")
         logger.info("=" * 60)
-        logger.info(f"Puzzle processati: {processed_puzzles:,}")
-        logger.info(f"Puzzle accettati (almeno una posizione accodata): {accepted_puzzles:,}")
-        logger.info(f"Posizioni accodate: {enqueued_positions:,}")
+        logger.info(f"Puzzle processati: {processed:,}")
+        logger.info(f"Puzzle accettati (almeno una posizione): {accepted:,}")
+        logger.info(f"Posizioni accodate: {enqueued:,}")
         if mate_n_counts:
-            logger.info("Per profondita' mate (N, mosse intere):")
+            logger.info("Per profondità mate (N, mosse intere):")
             for n in sorted(mate_n_counts.keys()):
                 logger.info(f"  n={n}: {mate_n_counts[n]:,}")
         logger.info("=" * 60)
+
+
