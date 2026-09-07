@@ -1,22 +1,3 @@
-"""
-train_time_aware.py
-
-Entrypoint di training per DualGATTimeAwareModel (modello NON modificato)
-sul dataset scacchistico board-level (event_ids a 13 categorie, edge_attr
-= tipo arco spaziale, time = clock_seconds costante per grafo, y = mossa
-in [0, 4096)).
-
-Pipeline completa:
-    Dataset/Train/shards/{train,val}/  (da step1_shard_dataset.py)
-        -> ShardedGraphDataset (lazy, un shard alla volta in RAM)
-        -> DataLoader con custom_collate_graph (label per-grafo, non per-nodo)
-        -> DualGATTimeAwareModel (output_dim=4096, edge_dim=1 perche' edge_attr=time)
-        -> pool_node_logits (media dei 64 nodi -> 1 logit per board)
-        -> CrossEntropyLoss + AMP + checkpoint automatico ogni N step
-
-USO:
-    python train_time_aware.py --shards-dir Dataset/Train/shards --epochs 20
-"""
 from __future__ import annotations
 
 import argparse
@@ -31,8 +12,8 @@ from shard_dataset import ShardedGraphDataset
 from timegnn.data.pyg import custom_collate_graph
 from timegnn.models.gat_time_decay import DualGATTimeAwareModel
 from timegnn.train.early_stopping import EarlyStopping
-from train_loop import evaluate_epoch, train_epoch
-from train_state import TrainState
+from TrainPipeline.Training.Loop import evaluate_epoch, train_epoch
+from TrainPipeline.Training.State import TrainState
 
 logging.basicConfig(
     level=logging.INFO,
