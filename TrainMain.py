@@ -6,6 +6,7 @@ import os
 import sys
 import time
 from typing import Any, Dict, Optional
+from logging.handlers import RotatingFileHandler
 
 import numpy as np
 import torch
@@ -39,7 +40,7 @@ MOVE_VOCAB_SIZE = 64 * 64
 NUM_EDGE_TYPES = 3
 TIME_EDGE_DIM = 1
 
-logger = logging.getLogger("train_main")
+logger = logging.getLogger(__name__)  # [LOGGING] logger di modulo
 
 
 # ----------------------------------------------------------------------
@@ -49,18 +50,30 @@ class PipelineConfigError(Exception):
     pass
 
 
-def setup_logging(log_level: str = "INFO", log_file: Optional[str] = None) -> None:
+def setup_logging(log_level: str = "INFO", log_file: Optional[str] = None, max_bytes: int = 10_485_760, backup_count: int = 3) -> None:
+    """
+    Configura il logging con:
+      - livello specificato
+      - output su stdout (colorato opzionalmente) e su file (con rotazione)
+    """
     level = getattr(logging, log_level.upper(), logging.INFO)
     handlers = [logging.StreamHandler(sys.stdout)]
+
     if log_file:
         os.makedirs(os.path.dirname(os.path.abspath(log_file)) or ".", exist_ok=True)
-        handlers.append(logging.FileHandler(log_file, encoding="utf-8"))
+        # Rotazione automatica quando il file supera max_bytes
+        file_handler = RotatingFileHandler(log_file, maxBytes=max_bytes, backupCount=backup_count, encoding="utf-8")
+        handlers.append(file_handler)
+
     logging.basicConfig(
         level=level,
-        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+        format="%(asctime)s [%(levelname)s] %(name)s:%(funcName)s: %(message)s",
         handlers=handlers,
         force=True,
     )
+    # [LOGGING] Imposta livello più basso per i logger di terze parti (opzionale)
+    logging.getLogger("torch").setLevel(logging.WARNING)
+    logging.getLogger("matplotlib").setLevel(logging.WARNING)
 
 
 def load_yaml_config(config_path: str) -> Dict[str, Any]:
@@ -85,6 +98,7 @@ def validate_config(cfg: Dict[str, Any]) -> None:
 
 
 def run_step(state: PipelineState, step_name: str, is_ready_fn, do_fn) -> None:
+    """Esegue uno step della pipeline con logging di stato e tempi."""
     if state.is_done(step_name) and is_ready_fn():
         logger.info(f"[SKIP] Step '{step_name}' già completato.")
         return
@@ -96,15 +110,30 @@ def run_step(state: PipelineState, step_name: str, is_ready_fn, do_fn) -> None:
         do_fn()
     except Exception as e:
         state.mark_failed(step_name, str(e))
-        logger.error(f"[FAILED] Step '{step_name}': {e}")
+        logger.error(f"[FAILED] Step '{step_name}': {e}", exc_info=True)
         raise
     elapsed = time.monotonic() - t0
     state.mark_done(step_name)
     logger.info(f"[DONE] Step '{step_name}' in {elapsed:.2f}s.")
 
 
+def log_config(cfg: Dict[str, Any], heading: str = "Configurazione") -> None:
+    """Stampa la configurazione in modo leggibile."""
+    logger.info("=" * 70)
+    logger.info(f"{heading}:")
+    logger.info("=" * 70)
+    for section, values in cfg.items():
+        logger.info(f"[{section}]")
+        if isinstance(values, dict):
+            for k, v in values.items():
+                logger.info(f"  {k}: {v}")
+        else:
+            logger.info(f"  {values}")
+    logger.info("=" * 70)
+
+
 # ----------------------------------------------------------------------
-# Training (basic / time‑aware) - invariato
+# Training (basic / time‑aware) - con logging migliorato
 # ----------------------------------------------------------------------
 def run_training(
     cfg: Dict[str, Any],
@@ -116,13 +145,10 @@ def run_training(
 ) -> None:
     """
     Addestra un modello (basic o time‑aware) usando i dati shardati.
-
-    Checkpoint:
-        - <checkpoint_base>_last.pt  : salvato a fine ogni epoca (sempre)
-        - <checkpoint_base>_best.pt  : salvato solo se val_loss migliora
-        - Il resume cerca prima _last.pt, poi il checkpoint_base (se esiste)
+    Logging dettagliato di configurazione, progresso, metriche e checkpoint.
     """
     section = cfg["train_basic"] if model_type == "basic" else cfg["train_time_aware"]
+    logger.info(f"Avvio training {model_type} con configurazione: {section}")
 
     # ------------------------------------------------------------------
     # 1. Modello e dati
@@ -159,7 +185,7 @@ def run_training(
         persistent_workers=section.get("num_workers", 2) > 0,
     )
 
-    logger.info(f"Train: {len(train_ds):,} | Val: {len(val_ds):,}")
+    logger.info(f"Train: {len(train_ds):,} samples in {len(train_loader)} batches | Val: {len(val_ds):,} samples in {len(val_loader)} batches")
 
     model = model_class(
         num_event_features=NUM_EVENT_FEATURES,
@@ -191,13 +217,11 @@ def run_training(
     # ------------------------------------------------------------------
     base_dir = os.path.dirname(checkpoint_base) or "."
     base_name = os.path.basename(checkpoint_base)
-    # Se base_name ha già un'estensione, la rimuoviamo
     if base_name.endswith(".pt"):
         base_name = base_name[:-3]
     last_path = os.path.join(base_dir, f"{base_name}_last.pt")
     best_path = os.path.join(base_dir, f"{base_name}_best.pt")
 
-    # Decidiamo da dove riprendere: prima _last.pt, poi il checkpoint base (se esiste)
     resume_path = None
     if os.path.exists(last_path):
         resume_path = last_path
@@ -208,16 +232,15 @@ def run_training(
     else:
         logger.info("Nessun checkpoint esistente, partenza da zero.")
 
-    # Crea TrainState e tenta il resume
     train_state = TrainState(checkpoint_path=resume_path)
     if resume_path:
         train_state.try_resume(model, optimizer, scaler, map_location=device)
+        logger.info(f"Checkpoint caricato: epoca {train_state.epoch}, best_val_loss={train_state.best_val_loss:.4f}")
 
     early_stopping = EarlyStopping(patience=section.get("patience", 5))
     epochs = section.get("epochs", 20)
-
-    # Il best_val_loss viene già caricato da try_resume
     best_val_loss = train_state.best_val_loss
+    log_interval = section.get("log_interval", 10)  # [LOGGING] ogni quanti batch loggare
 
     # ------------------------------------------------------------------
     # 3. Loop di training
@@ -227,6 +250,7 @@ def run_training(
 
         # --- Epoch di training ---
         t0 = time.monotonic()
+        # [LOGGING] passiamo log_interval per avere logging per-batch
         train_loss, train_acc = train_epoch(
             model,
             train_loader,
@@ -234,11 +258,12 @@ def run_training(
             criterion,
             device,
             scaler=scaler,
-            train_state=None,           # Non usiamo checkpoint intermedi
-            checkpoint_every=None,       # Disabilitato
+            train_state=None,
+            checkpoint_every=None,
             use_amp=use_amp,
             total_items=len(train_ds),
             epoch_label=f"Epoch {epoch+1}/{epochs} [train]",
+            log_interval=log_interval,  # supponiamo che train_epoch supporti questo parametro
         )
 
         # --- Validazione ---
@@ -253,11 +278,19 @@ def run_training(
         )
 
         elapsed = time.monotonic() - t0
+
+        # [LOGGING] log completo delle metriche
         logger.info(
             f"Epoch {epoch+1}/{epochs} ({elapsed:.1f}s) | "
             f"train_loss={train_loss:.4f} train_acc={train_acc:.4f} | "
             f"val_loss={val_loss:.4f} val_top1={val_top1:.4f} val_top3={val_top3:.4f}"
         )
+
+        # [LOGGING] eventuale utilizzo GPU
+        if device == "cuda":
+            mem_alloc = torch.cuda.memory_allocated(device) / 1024**3
+            mem_reserved = torch.cuda.memory_reserved(device) / 1024**3
+            logger.debug(f"GPU memoria: allocata {mem_alloc:.2f} GB, riservata {mem_reserved:.2f} GB")
 
         # Aggiorna stato
         train_state.epoch = epoch + 1
@@ -285,7 +318,6 @@ def run_training(
         early_stopping(val_loss)
         if early_stopping.early_stop:
             logger.info(f"Early stopping attivato all'epoca {epoch+1}.")
-            # Carica il best modello prima di uscire (opzionale)
             if os.path.exists(best_path):
                 logger.info(f"Caricamento del best modello da {best_path}")
                 best_state = torch.load(best_path, map_location=device)
@@ -294,8 +326,9 @@ def run_training(
 
     logger.info(f"Training {model_type} completato. Best val loss: {best_val_loss:.4f}")
 
+
 # ----------------------------------------------------------------------
-# Valutazione e plot
+# Valutazione e plot - con logging
 # ----------------------------------------------------------------------
 def evaluate_models(
     cfg: Dict[str, Any],
@@ -312,6 +345,7 @@ def evaluate_models(
         logger.warning(f"Test set non trovato: {test_path}. Salto la valutazione.")
         return
 
+    logger.info(f"Caricamento test set da {test_path}")
     test_data = torch.load(test_path, map_location="cpu")
 
     class SimpleTestDataset(torch.utils.data.Dataset):
@@ -332,8 +366,10 @@ def evaluate_models(
         collate_fn=custom_collate_graph,
         num_workers=eval_cfg.get("num_workers", 2),
     )
+    logger.info(f"Test set: {len(test_ds):,} samples in {len(test_loader)} batches")
 
     def load_model(checkpoint_path, model_class, edge_dim, extra_kwargs):
+        logger.debug(f"Caricamento modello da {checkpoint_path}")
         model = model_class(
             num_event_features=NUM_EVENT_FEATURES,
             num_embedding_features=NUM_EVENT_ID_CATEGORIES,
@@ -377,7 +413,8 @@ def evaluate_models(
     )
     model_time.eval()
 
-    def evaluate_model(model, loader):
+    def evaluate_model(model, loader, name: str):
+        logger.info(f"Valutazione del modello {name}...")
         move_correct_list = []
         mate_correct_list = []
         mate_true_list = []
@@ -385,7 +422,7 @@ def evaluate_models(
         mate_n_list = []
 
         with torch.no_grad():
-            for batch in loader:
+            for batch_idx, batch in enumerate(loader):
                 x = batch.x.to(device)
                 edge_index = batch.edge_index.to(device)
                 edge_attr = batch.edge_attr.to(device)
@@ -407,6 +444,10 @@ def evaluate_models(
                     mate_correct_list.extend(mate_correct)
                     mate_n_list.extend(mate_n)
 
+                # [LOGGING] log ogni 10 batch
+                if batch_idx % 10 == 0:
+                    logger.debug(f"  batch {batch_idx+1}/{len(loader)} processato")
+
         results = {
             "move_correct": np.array(move_correct_list),
             "mate_correct": np.array(mate_correct_list) if mate_correct_list else np.array([]),
@@ -414,19 +455,19 @@ def evaluate_models(
             "mate_pred": np.array(mate_pred_list) if mate_pred_list else np.array([]),
             "mate_n": np.array(mate_n_list) if mate_n_list else np.array([]),
         }
+        logger.info(f"Modello {name}: move accuracy = {np.mean(move_correct_list):.4f}")
         return results
 
-    logger.info("Valutazione del modello basic...")
-    res_basic = evaluate_model(model_basic, test_loader)
-    logger.info("Valutazione del modello time‑aware...")
-    res_time = evaluate_model(model_time, test_loader)
+    res_basic = evaluate_model(model_basic, test_loader, "basic")
+    res_time = evaluate_model(model_time, test_loader, "time_aware")
 
     plotter = EvaluatorPlotter(
         plots_dir=eval_cfg["plots_dir"],
         out_dir=eval_cfg["out_dir"]
     )
-    max_n = eval_cfg.get("max_n", 10)
+    max_n = eval_cfg.get("max_n", 5)
 
+    logger.info("Generazione dei grafici di valutazione...")
     plotter.plot_depth_bars(res_time, res_basic, max_n=max_n, filename="bars_per_n.png")
     plotter.plot_depth_curves(res_time, res_basic, max_n=max_n, filename="curves_per_n.png")
     plotter.save_depth_metrics(res_time, res_basic, max_n=max_n, filename="metrics_per_n.csv")
@@ -448,7 +489,7 @@ def evaluate_models(
             filename="cm_untimed.png"
         )
 
-    logger.info("Valutazione e plot completati.")
+    logger.info(f"Valutazione completata. Output salvati in {eval_cfg['plots_dir']} e {eval_cfg['out_dir']}")
 
 
 # ----------------------------------------------------------------------
@@ -460,6 +501,9 @@ def main(config_path: str = "Yaml/train_main.yaml") -> None:
 
     pipe_cfg = cfg["pipeline"]
     setup_logging(pipe_cfg.get("log_level", "INFO"), pipe_cfg.get("log_file"))
+
+    # [LOGGING] stampa configurazione
+    log_config(cfg, "Configurazione pipeline")
 
     logger.info("=" * 70)
     logger.info("AVVIO PIPELINE TRAINING TIMEGNN")
@@ -509,13 +553,11 @@ def main(config_path: str = "Yaml/train_main.yaml") -> None:
             out_test = clean_cfg.get("output_test", None)
             workers = clean_cfg.get("workers", 4)
 
-            # Controllo che i file di input esistano
             for f in [in_train, in_val] + ([in_test] if in_test else []):
                 if not os.path.exists(f):
                     raise PipelineConfigError(f"File di input non trovato: {f}")
 
             def _is_clean_ready():
-                # Verifica che tutti gli output esistano
                 ready = file_ready(out_train) and file_ready(out_val)
                 if out_test:
                     ready = ready and file_ready(out_test)
@@ -550,7 +592,7 @@ def main(config_path: str = "Yaml/train_main.yaml") -> None:
                    file_ready(os.path.join(val_shard_dir, "manifest.json"))
 
         def _do_shard():
-            logger.info(f"Sharding train: {train_clean} -> {train_shard_dir}")
+            logger.info(f"Sharding train: {train_clean} -> {train_shard_dir} con shard_size={shard_size}")
             shard_split(train_clean, train_shard_dir, shard_size)
             logger.info(f"Sharding val: {val_clean} -> {val_shard_dir}")
             shard_split(val_clean, val_shard_dir, shard_size)
@@ -620,5 +662,8 @@ def main(config_path: str = "Yaml/train_main.yaml") -> None:
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", default="Yaml/train_main.yaml")
+    parser.add_argument("--log-level", default="INFO", help="Override del livello di log (DEBUG, INFO, WARNING, ERROR)")
     args = parser.parse_args()
+    if args.log_level:
+        pass
     main(args.config)

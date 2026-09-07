@@ -28,8 +28,8 @@ train_basic:
   enabled: true
   shards_dir: "Dataset/Train/shards"
   checkpoint: "Dataset/Train/checkpoints/basic"
-  epochs: 20
-  batch_size: 32
+  epochs: 50
+  batch_size: 128
   num_workers: 2
   lr: 1e-3
   seed: 42
@@ -50,8 +50,8 @@ train_time_aware:
   enabled: true
   shards_dir: "Dataset/Train/shards"
   checkpoint: "Dataset/Train/checkpoints/basic"
-  epochs: 20
-  batch_size: 32
+  epochs: 50
+  batch_size: 128
   num_workers: 2
   lr: 1e-3
   seed: 42

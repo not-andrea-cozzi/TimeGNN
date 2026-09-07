@@ -6,7 +6,6 @@ import os
 from collections import defaultdict
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
-
 import chess
 import pandas as pd
 import torch
@@ -42,6 +41,7 @@ class PuzzleBuilderConfig:
 
     # Numero massimo di posizioni per puzzle (None = tutte)
     max_positions_per_puzzle: Optional[int] = None
+    source_tag: str = "puzzle"  
 
 
 class PuzzleBuilder:
@@ -310,7 +310,7 @@ class PuzzleBuilder:
             board.push(first_move)
 
             # Game ID leggibile e univoco per questo puzzle: "puzzle_{PuzzleId}".
-            game_id = f"puzzle_{puzzle_id_raw}"
+            game_id = f"{self.config.source_tag}_{puzzle_id_raw}"
 
             # group_key COSTANTE per l'intera finestra/puzzle (vedi NOTA
             # GROUP_KEY nel docstring di classe): mate_n_iniziale, non

@@ -173,42 +173,54 @@ VALID_STEPS = [
     "build_puzzles", "finalize_splits",
 ]
 
+# nello stesso namespace di game_id).
+DEFAULT_LICHESS_SOURCE_TAG = "lichess"
+DEFAULT_FICS_SOURCE_TAG = "fics"
+DEFAULT_CLUB_SOURCE_TAG = "club"
+DEFAULT_PUZZLE_SOURCE_TAG = "puzzle_"
+
 
 def _build_sources(raw_cfg: Dict[str, Any], games_cfg: Dict[str, Any]) -> List[SourceSpec]:
     sources: List[SourceSpec] = []
 
     lichess_path = raw_cfg.get("games_zst")
     if lichess_path and os.path.exists(lichess_path):
+        lichess_tag = raw_cfg.get("games_source_tag", DEFAULT_LICHESS_SOURCE_TAG)
         sources.append(
             SourceSpec(
                 kind="lichess",
                 path=lichess_path,
                 skip_games=games_cfg.get("skip_games_part1", 0),
                 max_games=games_cfg.get("max_games", 200000),
-                tag="lichess",
+                tag=lichess_tag,
             )
         )
-        logger.info(f"Sorgente Lichess aggiunta: '{lichess_path}' (max_games={games_cfg.get('max_games', 200000)}).")
+        logger.info(
+            f"Sorgente Lichess aggiunta: '{lichess_path}' "
+            f"(tag='{lichess_tag}', max_games={games_cfg.get('max_games', 200000)})."
+        )
     else:
         logger.info("raw_data.games_zst non configurato o file assente: sorgente Lichess saltata.")
 
     fics_path = raw_cfg.get("fics_pgn")
     if fics_path and os.path.exists(fics_path):
+        fics_tag = raw_cfg.get("fics_source_tag", DEFAULT_FICS_SOURCE_TAG)
         sources.append(
             SourceSpec(
                 kind="fics",
                 path=fics_path,
                 skip_games=games_cfg.get("fics_skip_games", 0),
                 max_games=games_cfg.get("fics_max_games"),
-                tag="fics",
+                tag=fics_tag,
             )
         )
-        logger.info(f"Sorgente FICS aggiunta: '{fics_path}'.")
+        logger.info(f"Sorgente FICS aggiunta: '{fics_path}' (tag='{fics_tag}').")
     else:
         logger.info("raw_data.fics_pgn non configurato o file assente: sorgente FICS saltata.")
 
     club_path = raw_cfg.get("club_csv")
     if club_path and os.path.exists(club_path):
+        club_tag = raw_cfg.get("club_source_tag", DEFAULT_CLUB_SOURCE_TAG)
         sources.append(
             SourceSpec(
                 kind="club",
@@ -216,10 +228,10 @@ def _build_sources(raw_cfg: Dict[str, Any], games_cfg: Dict[str, Any]) -> List[S
                 pgn_col=games_cfg.get("club_pgn_col", "pgn"),
                 skip_games=games_cfg.get("club_skip_games", 0),
                 max_games=games_cfg.get("club_max_games"),
-                tag="club",
+                tag=club_tag,
             )
         )
-        logger.info(f"Sorgente Club aggiunta: '{club_path}'.")
+        logger.info(f"Sorgente Club aggiunta: '{club_path}' (tag='{club_tag}').")
     else:
         logger.info("raw_data.club_csv non configurato o file assente: sorgente Club saltata.")
 
@@ -365,7 +377,7 @@ def main(config_path: str = "Yaml/main.yaml") -> None:
             mate_range=mate_train_range,
             search_depth=games_cfg.get("search_depth", 8),
             analysis_time=games_cfg.get("time_limit_seconds", 0.2),
-            workers= 8, #games_cfg.get("workers", 8),
+            workers=games_cfg.get("workers", 8),
             threads=engine_cfg.get("threads", 1),
             hash_mb=engine_cfg.get("hash_mb", 128),
             multipv=1,
@@ -400,7 +412,7 @@ def main(config_path: str = "Yaml/main.yaml") -> None:
             min_game_plies=games_cfg.get("min_game_plies", 20),
 
             queue_state_path=queue_state_path,
-            shard_size=games_cfg.get("shard_size", 500),
+            shard_size=games_cfg.get("shard_size", 5000),
 
             save_debug_jsonl=games_cfg.get("save_debug_jsonl", True),
             debug_jsonl_dir=games_output_dir,
@@ -478,6 +490,11 @@ def main(config_path: str = "Yaml/main.yaml") -> None:
                 load_avg_time_by_rating(time_stats_path) if file_ready(time_stats_path) else {}
             )
 
+        # source_tag parametrico da YAML (raw_data.puzzles_source_tag):
+        # e' il prefisso "{fonte}_" che precede l'id originale nel
+        # game_id finale ("{fonte}_{id_game}"), es. "puzzle_00sHx".
+        puzzles_source_tag = raw_cfg.get("puzzles_source_tag", DEFAULT_PUZZLE_SOURCE_TAG)
+
         pb_config = PuzzleBuilderConfig(
             csv_path=puzzle_csv_path,
             mate_range=mate_train_range,
@@ -492,10 +509,11 @@ def main(config_path: str = "Yaml/main.yaml") -> None:
             split_ratios=split_ratios,
             split_seed=pipe_cfg.get("seed", 42),
             max_positions_per_puzzle=puzzle_cfg.get("max_positions_per_puzzle"),
+            source_tag=puzzles_source_tag,
         )
 
         builder = PuzzleBuilder(pb_config)
-        logger.info("PuzzleBuilder pronto, avvio run()...")
+        logger.info(f"PuzzleBuilder pronto (source_tag='{puzzles_source_tag}'), avvio run()...")
         t0 = time.monotonic()
         result = builder.run()
         elapsed = time.monotonic() - t0
