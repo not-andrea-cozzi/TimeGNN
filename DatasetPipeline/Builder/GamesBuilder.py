@@ -311,7 +311,25 @@ class GamesBuilder:
         )
 
     def _validate_config(self) -> None:
-        pass # [Omissis controlli superflui per brevità, mantieni i tuoi originali se vuoi]
+        """Controlli bloccanti sulla config, in particolare l'unicita' del
+        tag tra sorgenti: dato che il game_id finale e' costruito come
+        "{tag}_{local_id}" e local_id riparte da 1 in OGNI sorgente (vedi
+        _iter_all_tasks), due SourceSpec con lo stesso tag produrrebbero
+        game_id identici per partite fisicamente diverse -> collisioni
+        silenziose o errori intermittenti in PositionQueueRegistry.
+        build_splits(). Meglio bloccare subito con un errore chiaro."""
+        tags_seen: Dict[str, SourceSpec] = {}
+        for src in self.config.sources:
+            if src.tag in tags_seen:
+                raise ValueError(
+                    f"Tag sorgente duplicato: '{src.tag}' usato sia da "
+                    f"'{tags_seen[src.tag].path}' che da '{src.path}'. Ogni "
+                    f"SourceSpec deve avere un tag univoco: il game_id finale "
+                    f"e' costruito come '{{tag}}_{{local_id}}', e local_id "
+                    f"riparte da 1 in OGNI sorgente — tag duplicati "
+                    f"produrrebbero game_id identici tra file diversi."
+                )
+            tags_seen[src.tag] = src
 
     @staticmethod
     def _init_worker(stockfish_path: str, threads: int, hash_mb: int, syzygy_path: Optional[str]) -> None:
@@ -764,12 +782,34 @@ class GamesBuilder:
             logger.warning("[GamesBuilder] Impossibile salvare lo stato di resume: %s", e)
 
     def _iter_all_tasks(self) -> Generator[Tuple[int, str, str, str], None, None]:
-        global_id = 0
+        """Itera su tutte le sorgenti, propagando l'id LOCALE alla
+        sorgente (quello prodotto da _iter_source, stabile e deterministico
+        perche' dipende solo dalla posizione della partita nel file/CSV),
+        NON un contatore globale condiviso tra sorgenti.
+
+        FIX: la versione precedente usava un `global_id` unico per tutte
+        le sorgenti, incrementato da zero ad ogni chiamata di run(). Il
+        game_id finale costruito in _worker come "{tag}_{game_id}"
+        dipendeva quindi da QUANTE partite erano gia' state processate
+        in run precedenti (skip_games/resume), non dalla partita fisica
+        nel file. Al resume, global_id ripartiva comunque da 0: la stessa
+        prima partita "nuova" di una run 2 riceveva lo stesso global_id
+        gia' assegnato a una partita diversa nella run 1 -> game_id
+        duplicato tra run differenti, con rischio di collisione silenziosa
+        in PositionQueueRegistry.build_splits() (o errore intermittente,
+        a seconda che il group_key coincidesse o meno).
+
+        Usando local_id (per-sorgente, indipendente dal numero di run
+        eseguite) il game_id finale "{tag}_{local_id}" identifica sempre
+        la STESSA partita fisica, ad ogni run, garantendo l'univocita'
+        richiesta da PositionQueueRegistry. Per questo _validate_config
+        impone anche che ogni sorgente abbia un tag univoco: altrimenti
+        due sorgenti diverse con local_id che ripartono entrambi da 1
+        collidrebbero comunque tra loro."""
         for src in self.config.sources:
             resume_key = self._resume_key(src)
-            for _local_id, pgn_text in self._iter_source(src):
-                global_id += 1
-                yield (global_id, pgn_text, src.tag, resume_key)
+            for local_id, pgn_text in self._iter_source(src):
+                yield (local_id, pgn_text, src.tag, resume_key)
 
     def _count_tasks_estimate(self) -> Optional[int]:
         total = 0

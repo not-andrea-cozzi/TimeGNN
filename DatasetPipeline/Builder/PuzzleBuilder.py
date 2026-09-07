@@ -309,12 +309,8 @@ class PuzzleBuilder:
                 continue
             board.push(first_move)
 
-            # Game ID leggibile e univoco per questo puzzle: "puzzle_{PuzzleId}".
             game_id = f"{self.config.source_tag}_{puzzle_id_raw}"
 
-            # group_key COSTANTE per l'intera finestra/puzzle (vedi NOTA
-            # GROUP_KEY nel docstring di classe): mate_n_iniziale, non
-            # current_mate_n (che varia per-posizione).
             window_group_key = mate_n_iniziale
 
             # I puzzle hanno una sequenza di mosse: la soluzione.
@@ -356,18 +352,14 @@ class PuzzleBuilder:
                     board.push(move)
                     continue
 
-                # Accoda la posizione nel registry condiviso.
-                # group_key=window_group_key (costante per il puzzle), NON
-                # current_mate_n (varierebbe per-posizione, vedi sopra).
                 self._registry.enqueue(
-                    source_tag="puzzle",
+                    source_tag=self.config.source_tag,   # era "puzzle"
                     data=data,
                     group_key=window_group_key,
                 )
                 puzzle_enqueued += 1
                 mate_n_counts[current_mate_n] += 1
 
-                # Accumula debug
                 if self.config.save_debug_jsonl:
                     split_name = self._assign_split(game_id)
                     self._debug_records[split_name].append({
@@ -379,7 +371,7 @@ class PuzzleBuilder:
                         "rating": puzzle_rating,
                         "ply_idx": ply_idx,
                         "game_id": game_id,
-                        "source": "puzzle",
+                        "source": self.config.source_tag,   # era "puzzle"
                     })
 
                 board.push(move)
