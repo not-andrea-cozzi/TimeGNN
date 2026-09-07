@@ -17,9 +17,9 @@
     syzygy_path: null
 
   raw_data:
-    games_zst: "RawData/lichess_db_standard_rated_2020-01.pgn.zst"
+    games_zst: ""  #"RawData/lichess_db_standard_rated_2020-01.pgn.zst"
     puzzles_zst: "RawData/lichess_db_puzzle.csv.zst"
-    fics_pgn: "RawData/ficsgamesdb_201701_chess_movetimes_4339526.pgn"
+    fics_pgn: "RawData/ficsgamesdb_2023_chess_movetimes_4339907.pgn"
     club_csv: ""
 
   time_stats:
@@ -30,24 +30,24 @@
   games_pipeline:
     output_base_filename: "games.pt"
     max_games: 250000                    # stesso, buon compromesso
-    skip_games_part1: 0
-    fics_max_games: 200000
+    skip_games_part1: 200000 
+    fics_max_games:  100000
     fics_skip_games: 0
     club_max_games: 1000
     club_skip_games: 0
     club_pgn_col: "pgn"
-    analysis_time: null
+    analysis_time: 0.3
 
     # --- Parametri critici ---
     mate_range_min: 1
     mate_range_max: 10                    # invariato
-    search_depth: 12                      # ⬆ aumento per PV più lunga e accuratezza
-    time_limit_seconds: 0.3               # ⬇ leggero calo per bilanciare profondità
+    search_depth: 16                      # ⬆ aumento per PV più lunga e accuratezza
+    time_limit_seconds: 0.2               # ⬇ leggero calo per bilanciare profondità
     max_piece_count: null                 # ⬅ rimuovi filtro: accetta tutte le posizioni
     min_material_for_mate_attempt: 3      # ⬇ abbassato per includere più matti
     only_decisive_games: true             # invariato
     skip_time_forfeit: true               # invariato
-    ply_sample_step: 8                    # invariato
+    ply_sample_step: 16                   # invariato
     min_ply: 6                            # invariato
     max_positions_per_game: 20            # invariato
     require_clock: true                   # SEMPRE TRUE
@@ -57,7 +57,7 @@
     pool_join_timeout: 20.0               # invariato
     min_rating: 1200                      # ⬆ alza leggermente per escludere partite troppo casuali
     max_rating: null                      # invariato
-    min_material_diff_for_mate_attempt: 2 # ⬇ abbassato per accettare più sacrifici
+    min_material_diff_for_mate_attempt: 3 # ⬇ abbassato per accettare più sacrifici
     require_heavy_piece: false            # ⬅ **FALSE** per includere matti con soli pezzi leggeri
     skip_forced_moves: true               # ⬅ **TRUE** per saltare posizioni con una sola mossa (velocità)
     dedupe_positions: true                # invariato
@@ -67,7 +67,7 @@
     decompressed_csv_filename: "lichess_puzzles.csv"
     chunk_size_bytes: 1048576
     max_puzzles: null              # lascialo null o alto, non è più il tetto guida
-    max_puzzles_per_theme: 20000    # NUOVO: fino a 2000 puzzle per ciascun mateIn1..mateIn10
+    max_puzzles_per_theme: 1000000    # NUOVO: fino a 2000 puzzle per ciascun mateIn1..mateIn10
 
   splits:
     train_ratio: 0.7

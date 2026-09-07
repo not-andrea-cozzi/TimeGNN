@@ -3,7 +3,8 @@ from __future__ import annotations
 import atexit
 import bz2
 import io
-from multiprocessing import pool
+import json
+import logging
 import os
 import re
 import signal
@@ -29,6 +30,8 @@ from DatasetPipeline.Utils.ipc_safe_data import (
     decode_from_ipc,
     harden_process_for_ipc,
 )
+
+logger = logging.getLogger(__name__)
 
 # ============================================================================
 # STATO GLOBALE PER WORKER (Stockfish + Syzygy + watchdog)
@@ -101,7 +104,24 @@ def _close_engine() -> None:
             _tablebase = None
 
 def _worker_sigterm_handler(signum, frame) -> None:
-    _close_engine()
+    """Il worker riceve SIGTERM solo durante uno shutdown forzato: niente
+    quit() 'educato' verso Stockfish, perche' se il motore e' incastrato
+    quel quit() puo' bloccarsi fino al timeout di comunicazione
+    dell'engine (default 10s). Si va dritti al kill del processo motore
+    e si esce subito: e' questa rapidita' che rende affidabile tutta la
+    catena di shutdown vista dal processo padre."""
+    _watchdog_stop.set()
+    pid = _engine_pid
+    if pid is not None:
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except Exception:
+            pass
+    if _tablebase is not None:
+        try:
+            _tablebase.close()
+        except Exception:
+            pass
     os._exit(0)
 
 # ============================================================================
@@ -201,6 +221,17 @@ class GamesBuilderConfig:
 
     pool_join_timeout: Optional[float] = 20.0
 
+    # [RESUME]: se True, ogni sorgente riprende automaticamente da dove
+    # era arrivata l'ultima run interrotta (somma a src.skip_games il
+    # numero di partite gia' confermate come processate). Se False, si
+    # usa esattamente src.skip_games senza toccare lo stato salvato.
+    auto_resume: bool = True
+    resume_state_path: Optional[str] = None
+    # Ogni quante partite CONFERMATE (risultato ricevuto dal worker, non
+    # solo dispacciate) si fa un checkpoint intermedio su disco, oltre a
+    # quello garantito ad ogni uscita da run() (normale, errore o Ctrl+C).
+    resume_checkpoint_every: int = 500
+
 # ============================================================================
 # GAMES BUILDER
 # ============================================================================
@@ -236,6 +267,34 @@ class GamesBuilder:
                 state_dir = os.path.dirname(config.queue_state_path) if config.queue_state_path else "."
                 os.makedirs(state_dir, exist_ok=True)
                 self._debug_jsonl_path = os.path.join(state_dir, "games_debug.jsonl")
+
+        self._resume_state_path = config.resume_state_path
+        if self._resume_state_path is None:
+            state_dir = os.path.dirname(config.queue_state_path) if config.queue_state_path else "."
+            os.makedirs(state_dir, exist_ok=True)
+            self._resume_state_path = os.path.join(state_dir, "games_builder_resume.json")
+
+        # [RESUME]: skip_games effettivo = quello specificato dall'utente +
+        # quanto gia' confermato processato in run precedenti (se
+        # auto_resume e' attivo). _resume_base memorizza il punto di
+        # partenza EFFETTIVO di questa run per ogni sorgente, cosi' a fine
+        # run si puo' calcolare il nuovo totale da salvare come
+        # base + confermate_in_questa_run, senza perdere il progresso
+        # accumulato prima di questa run.
+        saved_progress = self._load_resume_state() if config.auto_resume else {}
+        self._resume_base: Dict[str, int] = {}
+        self._resume_confirmed: Dict[str, int] = defaultdict(int)
+        for src in config.sources:
+            key = self._resume_key(src)
+            already_done = saved_progress.get(key, 0)
+            if config.auto_resume and already_done:
+                src.skip_games += already_done
+                logger.info(
+                    "[GamesBuilder] Resume attivo per %s: skip_games portato a %d "
+                    "(%d gia' processate in run precedenti).",
+                    key, src.skip_games, already_done,
+                )
+            self._resume_base[key] = src.skip_games
 
     def __getstate__(self) -> dict:
         state = self.__dict__.copy()
@@ -432,36 +491,36 @@ class GamesBuilder:
                 _watchdog_disarm()
         return None
 
-    def _worker(self, args: Tuple[int, str, str]) -> Tuple[int, bytes]:
+    def _worker(self, args: Tuple[int, str, str, str]) -> Tuple[int, str, bytes]:
         global _engine
         cfg = self.config
-        game_id, pgn_text, source_tag = args
+        game_id, pgn_text, source_tag, resume_key = args
 
         empty_payload = encode_for_ipc([])
-        if _engine is None: return game_id, empty_payload
+        if _engine is None: return game_id, resume_key, empty_payload
 
         # [OTTIMIZZAZIONE]: Fase 1: Fast parsing solo degli headers
         pgn_io = io.StringIO(pgn_text)
         headers = chess.pgn.read_headers(pgn_io)
         
         if headers is None or headers.get("Variant", "Standard").lower() not in ("standard", "normal"):
-            return game_id, empty_payload
+            return game_id, resume_key, empty_payload
             
         if not self._headers_are_eligible(headers):
-            return game_id, empty_payload
+            return game_id, resume_key, empty_payload
 
         # Fase 2: Parse completo solo se supera i filtri rapidi
         pgn_io.seek(0)
         try:
             game = chess.pgn.read_game(pgn_io)
         except Exception:
-            return game_id, empty_payload
+            return game_id, resume_key, empty_payload
 
-        if game is None: return game_id, empty_payload
+        if game is None: return game_id, resume_key, empty_payload
 
         try:
-            if game.end().ply() < cfg.min_game_plies: return game_id, empty_payload
-        except Exception: return game_id, empty_payload
+            if game.end().ply() < cfg.min_game_plies: return game_id, resume_key, empty_payload
+        except Exception: return game_id, resume_key, empty_payload
 
         time_control = game.headers.get("TimeControl", "")
         base_time, increment = self._parse_time_control(time_control)
@@ -610,7 +669,7 @@ class GamesBuilder:
         except Exception:
             pass
 
-        return game_id, encode_for_ipc(records)
+        return game_id, resume_key, encode_for_ipc(records)
 
     def _open_pgn_text_stream(self, path: str, kind: str):
         if kind == "lichess":
@@ -671,12 +730,54 @@ class GamesBuilder:
         with self._open_pgn_text_stream(src.path, src.kind) as text_stream:
             yield from self._iter_pgn_texts(text_stream, src.skip_games, src.max_games)
 
-    def _iter_all_tasks(self) -> Generator[Tuple[int, str, str], None, None]:
+    @staticmethod
+    def _resume_key(src: SourceSpec) -> str:
+        """Chiave stabile per il progresso di resume: kind+path (non il
+        tag, che puo' ripetersi su piu' sorgenti dello stesso kind)."""
+        return f"{src.kind}:{src.path}"
+
+    def _load_resume_state(self) -> Dict[str, int]:
+        if not os.path.exists(self._resume_state_path):
+            return {}
+        try:
+            with open(self._resume_state_path, "r", encoding="utf-8") as f:
+                raw = json.load(f)
+            return {str(k): int(v) for k, v in raw.items()}
+        except (json.JSONDecodeError, OSError, ValueError, TypeError) as e:
+            logger.warning(
+                "[GamesBuilder] Stato di resume in %s illeggibile (%s), riparto senza resume.",
+                self._resume_state_path, e,
+            )
+            return {}
+
+    def _persist_resume_state(self) -> None:
+        """Scrittura atomica (tmp+replace) e a merge: aggiorna solo le
+        chiavi delle sorgenti di QUESTA run, senza cancellare il progresso
+        salvato per sorgenti di altre run che non fanno parte di questa
+        config.sources. Non deve mai sollevare: viene chiamata anche
+        durante lo scaricamento di un KeyboardInterrupt/Exception, e un
+        errore qui non deve mai mascherare quello originale."""
+        try:
+            merged = self._load_resume_state()
+            for key, base in self._resume_base.items():
+                merged[key] = base + self._resume_confirmed.get(key, 0)
+
+            state_dir = os.path.dirname(os.path.abspath(self._resume_state_path)) or "."
+            os.makedirs(state_dir, exist_ok=True)
+            tmp_path = self._resume_state_path + ".tmp"
+            with open(tmp_path, "w", encoding="utf-8") as f:
+                json.dump(merged, f, indent=2, ensure_ascii=False)
+            os.replace(tmp_path, self._resume_state_path)
+        except Exception as e:
+            logger.warning("[GamesBuilder] Impossibile salvare lo stato di resume: %s", e)
+
+    def _iter_all_tasks(self) -> Generator[Tuple[int, str, str, str], None, None]:
         global_id = 0
         for src in self.config.sources:
+            resume_key = self._resume_key(src)
             for _local_id, pgn_text in self._iter_source(src):
                 global_id += 1
-                yield (global_id, pgn_text, src.tag)
+                yield (global_id, pgn_text, src.tag, resume_key)
 
     def _count_tasks_estimate(self) -> Optional[int]:
         total = 0
@@ -711,25 +812,51 @@ class GamesBuilder:
 
         estimate = self._count_tasks_estimate()
 
-        def _force_shutdown_pool() -> None:
-            """Chiude il pool con un timeout GARANTITO su ogni fase: mai un
-            join bloccante indefinito, a costo di finire con SIGKILL diretto
-            sui pid se i worker non rispondono a terminate()."""
-            old_sigint = signal.signal(signal.SIGINT, signal.SIG_IGN)
+        shutdown_in_progress = threading.Event()
+
+        def _panic_kill() -> None:
+            """Ultima spiaggia, senza join ne' logica annidata: SIGKILL
+            diretto su ogni worker noto ed uscita immediata. Scatta solo se
+            l'utente chiede un secondo stop mentre il primo e' gia' in
+            corso, cosi' non si resta MAI bloccati in terminale, qualunque
+            cosa vada storta altrove."""
+            for proc in getattr(pool, "_pool", []):
+                try:
+                    os.kill(proc.pid, signal.SIGKILL)
+                except Exception:
+                    pass
+            os._exit(1)
+
+        def _sigint_handler(signum, frame) -> None:
+            if shutdown_in_progress.is_set():
+                _panic_kill()
+            shutdown_in_progress.set()
+            raise KeyboardInterrupt
+
+        previous_sigint = signal.signal(signal.SIGINT, _sigint_handler)
+
+        def _shutdown_pool(graceful_first: bool) -> None:
+            """Chiude il pool con un tempo massimo garantito su ogni fase.
+            graceful_first=True (percorso di successo, task gia' finiti)
+            concede prima un margine di attesa naturale; con False
+            (interruzione o errore) si salta dritti a terminate()+SIGKILL,
+            perche' lo stop e' gia' stato richiesto e non ha senso
+            aspettare. L'intero corpo e' avvolto in un try/except: era
+            proprio un errore imprevisto qui dentro (logger non definito)
+            a impedire il SIGKILL finale in produzione."""
             try:
-                timeout = cfg.pool_join_timeout if cfg.pool_join_timeout is not None else 15.0
-                deadline = time.monotonic() + timeout
+                if graceful_first:
+                    timeout = cfg.pool_join_timeout if cfg.pool_join_timeout is not None else 15.0
+                    deadline = time.monotonic() + timeout
+                    for proc in pool._pool:
+                        remaining = deadline - time.monotonic()
+                        if remaining <= 0:
+                            break
+                        proc.join(timeout=remaining)
 
-                # Fase 1: attesa "pulita" di terminazione naturale.
-                for proc in pool._pool:
-                    remaining = deadline - time.monotonic()
-                    if remaining <= 0:
-                        break
-                    proc.join(timeout=remaining)
-
-                # Fase 2: SIGTERM ai processi ancora vivi (chi e' appeso
-                # dentro _engine.analyse() con Stockfish non responsivo
-                # non torna mai al loop del pool da solo).
+                # SIGTERM ai processi ancora vivi (chi e' appeso dentro
+                # _engine.analyse() con Stockfish non responsivo non torna
+                # mai al loop del pool da solo).
                 pool.terminate()
 
                 kill_deadline = time.monotonic() + 5.0
@@ -737,40 +864,56 @@ class GamesBuilder:
                     remaining = kill_deadline - time.monotonic()
                     proc.join(timeout=max(remaining, 0.1))
 
-                # Fase 3: rete di sicurezza. Se anche dopo terminate()
-                # qualcuno e' ancora vivo, SIGKILL diretto sul pid.
+                # Rete di sicurezza: se anche dopo terminate() qualcuno e'
+                # ancora vivo, SIGKILL diretto sul pid.
                 for proc in pool._pool:
                     if proc.is_alive():
                         logger.warning(
-                            f"[GamesBuilder] Worker pid={proc.pid} ancora vivo dopo "
-                            f"terminate(): invio SIGKILL diretto."
+                            "[GamesBuilder] Worker pid=%s ancora vivo dopo terminate(): invio SIGKILL diretto.",
+                            proc.pid,
                         )
                         try:
                             os.kill(proc.pid, signal.SIGKILL)
                         except ProcessLookupError:
                             pass
                         except Exception as e:
-                            logger.warning(f"[GamesBuilder] SIGKILL su pid={proc.pid} fallito: {e}")
+                            logger.warning("[GamesBuilder] SIGKILL su pid=%s fallito: %s", proc.pid, e)
 
                 # Join finale, breve: a questo punto i processi sono morti
                 # o morenti. Non deve mai bloccare a lungo; se scade
                 # comunque si prosegue (zombie residui li ripulisce l'OS).
                 for proc in pool._pool:
                     proc.join(timeout=2.0)
-            finally:
-                signal.signal(signal.SIGINT, old_sigint)
+            except Exception:
+                logger.exception(
+                    "[GamesBuilder] Errore imprevisto nello shutdown del pool: forzo SIGKILL su tutti i worker."
+                )
+                for proc in getattr(pool, "_pool", []):
+                    try:
+                        os.kill(proc.pid, signal.SIGKILL)
+                    except Exception:
+                        pass
 
         try:
             task_stream = self._iter_all_tasks()
             results = pool.imap_unordered(self._worker, task_stream, chunksize=1)
 
-            for _provisional_game_id, payload in wrap_iter(
+            for _provisional_game_id, resume_key, payload in wrap_iter(
                 results,
                 desc="[GamesBuilder] Analisi partite (multi-sorgente)",
                 unit="game",
                 total=estimate,
             ):
                 processed_games += 1
+
+                # [RESUME]: questa partita ha un risultato confermato (che
+                # sia stata accettata o scartata dai filtri non conta: e'
+                # comunque stata consumata dalla sorgente e non va
+                # riletta al prossimo resume). Checkpoint periodico oltre
+                # a quello garantito a fine run.
+                self._resume_confirmed[resume_key] += 1
+                if cfg.auto_resume and processed_games % cfg.resume_checkpoint_every == 0:
+                    self._persist_resume_state()
 
                 records: List[Dict[str, Any]] = decode_from_ipc(payload)
                 if not records:
@@ -800,24 +943,29 @@ class GamesBuilder:
 
         except KeyboardInterrupt:
             print("\n[WARNING] Interruzione richiesta: arresto forzato dei worker in corso...")
-            _force_shutdown_pool()
+            _shutdown_pool(graceful_first=False)
             raise
         except Exception:
             print("\n[WARNING] Errore durante l'analisi: arresto forzato dei worker in corso...")
-            _force_shutdown_pool()
+            _shutdown_pool(graceful_first=False)
             raise
         else:
             # Percorso "normale": pool.close() (niente nuovi task), poi
-            # comunque la stessa chiusura con timeout garantito, perche' il
-            # blocco visto in produzione avveniva PROPRIO qui, non solo sui
-            # rami d'eccezione.
+            # comunque la stessa chiusura con tempo massimo garantito, perche'
+            # il blocco visto in produzione avveniva PROPRIO qui, non solo
+            # sui rami d'eccezione.
             pool.close()
-            _force_shutdown_pool()
+            _shutdown_pool(graceful_first=True)
+        finally:
+            # Garantita SEMPRE: successo, errore o Ctrl+C. E' proprio
+            # questo il punto del checkpoint di resume: se l'utente
+            # interrompe, il progresso fatto fin qui non va perso.
+            self._persist_resume_state()
+            signal.signal(signal.SIGINT, previous_sigint)
 
         self._registry.flush()
 
         if cfg.save_debug_jsonl and self._debug_jsonl_path:
-            import json
             tmp_path = self._debug_jsonl_path + ".tmp"
             with open(tmp_path, "w", encoding="utf-8") as f:
                 for split in ("train", "val", "test"):
