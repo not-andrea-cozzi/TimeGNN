@@ -1,0 +1,36 @@
+# Configurazione per la valutazione standalone dei modelli
+evaluation:
+  # Percorso del dataset di test (file .pt contenente una lista di campioni)
+  test_data: "Dataset/Test/test_clean.pt"
+  
+  # Checkpoint dei modelli addestrati
+  checkpoint_basic: "Dataset/Train/checkpoints/basic.pt"
+  checkpoint_time: "Dataset/Train/checkpoints/time_aware.pt"
+  
+  # Directory di output per plot e CSV
+  plots_dir: "Dataset/Test/plots"
+  metrics_dir: "Dataset/Test/metrics"
+  
+  # Parametri di valutazione
+  max_n: 10                     # Profondità massima di matto da considerare
+  batch_size: 64
+  num_workers: 2                # Su Windows usare 0 se dà problemi
+  device: "auto"                # "auto", "cuda" o "cpu"
+  use_amp: false                # Usare mixed precision durante l'inferenza (solo se device=cuda)
+
+model_params:
+  embedding_dims: 64
+  gat_hidden_dim_event: 32
+  gat_hidden_dim_embed: 128
+  gat_hidden_dim_concat: 128
+  num_heads: 4
+  num_layers: 1
+  dropout: 0.0
+  use_batch_norm: false
+  activation: "elu"
+  lambda_decay: 0.01            # solo per time-aware
+
+# Logging
+logging:
+  log_level: "INFO"
+  log_file: "Dataset/Test/evaluation.log"
