@@ -1,21 +1,3 @@
-"""
-step0_clean_dataset.py
-
-Step 0 della training pipeline: legge train.pt / val.pt (liste di
-torch_geometric.data.Data prodotte da PositionGraphSchema.build_position_data),
-rimuove da ciascun Data ogni campo non richiesto dal forward dei modelli
-NON modificabili (DualGATModel / DualGATTimeAwareModel), e scrive
-train_clean.pt / val_clean.pt. I file originali non vengono toccati.
-
-Campi tenuti (minimo GAT):
-    event_ids, x, edge_index, edge_attr, time, y, num_nodes
-
-Campi scartati: rating, game_id, ply (mai letti dai modelli, servivano
-solo a debug/stratificazione a monte).
-
-Elaborazione train e val in parallelo con ProcessPoolExecutor (2 processi,
-uno per file), ciascuno internamente multi-processo sui singoli Data.
-"""
 from __future__ import annotations
 
 import argparse
@@ -97,36 +79,3 @@ def clean_file(in_path: str, out_path: str, workers: int = 4) -> int:
 
     return len(cleaned)
 
-
-def main() -> None:
-    parser = argparse.ArgumentParser(description="Step 0: pulizia parallela train.pt / val.pt")
-    parser.add_argument("--train", default="Dataset/Train/train.pt")
-    parser.add_argument("--val", default="Dataset/Train/val.pt")
-    parser.add_argument("--out-dir", default=None, help="Dir output (default: stessa dir dei file input)")
-    parser.add_argument("--inner-workers", type=int, default=4, help="Processi per la pulizia interna di ciascun file")
-    args = parser.parse_args()
-
-    train_out_dir = args.out_dir or os.path.dirname(args.train) or "."
-    val_out_dir = args.out_dir or os.path.dirname(args.val) or "."
-    train_out = os.path.join(train_out_dir, "train_clean.pt")
-    val_out = os.path.join(val_out_dir, "val_clean.pt")
-
-    logger.info("=" * 60)
-    logger.info("STEP 0: pulizia dataset (train + val in parallelo)")
-    logger.info("=" * 60)
-
-    # train e val elaborati in parallelo, un processo top-level ciascuno.
-    with ProcessPoolExecutor(max_workers=2) as top_pool:
-        fut_train = top_pool.submit(clean_file, args.train, train_out, args.inner_workers)
-        fut_val = top_pool.submit(clean_file, args.val, val_out, args.inner_workers)
-
-        n_train = fut_train.result()
-        n_val = fut_val.result()
-
-    logger.info("=" * 60)
-    logger.info(f"Completato: train={n_train:,} -> '{train_out}', val={n_val:,} -> '{val_out}'")
-    logger.info("=" * 60)
-
-
-if __name__ == "__main__":
-    main()

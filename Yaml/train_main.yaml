@@ -6,64 +6,72 @@ pipeline:
   force_recompute: false
   log_level: "INFO"
   log_file: "Dataset/train_pipeline.log"
-  step: null               
-  no_amp: true            
+  step: null               # valori: "clean", "shard", "train_basic", "train_time_aware", "evaluate"
+  no_amp: true
+
+clean:
+  enabled: true
+  input_train: "Dataset/Train/train_raw.pt"      
+  input_val: "Dataset/Train/val_raw.pt"
+  input_test: ""       # opzionale
+  output_train: "Dataset/Train/train_clean.pt"
+  output_val: "Dataset/Train/val_clean.pt"
+  output_test: "Dataset/Test/test_clean.pt"
+  workers: 4
 
 shard:
   train_clean: "Dataset/Train/train_clean.pt"
   val_clean: "Dataset/Train/val_clean.pt"
-  shard_size: 4000       
-
+  shard_size: 4000
 
 train_basic:
   enabled: true
-  shards_dir: "Dataset/Train/shards"   
-  checkpoint: "Dataset/Train/checkpoints/basic.pt"
-  epochs: 50               
-  batch_size: 32           
-  num_workers: 2          
-  lr: 1e-3
-  seed: 42
-  checkpoint_every: 500
-  patience: 5
-  no_amp: true
-  embedding_dims: 64
-  gat_hidden_dim_event: 32
-  gat_hidden_dim_embed: 128
-  gat_hidden_dim_concat: 128          
-  num_heads: 4
-  num_layers: 1
-  dropout: 0.0
-  use_batch_norm: false
-  activation: "elu"
-
-train_time_aware:
-  enabled: true
   shards_dir: "Dataset/Train/shards"
-  checkpoint: "Dataset/Train/checkpoints/time_aware.pt"
-  epochs: 50
+  checkpoint: "Dataset/Train/checkpoints/basic"
+  epochs: 20
   batch_size: 32
   num_workers: 2
   lr: 1e-3
   seed: 42
-  checkpoint_every: 500
   patience: 5
-  no_amp: true  
+  no_amp: true
   embedding_dims: 64
   gat_hidden_dim_event: 32
   gat_hidden_dim_embed: 128
   gat_hidden_dim_concat: 128
   num_heads: 4
   num_layers: 1
-  dropout: 0.0
-  use_batch_norm: false
+  dropout: 0.2
+  use_batch_norm: true
+  activation: "elu"
+  weight_decay: 1e-4
+
+train_time_aware:
+  enabled: true
+  shards_dir: "Dataset/Train/shards"
+  checkpoint: "Dataset/Train/checkpoints/basic"
+  epochs: 20
+  batch_size: 32
+  num_workers: 2
+  lr: 1e-3
+  seed: 42
+  patience: 5
+  no_amp: true
+  embedding_dims: 64
+  gat_hidden_dim_event: 32
+  gat_hidden_dim_embed: 128
+  gat_hidden_dim_concat: 128
+  num_heads: 4
+  num_layers: 1
+  dropout: 0.2
+  use_batch_norm: true
   activation: "elu"
   lambda_decay: 0.01
-
+  weight_decay: 1e-4
 
 evaluate:
   enabled: true
-  test_data: "Dataset/Test/test_clean.pt"          # dataset di test pulito (torch.save)
+  test_data: "Dataset/Test/test_clean.pt"
   plots_dir: "Dataset/Test/plots"
   out_dir: "Dataset/Test/metrics"
   max_n: 10

@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-import csv
+import argparse
 import logging
 import os
 import sys
@@ -23,15 +23,12 @@ from TrainPipeline.Shard.Sharding import shard_split
 from TrainPipeline.Training.State import TrainState
 from TrainPipeline.Training.Loop import train_epoch, evaluate_epoch
 from TrainPipeline.Shard.ShardDataset import ShardedGraphDataset
-
-# Modelli e utilità
 from timegnn.models.gat_basic import DualGATModel
 from timegnn.models.gat_time_decay import DualGATTimeAwareModel
 from timegnn.data.pyg import custom_collate_graph
 from timegnn.train.early_stopping import EarlyStopping
-
-# Helper per i plot
 from Common.EvaluatorPlotter import EvaluatorPlotter
+from TrainPipeline.CleanDataset import clean_file
 
 # ----------------------------------------------------------------------
 # Costanti
@@ -81,7 +78,7 @@ def load_yaml_config(config_path: str) -> Dict[str, Any]:
 
 
 def validate_config(cfg: Dict[str, Any]) -> None:
-    required = ["pipeline", "shard", "train_basic", "train_time_aware", "evaluate"]
+    required = ["pipeline", "clean", "shard", "train_basic", "train_time_aware", "evaluate"]
     for section in required:
         if section not in cfg:
             raise PipelineConfigError(f"Sezione mancante: '{section}'.")
@@ -111,13 +108,25 @@ def run_step(state: PipelineState, step_name: str, is_ready_fn, do_fn) -> None:
 # ----------------------------------------------------------------------
 def run_training(
     cfg: Dict[str, Any],
-    model_type: str,
+    model_type: str,              # "basic" o "time_aware"
     shards_dir: str,
-    checkpoint_path: str,
+    checkpoint_base: str,         # percorso base senza estensione (es. "basic")
     device: str,
     use_amp: bool,
 ) -> None:
+    """
+    Addestra un modello (basic o time‑aware) usando i dati shardati.
+
+    Checkpoint:
+        - <checkpoint_base>_last.pt  : salvato a fine ogni epoca (sempre)
+        - <checkpoint_base>_best.pt  : salvato solo se val_loss migliora
+        - Il resume cerca prima _last.pt, poi il checkpoint_base (se esiste)
+    """
     section = cfg["train_basic"] if model_type == "basic" else cfg["train_time_aware"]
+
+    # ------------------------------------------------------------------
+    # 1. Modello e dati
+    # ------------------------------------------------------------------
     if model_type == "basic":
         model_class = DualGATModel
         edge_dim = NUM_EDGE_TYPES
@@ -169,32 +178,77 @@ def run_training(
         **extra_kwargs,
     ).to(device)
 
-    optimizer = torch.optim.Adam(model.parameters(), lr=section.get("lr", 1e-3))
+    optimizer = torch.optim.Adam(
+        model.parameters(),
+        lr=section.get("lr", 1e-3),
+        weight_decay=section.get("weight_decay", 0.0),
+    )
     criterion = nn.CrossEntropyLoss()
     scaler = torch.amp.GradScaler("cuda", enabled=use_amp) if device == "cuda" else None
 
-    train_state = TrainState(checkpoint_path=checkpoint_path)
-    train_state.try_resume(model, optimizer, scaler, map_location=device)
+    # ------------------------------------------------------------------
+    # 2. Percorsi per i checkpoint
+    # ------------------------------------------------------------------
+    base_dir = os.path.dirname(checkpoint_base) or "."
+    base_name = os.path.basename(checkpoint_base)
+    # Se base_name ha già un'estensione, la rimuoviamo
+    if base_name.endswith(".pt"):
+        base_name = base_name[:-3]
+    last_path = os.path.join(base_dir, f"{base_name}_last.pt")
+    best_path = os.path.join(base_dir, f"{base_name}_best.pt")
+
+    # Decidiamo da dove riprendere: prima _last.pt, poi il checkpoint base (se esiste)
+    resume_path = None
+    if os.path.exists(last_path):
+        resume_path = last_path
+        logger.info(f"Ripresa da checkpoint last: {last_path}")
+    elif os.path.exists(checkpoint_base):
+        resume_path = checkpoint_base
+        logger.info(f"Ripresa da checkpoint base: {checkpoint_base}")
+    else:
+        logger.info("Nessun checkpoint esistente, partenza da zero.")
+
+    # Crea TrainState e tenta il resume
+    train_state = TrainState(checkpoint_path=resume_path)
+    if resume_path:
+        train_state.try_resume(model, optimizer, scaler, map_location=device)
 
     early_stopping = EarlyStopping(patience=section.get("patience", 5))
     epochs = section.get("epochs", 20)
-    checkpoint_every = section.get("checkpoint_every", 500) or None
 
+    # Il best_val_loss viene già caricato da try_resume
+    best_val_loss = train_state.best_val_loss
+
+    # ------------------------------------------------------------------
+    # 3. Loop di training
+    # ------------------------------------------------------------------
     for epoch in range(train_state.epoch, epochs):
         train_ds.set_epoch(epoch)
 
+        # --- Epoch di training ---
         t0 = time.monotonic()
         train_loss, train_acc = train_epoch(
-            model, train_loader, optimizer, criterion, device,
-            scaler=scaler, train_state=train_state,
-            checkpoint_every=checkpoint_every, use_amp=use_amp,
+            model,
+            train_loader,
+            optimizer,
+            criterion,
+            device,
+            scaler=scaler,
+            train_state=None,           # Non usiamo checkpoint intermedi
+            checkpoint_every=None,       # Disabilitato
+            use_amp=use_amp,
             total_items=len(train_ds),
             epoch_label=f"Epoch {epoch+1}/{epochs} [train]",
         )
 
+        # --- Validazione ---
         val_loss, val_top1, val_top3 = evaluate_epoch(
-            model, val_loader, criterion, device,
-            use_amp=use_amp, total_items=len(val_ds),
+            model,
+            val_loader,
+            criterion,
+            device,
+            use_amp=use_amp,
+            total_items=len(val_ds),
             epoch_label=f"Epoch {epoch+1}/{epochs} [val]",
         )
 
@@ -205,6 +259,7 @@ def run_training(
             f"val_loss={val_loss:.4f} val_top1={val_top1:.4f} val_top3={val_top3:.4f}"
         )
 
+        # Aggiorna stato
         train_state.epoch = epoch + 1
         train_state.history.append({
             "epoch": epoch + 1,
@@ -214,15 +269,30 @@ def run_training(
             "val_top1": val_top1,
             "val_top3": val_top3,
         })
-        train_state.save(model, optimizer, scaler)
 
+        # --- SALVA LAST checkpoint (sempre) ---
+        train_state.save(model, optimizer, scaler, checkpoint_path=last_path)
+        logger.debug(f"Last checkpoint salvato: {last_path}")
+
+        # --- SALVA BEST checkpoint (se migliora) ---
+        if val_loss < best_val_loss:
+            best_val_loss = val_loss
+            train_state.best_val_loss = best_val_loss
+            train_state.save(model, optimizer, scaler, checkpoint_path=best_path)
+            logger.info(f"Nuovo best checkpoint: {best_path} (val_loss={best_val_loss:.4f})")
+
+        # --- Early stopping ---
         early_stopping(val_loss)
         if early_stopping.early_stop:
-            logger.info(f"Early stopping all'epoca {epoch+1}.")
+            logger.info(f"Early stopping attivato all'epoca {epoch+1}.")
+            # Carica il best modello prima di uscire (opzionale)
+            if os.path.exists(best_path):
+                logger.info(f"Caricamento del best modello da {best_path}")
+                best_state = torch.load(best_path, map_location=device)
+                model.load_state_dict(best_state["model_state_dict"])
             break
 
-    logger.info(f"Training {model_type} completato.")
-
+    logger.info(f"Training {model_type} completato. Best val loss: {best_val_loss:.4f}")
 
 # ----------------------------------------------------------------------
 # Valutazione e plot
@@ -232,7 +302,6 @@ def evaluate_models(
     device: str,
     use_amp: bool,
 ) -> None:
-    """Carica i checkpoint, valuta sul test set e genera i grafici."""
     eval_cfg = cfg["evaluate"]
     if not eval_cfg.get("enabled", True):
         logger.info("Valutazione disabilitata.")
@@ -243,13 +312,7 @@ def evaluate_models(
         logger.warning(f"Test set non trovato: {test_path}. Salto la valutazione.")
         return
 
-    # Carico il dataset di test (un singolo file .pt con una lista di campioni)
     test_data = torch.load(test_path, map_location="cpu")
-    # Assumo che test_data sia una lista di dict con chiavi: x, edge_index, edge_attr, y, mate_n, ...
-    # Oppure un tensore strutturato. Adattiamo la lettura al formato del progetto.
-    # Per questo esempio, ipotizzo una classe Dataset semplice che restituisce i singoli campioni.
-    # Se invece abbiamo un file con un unico tensore di features, dobbiamo gestirlo.
-    # Qui per brevità creo un DataLoader basato su una semplice lista.
 
     class SimpleTestDataset(torch.utils.data.Dataset):
         def __init__(self, data_list):
@@ -270,7 +333,6 @@ def evaluate_models(
         num_workers=eval_cfg.get("num_workers", 2),
     )
 
-    # Carico i due modelli
     def load_model(checkpoint_path, model_class, edge_dim, extra_kwargs):
         model = model_class(
             num_event_features=NUM_EVENT_FEATURES,
@@ -288,7 +350,6 @@ def evaluate_models(
             activation=cfg["train_basic"].get("activation", "elu"),
             **extra_kwargs,
         ).to(device)
-        # Carico i pesi (solo stato del modello)
         if os.path.exists(checkpoint_path):
             state_dict = torch.load(checkpoint_path, map_location=device)
             if "model_state_dict" in state_dict:
@@ -300,7 +361,6 @@ def evaluate_models(
             logger.warning(f"Checkpoint non trovato: {checkpoint_path}, uso modello non addestrato.")
         return model
 
-    # Modello basic
     model_basic = load_model(
         eval_cfg["model_basic_checkpoint"],
         DualGATModel,
@@ -309,7 +369,6 @@ def evaluate_models(
     )
     model_basic.eval()
 
-    # Modello time‑aware
     model_time = load_model(
         eval_cfg["model_time_aware_checkpoint"],
         DualGATTimeAwareModel,
@@ -318,7 +377,6 @@ def evaluate_models(
     )
     model_time.eval()
 
-    # Funzione di valutazione su un batch
     def evaluate_model(model, loader):
         move_correct_list = []
         mate_correct_list = []
@@ -328,31 +386,22 @@ def evaluate_models(
 
         with torch.no_grad():
             for batch in loader:
-                # batch contiene: x, edge_index, edge_attr, y (target move), mate_n (profondità), e altri campi
                 x = batch.x.to(device)
                 edge_index = batch.edge_index.to(device)
                 edge_attr = batch.edge_attr.to(device)
-                y = batch.y.to(device)  # target move (classe)
+                y = batch.y.to(device)
                 mate_n = batch.mate_n.cpu().numpy() if hasattr(batch, "mate_n") else None
 
                 logits = model(x, edge_index, edge_attr)
                 pred = logits.argmax(dim=1)
 
-                # Accuratezza della mossa
                 correct_move = (pred == y).cpu().numpy()
                 move_correct_list.extend(correct_move)
 
-                # Se abbiamo la profondità di matto (mate_n) possiamo calcolare mate_correct
                 if mate_n is not None:
-                    # Ipotizzo che il modello abbia anche un head per la profondità (valore)
-                    # Ma qui non c'è, quindi per semplicità assumiamo che la predizione di mate_n sia data da un'altra
-                    # parte del modello (non implementata). In alternativa, possiamo calcolare mate_correct come
-                    # correttezza della sequenza di mosse (se abbiamo la soluzione completa).
-                    # Per questo esempio, mettiamo un placeholder.
-                    # Utilizzo il campo mate_n reale e predetto se disponibile, altrimenti zero.
                     mate_true = mate_n
-                    mate_pred = np.zeros_like(mate_n)  # placeholder
-                    mate_correct = np.zeros_like(mate_n, dtype=bool)  # placeholder
+                    mate_pred = np.zeros_like(mate_n)
+                    mate_correct = np.zeros_like(mate_n, dtype=bool)
                     mate_true_list.extend(mate_true)
                     mate_pred_list.extend(mate_pred)
                     mate_correct_list.extend(mate_correct)
@@ -372,22 +421,17 @@ def evaluate_models(
     logger.info("Valutazione del modello time‑aware...")
     res_time = evaluate_model(model_time, test_loader)
 
-    # Uso EvaluatorPlotter per generare i grafici
     plotter = EvaluatorPlotter(
         plots_dir=eval_cfg["plots_dir"],
         out_dir=eval_cfg["out_dir"]
     )
     max_n = eval_cfg.get("max_n", 10)
 
-    # Plot a barre per n
     plotter.plot_depth_bars(res_time, res_basic, max_n=max_n, filename="bars_per_n.png")
-    # Curve
     plotter.plot_depth_curves(res_time, res_basic, max_n=max_n, filename="curves_per_n.png")
-    # CSV
     plotter.save_depth_metrics(res_time, res_basic, max_n=max_n, filename="metrics_per_n.csv")
-    # Barre aggregate
     plotter.plot_aggregate_bars(res_time, res_basic, filename="aggregate_bars.png")
-    # Matrice di confusione (solo se abbiamo i dati)
+
     if len(res_time.get("mate_true", [])) > 0:
         plotter.plot_confusion_matrix(
             res_time["mate_true"],
@@ -422,7 +466,7 @@ def main(config_path: str = "Yaml/train_main.yaml") -> None:
     logger.info("=" * 70)
 
     step_filter = pipe_cfg.get("step")
-    valid_steps = ["shard", "train_basic", "train_time_aware", "evaluate"]
+    valid_steps = ["clean", "shard", "train_basic", "train_time_aware", "evaluate"]
     if step_filter is not None and step_filter not in valid_steps:
         raise PipelineConfigError(f"'pipeline.step' non valido: {step_filter}")
 
@@ -446,6 +490,49 @@ def main(config_path: str = "Yaml/train_main.yaml") -> None:
     device = "cuda" if torch.cuda.is_available() else "cpu"
     use_amp = (not pipe_cfg.get("no_amp", False)) and device == "cuda"
     logger.info(f"Device: {device}, AMP: {use_amp}")
+
+    # ------------------------------------------------------------------
+    # STEP 0: Clean dataset
+    # ------------------------------------------------------------------
+    if step_filter is None or step_filter == "clean":
+        clean_cfg = cfg.get("clean", {})
+        if clean_cfg.get("enabled", True):
+            logger.info("-" * 70)
+            logger.info("STEP 0/4: clean (rimozione campi superflui)")
+            logger.info("-" * 70)
+
+            in_train = clean_cfg["input_train"]
+            in_val = clean_cfg["input_val"]
+            in_test = clean_cfg.get("input_test", None)
+            out_train = clean_cfg["output_train"]
+            out_val = clean_cfg["output_val"]
+            out_test = clean_cfg.get("output_test", None)
+            workers = clean_cfg.get("workers", 4)
+
+            # Controllo che i file di input esistano
+            for f in [in_train, in_val] + ([in_test] if in_test else []):
+                if not os.path.exists(f):
+                    raise PipelineConfigError(f"File di input non trovato: {f}")
+
+            def _is_clean_ready():
+                # Verifica che tutti gli output esistano
+                ready = file_ready(out_train) and file_ready(out_val)
+                if out_test:
+                    ready = ready and file_ready(out_test)
+                return ready
+
+            def _do_clean():
+                logger.info(f"Pulizia train: {in_train} -> {out_train}")
+                clean_file(in_train, out_train, workers)
+                logger.info(f"Pulizia val: {in_val} -> {out_val}")
+                clean_file(in_val, out_val, workers)
+                if in_test and out_test:
+                    logger.info(f"Pulizia test: {in_test} -> {out_test}")
+                    clean_file(in_test, out_test, workers)
+
+            run_step(state, "clean", _is_clean_ready, _do_clean)
+        else:
+            logger.info("clean disabilitato.")
 
     # ------------------------------------------------------------------
     # STEP 1: Sharding
@@ -514,14 +601,7 @@ def main(config_path: str = "Yaml/train_main.yaml") -> None:
     if step_filter is None or step_filter == "evaluate":
         eval_cfg = cfg["evaluate"]
         if eval_cfg.get("enabled", True):
-            # La valutazione dipende dai checkpoint, quindi la eseguiamo solo se i training sono stati fatti.
-            # Ma run_step la eseguirà comunque se richiesta. Possiamo mettere una readiness check
-            # basata sull'esistenza dei checkpoint.
-            basic_ckpt = eval_cfg.get("model_basic_checkpoint", os.path.join(checkpoints_dir, "basic.pt"))
-            time_ckpt = eval_cfg.get("model_time_aware_checkpoint", os.path.join(checkpoints_dir, "time_aware.pt"))
-
             def _is_eval_ready():
-                # Considero pronto se i plot sono già stati generati (es. esiste bars_per_n.png)
                 plots_dir = eval_cfg.get("plots_dir", "Dataset/Test/plots")
                 return file_ready(os.path.join(plots_dir, "bars_per_n.png"))
 
@@ -538,7 +618,6 @@ def main(config_path: str = "Yaml/train_main.yaml") -> None:
 
 
 if __name__ == "__main__":
-    import argparse
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", default="Yaml/train_main.yaml")
     args = parser.parse_args()

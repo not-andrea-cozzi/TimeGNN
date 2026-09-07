@@ -32,7 +32,7 @@
     max_games: 250000                    # stesso, buon compromesso
     skip_games_part1: 200000 
     fics_max_games:  100000
-    fics_skip_games: 0
+    fics_skip_games: 100000
     club_max_games: 1000
     club_skip_games: 0
     club_pgn_col: "pgn"

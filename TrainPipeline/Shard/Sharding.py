@@ -75,30 +75,3 @@ def shard_split(in_path: str, out_dir: str, shard_size: int = 8000) -> dict:
         f"-> '{out_dir}' ({total:,} Data totali, shard_size={shard_size})."
     )
     return manifest
-
-
-def main() -> None:
-    parser = argparse.ArgumentParser(description="Step 1: risharding train_clean.pt / val_clean.pt")
-    parser.add_argument("--train", default="Dataset/Train/train_clean.pt")
-    parser.add_argument("--val", default="Dataset/Train/val_clean.pt")
-    parser.add_argument("--out-dir", default="Dataset/Train/shards")
-    parser.add_argument("--shard-size", type=int, default=8000)
-    args = parser.parse_args()
-
-    logger.info("=" * 60)
-    logger.info("STEP 1: risharding dataset (train + val)")
-    logger.info("=" * 60)
-
-    train_out = os.path.join(args.out_dir, "train")
-    val_out = os.path.join(args.out_dir, "val")
-
-    shard_split(args.train, train_out, args.shard_size)
-    shard_split(args.val, val_out, args.shard_size)
-
-    logger.info("=" * 60)
-    logger.info(f"Completato: shard in '{args.out_dir}/train' e '{args.out_dir}/val'.")
-    logger.info("=" * 60)
-
-
-if __name__ == "__main__":
-    main()
