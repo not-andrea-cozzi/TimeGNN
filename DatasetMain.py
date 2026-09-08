@@ -100,6 +100,19 @@ def validate_config(cfg: Dict[str, Any]) -> None:
     if m_train[0] > m_train[1] or m_train[0] < 1:
         raise PipelineConfigError(f"Range mate non valido per train games: {m_train}")
 
+    puzzle_cfg = cfg.get("puzzle_pipeline", {})
+    p_min_rating = puzzle_cfg.get("min_rating")
+    p_max_rating = puzzle_cfg.get("max_rating")
+    if p_min_rating is not None and p_max_rating is not None and p_min_rating > p_max_rating:
+        raise PipelineConfigError(
+            f"puzzle_pipeline: min_rating ({p_min_rating}) non puo' essere maggiore di max_rating ({p_max_rating})."
+        )
+    p_max_piece_count = puzzle_cfg.get("max_piece_count")
+    if p_max_piece_count is not None and p_max_piece_count < 2:
+        raise PipelineConfigError(
+            f"puzzle_pipeline: max_piece_count ({p_max_piece_count}) deve essere >= 2 (servono almeno i due Re)."
+        )
+
     logger.info(
         f"Configurazione valida: split_ratios=({t_ratio}, {v_ratio}, {te_ratio}), "
         f"mate_range={m_train}."
@@ -493,9 +506,6 @@ def main(config_path: str = "Yaml/main.yaml") -> None:
                 load_avg_time_by_rating(time_stats_path) if file_ready(time_stats_path) else {}
             )
 
-        # source_tag parametrico da YAML (raw_data.puzzles_source_tag):
-        # e' il prefisso "{fonte}_" che precede l'id originale nel
-        # game_id finale ("{fonte}_{id_game}"), es. "puzzle_00sHx".
         puzzles_source_tag = raw_cfg.get("puzzles_source_tag", DEFAULT_PUZZLE_SOURCE_TAG)
 
         pb_config = PuzzleBuilderConfig(
@@ -513,6 +523,15 @@ def main(config_path: str = "Yaml/main.yaml") -> None:
             split_seed=pipe_cfg.get("seed", 42),
             max_positions_per_puzzle=puzzle_cfg.get("max_positions_per_puzzle"),
             source_tag=puzzles_source_tag,
+
+            min_rating=puzzle_cfg.get("min_rating"),
+            max_rating=puzzle_cfg.get("max_rating"),
+            max_piece_count=puzzle_cfg.get("max_piece_count"),
+            min_material_for_mate_attempt=puzzle_cfg.get("min_material_for_mate_attempt", 0),
+            min_material_diff_for_mate_attempt=puzzle_cfg.get("min_material_diff_for_mate_attempt", 0),
+            require_heavy_piece=puzzle_cfg.get("require_heavy_piece", False),
+            skip_trivial_endgame=puzzle_cfg.get("skip_trivial_endgame", False),
+            dedupe_positions=puzzle_cfg.get("dedupe_positions", True),
         )
 
         builder = PuzzleBuilder(pb_config)
@@ -524,7 +543,9 @@ def main(config_path: str = "Yaml/main.yaml") -> None:
         logger.info(
             f"build_puzzles completato in {elapsed:.2f}s: "
             f"{result.get('accepted_puzzles', 0):,} puzzle accettati, "
-            f"{result.get('enqueued_positions', 0):,} posizioni accodate."
+            f"{result.get('enqueued_positions', 0):,} posizioni accodate, "
+            f"{result.get('quality_filtered_positions', 0):,} posizioni scartate da filtri di compatibilita', "
+            f"{result.get('deduped_positions', 0):,} posizioni scartate da dedupe."
         )
 
     if file_ready(puzzle_csv_path):

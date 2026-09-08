@@ -13,17 +13,22 @@ from tqdm import tqdm
 
 from DatasetPipeline.Model.PositionGraphSchema import build_position_data
 from DatasetPipeline.PositionQueue import PositionQueueRegistry
+from DatasetPipeline.Utils.compatibility_filters import (
+    has_mating_material,
+    is_trivially_drawn_endgame,
+    mover_has_heavy_piece,
+    parse_rating_strict,
+)
 
 logger = logging.getLogger("puzzle_builder")
 
 
 @dataclass(frozen=True)
 class PuzzleBuilderConfig:
-    """Configurazione per PuzzleBuilder (allineata a GamesBuilderConfig)."""
     csv_path: str
     mate_range: Tuple[int, int] = (1, 5)          # mateInN da includere
     max_puzzles: Optional[int] = None             # limite TOTALE dopo il filtro tematico (usato solo se max_puzzles_per_theme è None)
-    max_puzzles_per_theme: Optional[int] = None   # NUOVO: tetto per singolo tema mateInN, per campionamento stratificato
+    max_puzzles_per_theme: Optional[int] = None   # tetto per singolo tema mateInN, per campionamento stratificato
     avg_time_by_rating: Dict[int, float] = field(default_factory=dict)  # da TimeStatBuilder
     chunksize: int = 50_000                       # lettura chunk CSV
 
@@ -41,7 +46,17 @@ class PuzzleBuilderConfig:
 
     # Numero massimo di posizioni per puzzle (None = tutte)
     max_positions_per_puzzle: Optional[int] = None
-    source_tag: str = "puzzle"  
+    source_tag: str = "puzzle"
+
+    # --- Filtri di compatibilita' applicabili ai puzzle (vedi docstring) ---
+    min_rating: Optional[int] = None
+    max_rating: Optional[int] = None
+    max_piece_count: Optional[int] = None
+    min_material_for_mate_attempt: int = 0
+    min_material_diff_for_mate_attempt: int = 0
+    require_heavy_piece: bool = False
+    skip_trivial_endgame: bool = False
+    dedupe_positions: bool = True
 
 
 class PuzzleBuilder:
@@ -57,18 +72,18 @@ class PuzzleBuilder:
     "{source_tag}_{provisional_game_id}").
 
     NOTA GROUP_KEY (fix stratificazione split): il group_key passato a
-    registry.enqueue() per OGNI posizione di uno stesso puzzle e' COSTANTE
-    (= mate_n_iniziale, il tema dichiarato dal puzzle), perche'
+    registry.enqueue() per OGNI posizione di uno stesso puzzle è COSTANTE
+    (= mate_n_iniziale, il tema dichiarato dal puzzle), perché
     PositionQueueRegistry.build_splits impone l'invariante "un game_id -> un
     solo group_key" (stratifica per finestra intera, non per singola
     posizione). Il mate_n REALE per-posizione (current_mate_n, che decresce
-    ad ogni mossa-solver: e' corretto che lo faccia, vedi sotto) resta
+    ad ogni mossa-solver: è corretto che lo faccia, vedi sotto) resta
     comunque salvato nel debug JSONL.
 
     NOTA CAMPIONAMENTO STRATIFICATO (fix distribuzione mate_n):
-    current_mate_n = mate_n_iniziale - (mosse_solver_gia'_fatte) e' calcolato
-    CORRETTAMENTE: la prima mossa-solver di un puzzle mateIn4 e' davvero "a
-    4 mosse dal matto", l'ultima e' davvero "matto in 1". Il problema NON e'
+    current_mate_n = mate_n_iniziale - (mosse_solver_gia'_fatte) è calcolato
+    CORRETTAMENTE: la prima mossa-solver di un puzzle mateIn4 è davvero "a
+    4 mosse dal matto", l'ultima è davvero "matto in 1". Il problema NON è
     questo calcolo, ma la SELEZIONE dei puzzle a monte: se _load_filtered_rows
     taglia le prime `max_puzzles` righe del CSV che matchano il pattern
     combinato "mateIn1|mateIn2|...|mateIn10", e la maggioranza dei puzzle
@@ -82,11 +97,25 @@ class PuzzleBuilder:
     puzzle sorgente, e le posizioni intermedie che ne derivano popolano anche
     gli n alti.
 
+    NOTA FILTRI DI COMPATIBILITA': vedi docstring di PuzzleBuilderConfig per
+    la motivazione dettagliata di quali filtri di GamesBuilder sono stati
+    portati qui (min_rating/max_rating a livello di puzzle intero;
+    max_piece_count/min_material_for_mate_attempt/
+    min_material_diff_for_mate_attempt/require_heavy_piece/
+    skip_trivial_endgame/dedupe_positions a livello di singola posizione
+    solver) e quali sono stati esplicitamente esclusi perche' privi di un
+    dato o di un referente concettuale nel CSV puzzle.
+
     Uso tipico:
         config = PuzzleBuilderConfig(
             csv_path="lichess_puzzles.csv",
             mate_range=(1, 10),
             max_puzzles_per_theme=500,   # es. fino a 500 puzzle per ciascun mateInN
+            min_rating=1200,
+            require_heavy_piece=False,
+            skip_trivial_endgame=True,
+            min_material_for_mate_attempt=3,
+            min_material_diff_for_mate_attempt=3,
         )
         builder = PuzzleBuilder(config)
         result = builder.run()
@@ -94,6 +123,14 @@ class PuzzleBuilder:
         registry = PositionQueueRegistry.instance()
         splits = registry.build_splits(...)
     """
+
+    _PIECE_VALUES: Dict[int, int] = {
+        chess.PAWN: 1,
+        chess.KNIGHT: 3,
+        chess.BISHOP: 3,
+        chess.ROOK: 5,
+        chess.QUEEN: 9,
+    }
 
     def __init__(self, config: PuzzleBuilderConfig):
         self.config = config
@@ -131,6 +168,10 @@ class PuzzleBuilder:
             raise ValueError("max_puzzles_per_theme deve essere >= 1 se specificato.")
         if cfg.chunksize < 1:
             raise ValueError("chunksize deve essere >= 1.")
+        if cfg.min_rating is not None and cfg.max_rating is not None and cfg.min_rating > cfg.max_rating:
+            raise ValueError("min_rating non puo' essere maggiore di max_rating.")
+        if cfg.max_piece_count is not None and cfg.max_piece_count < 2:
+            raise ValueError("max_piece_count deve essere >= 2 se specificato (servono almeno i due Re).")
 
     # ------------------------------------------------------------------
     # LETTURA E FILTRO CSV
@@ -138,13 +179,20 @@ class PuzzleBuilder:
     def _load_filtered_rows(self) -> List[Dict]:
         """Legge il CSV a chunk, filtra per tema mateInN nel range configurato.
 
-        Se `max_puzzles_per_theme` e' impostato, il campionamento e'
+        Se `max_puzzles_per_theme` è impostato, il campionamento è
         STRATIFICATO: si accumulano fino a quel tetto di righe per CIASCUN
         valore di mateInN separatamente (in ordine di apparizione nel CSV,
         nessuno shuffle: sufficiente a garantire che ogni bucket riceva una
         quota, vedi docstring di classe). Altrimenti si ricade sul
         comportamento storico: taglio secco a `max_puzzles` righe totali sul
         pattern combinato, che NON garantisce copertura di tutti i temi.
+
+        Il filtro min_rating/max_rating (se configurato) e' applicato QUI,
+        a livello di riga CSV, PRIMA ancora della stratificazione per tema:
+        un puzzle fuori range di rating non deve occupare una quota del
+        tetto per-tema (coerente con
+        compatibility_filters.passes_rating_range_filter, applicato a
+        livello di intero puzzle).
         """
         lo, hi = self.config.mate_range
         themes_wanted = [f"mateIn{n}" for n in range(lo, hi + 1)]
@@ -156,6 +204,30 @@ class PuzzleBuilder:
             return self._load_filtered_rows_stratified(reader, themes_wanted, theme_pattern)
         return self._load_filtered_rows_flat(reader, theme_pattern)
 
+    def _row_passes_rating_filter(self, row: Dict) -> bool:
+        """min_rating/max_rating a livello di PUZZLE INTERO (un solo campo
+        Rating per riga, a differenza di WhiteElo/BlackElo di GamesBuilder).
+        Nessun bound configurato -> passa sempre."""
+        cfg = self.config
+        if cfg.min_rating is None and cfg.max_rating is None:
+            return True
+        rating = parse_rating_strict(row.get("Rating"))
+        if rating is None:
+            # Rating assente/non numerico: coerente con il fallback usato
+            # altrove nel builder (_simulated_clock/1500.0 di default), non
+            # scartiamo per un dato mancante quando nessun bound e' certo
+            # di escluderlo; se pero' un bound e' configurato, un rating
+            # ignoto non puo' essere verificato: scartiamo per sicurezza
+            # (stesso principio HARD di has_valid_ratings in
+            # compatibility_filters, applicato qui perche' e' l'unico dato
+            # su cui il filtro puo' operare).
+            return False
+        if cfg.min_rating is not None and rating < cfg.min_rating:
+            return False
+        if cfg.max_rating is not None and rating > cfg.max_rating:
+            return False
+        return True
+
     def _load_filtered_rows_flat(self, reader, theme_pattern: str) -> List[Dict]:
         """Comportamento storico: taglio secco a max_puzzles righe totali."""
         rows: List[Dict] = []
@@ -163,8 +235,11 @@ class PuzzleBuilder:
         for chunk in reader:
             mask = chunk["Themes"].str.contains(theme_pattern, na=False)
             filtered = chunk[mask]
-            rows.extend(filtered.to_dict("records"))
-            pbar.update(len(filtered))
+            for record in filtered.to_dict("records"):
+                if not self._row_passes_rating_filter(record):
+                    continue
+                rows.append(record)
+                pbar.update(1)
             if self.config.max_puzzles and len(rows) >= self.config.max_puzzles:
                 rows = rows[:self.config.max_puzzles]
                 break
@@ -187,6 +262,9 @@ class PuzzleBuilder:
                 continue
 
             for record in filtered.to_dict("records"):
+                if not self._row_passes_rating_filter(record):
+                    continue
+
                 theme_found = self._extract_theme_tag(str(record.get("Themes", "")), themes_wanted)
                 if theme_found is None:
                     continue
@@ -206,7 +284,8 @@ class PuzzleBuilder:
             if found < cap:
                 logger.warning(
                     f"Tema '{theme}': solo {found}/{cap} puzzle trovati nel CSV "
-                    f"(il dataset Lichess ne contiene meno di quanti richiesti)."
+                    f"(il dataset Lichess ne contiene meno di quanti richiesti, "
+                    f"anche considerando il filtro rating configurato)."
                 )
             all_rows.extend(rows_by_theme[theme])
 
@@ -229,7 +308,7 @@ class PuzzleBuilder:
     def _extract_theme_tag(themes: str, themes_wanted: List[str]) -> Optional[str]:
         """Ritorna il PRIMO tema tra quelli cercati (mateIn1..mateInN) presente
         nella stringa Themes della riga, o None se nessuno matcha (non
-        dovrebbe succedere se la riga e' gia' passata dal filtro .str.contains,
+        dovrebbe succedere se la riga è già passata dal filtro .str.contains,
         ma per sicurezza in caso di match parziale/overlap)."""
         tokens = set(themes.split())
         for t in themes_wanted:
@@ -265,6 +344,54 @@ class PuzzleBuilder:
         return "test"
 
     # ------------------------------------------------------------------
+    # FILTRI DI COMPATIBILITA' SU SINGOLA POSIZIONE SOLVER
+    # ------------------------------------------------------------------
+    def _material_by_color(self, board: "chess.Board") -> Tuple[int, int]:
+        white_mat = black_mat = 0
+        for p in board.piece_map().values():
+            val = self._PIECE_VALUES.get(p.piece_type, 0)
+            if p.color == chess.WHITE:
+                white_mat += val
+            else:
+                black_mat += val
+        return white_mat, black_mat
+
+    def _position_passes_quality_filters(self, board: "chess.Board") -> bool:
+        """Applica, sulla posizione SOLVER corrente (board.turn = lato che
+        deve trovare la mossa), i filtri di compatibilita' con un referente
+        concreto per un puzzle (vedi NOTA FILTRI DI COMPATIBILITA' nel
+        docstring di PuzzleBuilderConfig). Ritorna False se una qualunque
+        soglia configurata non e' soddisfatta: il chiamante scarta SOLO
+        questa posizione, non l'intero puzzle.
+
+        Riusa has_mating_material/mover_has_heavy_piece/
+        is_trivially_drawn_endgame da compatibility_filters.py (stessa
+        logica di GamesBuilder, senza duplicarla), passando un
+        QualityFilterConfig "sintetico" costruito dai campi equivalenti di
+        PuzzleBuilderConfig cosi' da non dover reimplementare le soglie.
+        """
+        cfg = self.config
+
+        if cfg.max_piece_count is not None and len(board.piece_map()) > cfg.max_piece_count:
+            return False
+
+        from DatasetPipeline.Utils.compatibility_filters import QualityFilterConfig
+        quality_cfg = QualityFilterConfig(
+            min_material_for_mate_attempt=cfg.min_material_for_mate_attempt,
+            min_material_diff_for_mate_attempt=cfg.min_material_diff_for_mate_attempt,
+            require_heavy_piece=cfg.require_heavy_piece,
+            skip_trivial_endgame=cfg.skip_trivial_endgame,
+        )
+
+        if not has_mating_material(board, quality_cfg):
+            return False
+        if cfg.require_heavy_piece and not mover_has_heavy_piece(board):
+            return False
+        if cfg.skip_trivial_endgame and is_trivially_drawn_endgame(board):
+            return False
+        return True
+
+    # ------------------------------------------------------------------
     # RUN
     # ------------------------------------------------------------------
     def run(self) -> Dict[str, Any]:
@@ -274,7 +401,9 @@ class PuzzleBuilder:
         accepted_puzzles = 0
         enqueued_positions = 0
         mate_n_counts: Dict[int, int] = defaultdict(int)
-        source_mate_n_counts: Dict[int, int] = defaultdict(int)  # NUOVO: quanti PUZZLE sorgente per mate_n_iniziale (diagnostico)
+        source_mate_n_counts: Dict[int, int] = defaultdict(int)  # quanti PUZZLE sorgente per mate_n_iniziale (diagnostico)
+        quality_filtered_positions = 0  # diagnostico: posizioni scartate dai filtri di compatibilita'
+        deduped_positions = 0  # diagnostico: posizioni scartate perche' gia' viste nello stesso puzzle
 
         for row in tqdm(all_rows, desc="Costruzione posizioni puzzle"):
             processed += 1
@@ -316,6 +445,7 @@ class PuzzleBuilder:
             # I puzzle hanno una sequenza di mosse: la soluzione.
             # Prendiamo solo i ply alterni (quelli in cui il solver deve muovere)
             puzzle_enqueued = 0
+            seen_positions: set = set()  # dedupe_positions: FEN troncato gia' visto in QUESTO puzzle
             for ply_idx, uci in enumerate(uci_moves[1:], start=1):
                 move = chess.Move.from_uci(uci)
 
@@ -329,6 +459,19 @@ class PuzzleBuilder:
                 # Questa è una mossa che il solver deve trovare (ply dispari)
                 if move not in board.legal_moves:
                     break
+
+                if self.config.dedupe_positions:
+                    position_key = " ".join(board.fen().split(" ")[:4])
+                    if position_key in seen_positions:
+                        deduped_positions += 1
+                        board.push(move)
+                        continue
+                    seen_positions.add(position_key)
+
+                if not self._position_passes_quality_filters(board):
+                    quality_filtered_positions += 1
+                    board.push(move)
+                    continue
 
                 current_mate_n = max(1, mate_n_iniziale - (ply_idx // 2))
                 # Simuliamo clock crescente con il numero di mosse
@@ -392,7 +535,10 @@ class PuzzleBuilder:
         if self.config.save_debug_jsonl and self._debug_jsonl_path:
             self._write_debug_jsonl()
 
-        self._log_summary(processed, accepted_puzzles, enqueued_positions, mate_n_counts, source_mate_n_counts)
+        self._log_summary(
+            processed, accepted_puzzles, enqueued_positions, mate_n_counts,
+            source_mate_n_counts, quality_filtered_positions, deduped_positions,
+        )
 
         return {
             "processed_puzzles": processed,
@@ -400,6 +546,8 @@ class PuzzleBuilder:
             "enqueued_positions": enqueued_positions,
             "mate_n_counts": dict(mate_n_counts),
             "source_mate_n_counts": dict(source_mate_n_counts),
+            "quality_filtered_positions": quality_filtered_positions,
+            "deduped_positions": deduped_positions,
         }
 
     def _write_debug_jsonl(self) -> None:
@@ -415,13 +563,16 @@ class PuzzleBuilder:
         os.replace(tmp_path, self._debug_jsonl_path)
         logger.info(f"Debug JSONL puzzle scritto in {self._debug_jsonl_path} ({len(all_records)} record)")
 
-    def _log_summary(self, processed, accepted, enqueued, mate_n_counts, source_mate_n_counts):
+    def _log_summary(self, processed, accepted, enqueued, mate_n_counts,
+                      source_mate_n_counts, quality_filtered_positions, deduped_positions):
         logger.info("=" * 60)
         logger.info("PUZZLE BUILDER — RIEPILOGO (allineato a GamesBuilder)")
         logger.info("=" * 60)
         logger.info(f"Puzzle processati: {processed:,}")
         logger.info(f"Puzzle accettati (almeno una posizione): {accepted:,}")
         logger.info(f"Posizioni accodate: {enqueued:,}")
+        logger.info(f"Posizioni scartate da filtri di compatibilita': {quality_filtered_positions:,}")
+        logger.info(f"Posizioni scartate da dedupe_positions: {deduped_positions:,}")
         if source_mate_n_counts:
             logger.info("Puzzle SORGENTE per tema mateInN dichiarato (prima della generazione posizioni):")
             for n in sorted(source_mate_n_counts.keys()):
