@@ -24,12 +24,14 @@ class TimeStatsBuilder:
         bucket_size: int = 100,
         min_base_time: int = 180,
         max_spent_threshold: float = 300.0,
+        min_rating: int = 1200,
     ):
         self.zst_path = zst_path
         self.max_games = max_games
         self.bucket_size = bucket_size
         self.min_base_time = min_base_time
         self.max_spent_threshold = max_spent_threshold
+        self.min_rating = min_rating
 
     @classmethod
     def _parse_clock(cls, comment: str) -> Optional[float]:
@@ -92,6 +94,8 @@ class TimeStatsBuilder:
                 continue
 
             if white_elo <= 0 or black_elo <= 0:
+                continue
+            elif white_elo < self.min_rating and black_elo < self.min_rating:
                 continue
 
             prev_clock = {

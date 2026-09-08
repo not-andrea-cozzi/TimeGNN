@@ -1,115 +1,236 @@
-"""
-Script per l'ispezione dei `data.game_id` gestiti da PositionQueueRegistry.
-"""
-
-import glob
-import os
 import torch
-from torch_geometric.data import Data
 
-from DatasetPipeline.Utils.position_compression import decompress_position_data
-from DatasetPipeline.PositionQueue import (
-    SHARD_GLOB_PATTERN,
-    PositionQueueRegistry,
-    _extract_game_id,
-    _spool_dir_for,
+path = "Dataset/Train/test.pt"
+
+# Quanti elementi mostrare per i Tensor grandi
+MAX_ELEMENTS = 200
+
+
+def print_value(name, value):
+    """Stampa nome, tipo, shape e contenuto del valore."""
+
+    print(f"\n{'-' * 60}")
+    print(f"KEY: {name}")
+    print(f"TIPO: {type(value)}")
+
+    # Tensor
+    if isinstance(value, torch.Tensor):
+        print(f"SHAPE: {tuple(value.shape)}")
+        print(f"DTYPE: {value.dtype}")
+        print(f"DEVICE: {value.device}")
+
+        # Tensor scalare
+        if value.numel() == 1:
+            print(f"VALORE: {value.item()}")
+
+        # Tensor piccolo
+        elif value.numel() <= MAX_ELEMENTS:
+            print("VALORE:")
+            print(value)
+
+        # Tensor grande
+        else:
+            print(f"NUMERO ELEMENTI: {value.numel()}")
+            print(f"PRIMI {MAX_ELEMENTS} ELEMENTI:")
+            print(value.flatten()[:MAX_ELEMENTS])
+
+    # Stringhe
+    elif isinstance(value, str):
+        print(f"VALORE: {value}")
+
+    # Numeri / bool
+    elif isinstance(value, (int, float, bool)):
+        print(f"VALORE: {value}")
+
+    # Liste / tuple
+    elif isinstance(value, (list, tuple)):
+        print(f"LUNGHEZZA: {len(value)}")
+
+        if len(value) <= MAX_ELEMENTS:
+            print("VALORE:")
+            print(value)
+        else:
+            print(f"PRIMI {MAX_ELEMENTS} ELEMENTI:")
+            print(value[:MAX_ELEMENTS])
+
+    # Altro
+    else:
+        print(f"VALORE: {value}")
+
+
+# ============================================================
+# CARICAMENTO
+# ============================================================
+
+data = torch.load(
+    path,
+    map_location="cpu",
+    weights_only=False
 )
 
 
-def print_game_ids_from_splits(splits: dict) -> None:
-    """Ripercorre tutti i dataset generati (train, val, test) e stampa il game_id di ogni singolo Data object."""
-    print("\n" + "=" * 60)
-    print(" 📊 VISUALIZZAZIONE GAME_ID DAGLI SPLIT COSTRUITI")
+print("=" * 60)
+print("ISPEZIONE FILE PT")
+print("=" * 60)
+
+print(f"FILE: {path}")
+print(f"TIPO: {type(data)}")
+
+
+# ============================================================
+# CASO 1: SINGOLO torch_geometric.data.Data
+# ============================================================
+
+if hasattr(data, "keys") and not isinstance(data, (list, tuple)):
+
+    print("\n")
+    print("=" * 60)
+    print("SINGOLO OGGETTO DATA")
     print("=" * 60)
 
-    total_items = 0
-    for split_name, data_list in splits.items():
-        print(f"\n--- [SPLIT: {split_name.upper()}] ({len(data_list)} elementi) ---")
-        for idx, data in enumerate(data_list, start=1):
-            game_id = _extract_game_id(data)
-            print(f"  [{idx:04d}] game_id: {game_id}")
-            total_items += 1
+    keys = list(data.keys())
 
-    print(f"\nTotale elementi ispezionati negli split: {total_items}")
+    print(f"\nNUMERO KEYS: {len(keys)}")
 
+    print("\nKEYS:")
+    for key in keys:
+        print(f"  - {key}")
 
-def print_game_ids_from_spool_shards(state_path: str) -> None:
-    """Legge direttamente i file shard (.pt) presenti nella cartella di spool,
-
-    decomprime i dati e stampa i game_id senza svuotare la coda in memoria.
-    """
-    spool_dir = _spool_dir_for(state_path)
-    pattern = os.path.join(spool_dir, SHARD_GLOB_PATTERN)
-    shard_paths = sorted(glob.glob(pattern))
-
-    print("\n" + "=" * 60)
-    print(f" 💾 VISUALIZZAZIONE GAME_ID DAI FILE SHARD SU DISCO ({spool_dir})")
+    print("\n")
+    print("=" * 60)
+    print("VALORI")
     print("=" * 60)
 
-    if not shard_paths:
-        print("Nessun file shard trovato su disco.")
-        return
-
-    total_items = 0
-    for shard_path in shard_paths:
-        shard_name = os.path.basename(shard_path)
-        print(f"\n📂 File Shard: {shard_name}")
-
-        try:
-            records = torch.load(shard_path, weights_only=False)
-            for idx, rec in enumerate(records, start=1):
-                decompressed_data = decompress_position_data(rec["data"])
-                game_id = _extract_game_id(decompressed_data)
-                source_tag = rec.get("source_tag", "N/A")
-                group_key = rec.get("group_key", "N/A")
-
-                print(
-                    f"  [{idx:03d}] game_id: {game_id:<25} | "
-                    f"source_tag: {source_tag:<15} | group_key: {group_key}"
-                )
-                total_items += 1
-        except Exception as e:
-            print(f"  ❌ Errore nella lettura dello shard {shard_name}: {e}")
-
-    print(f"\nTotale elementi trovati negli shard su disco: {total_items}")
+    for key in keys:
+        value = getattr(data, key)
+        print_value(key, value)
 
 
-def main():
-    state_path = "test_position_queue_state.json"
+# ============================================================
+# CASO 2: LISTA / TUPLA DI Data
+# ============================================================
 
-    PositionQueueRegistry.reset_for_testing()
+elif isinstance(data, (list, tuple)):
 
-    queue = PositionQueueRegistry.instance(
-        state_path=state_path, shard_size=3
-    )
+    print("\n")
+    print("=" * 60)
+    print("COLLEZIONE")
+    print("=" * 60)
 
-    print("\n1. Accodamento elementi con log in tempo reale...")
+    print(f"NUMERO ELEMENTI: {len(data)}")
 
-    sample_items = [
-        ("lichess_puzzles", "lichess_puzzle_1001", 1),
-        ("lichess_puzzles", "lichess_puzzle_1002", 1),
-        ("lichess_puzzles", "lichess_puzzle_1003", 2),
-        ("game_generator", "game_run_01_pos_0", 2),
-        ("game_generator", "game_run_01_pos_1", 2),
-    ]
+    if len(data) == 0:
+        print("\nLa lista è vuota.")
 
-    for source_tag, game_id_str, group_key in sample_items:
-        # Generazione matrice x strettamente binaria (0.0 o 1.0)
-        data = Data(x=torch.randint(0, 2, (4, 16), dtype=torch.float32))
-        data.game_id = game_id_str
+    else:
 
-        ref = queue.enqueue(source_tag=source_tag, data=data, group_key=group_key)
-        print(f"  [ENQUEUE] ref: {ref:<2} | game_id: {_extract_game_id(data)}")
+        # ----------------------------------------------------
+        # STAMPA TIPO ELEMENTI
+        # ----------------------------------------------------
 
-    queue.flush()
+        print("\nTIPI DEGLI ELEMENTI:")
 
-    print_game_ids_from_spool_shards(state_path)
+        for i, element in enumerate(data[:MAX_ELEMENTS]):
+            print(f"  [{i}] {type(element)}")
 
-    print("\nCostruzione degli split con build_splits()...")
-    splits = queue.build_splits(split_ratios=(0.6, 0.2, 0.2), seed=42)
+        # ----------------------------------------------------
+        # PRIMO ELEMENTO
+        # ----------------------------------------------------
 
-    print_game_ids_from_splits(splits)
+        first = data[0]
+
+        print("\n")
+        print("=" * 60)
+        print("PRIMO ELEMENTO")
+        print("=" * 60)
+
+        print(f"TIPO: {type(first)}")
+
+        if hasattr(first, "keys"):
+
+            keys = list(first.keys())
+
+            print(f"\nNUMERO KEYS: {len(keys)}")
+
+            print("\nKEYS:")
+            for key in keys:
+                print(f"  - {key}")
+
+            # ------------------------------------------------
+            # VALORI DEL PRIMO ELEMENTO
+            # ------------------------------------------------
+
+            print("\n")
+            print("=" * 60)
+            print("VALORI DEL PRIMO ELEMENTO")
+            print("=" * 60)
+
+            for key in keys:
+                value = getattr(first, key)
+                print_value(key, value)
+
+        else:
+            print("\nIl primo elemento non possiede keys().")
+            print("VALORE:")
+            print(first)
 
 
-if __name__ == "__main__":
-    main()
+# ============================================================
+# ALTRO TIPO DI CONTENUTO
+# ============================================================
+
+else:
+
+    print("\n")
+    print("=" * 60)
+    print("CONTENUTO")
+    print("=" * 60)
+
+    print_value("data", data)
+
+
+# ============================================================
+# GAME ID
+# ============================================================
+
+print("\n")
+print("=" * 60)
+print("GAME_ID")
+print("=" * 60)
+
+
+if isinstance(data, (list, tuple)):
+
+    game_ids = []
+
+    for i, element in enumerate(data):
+
+        if hasattr(element, "game_id"):
+
+            game_id = element.game_id
+
+            game_ids.append(game_id)
+
+            print(f"[{i}] game_id = {game_id}")
+
+        else:
+            print(f"[{i}] game_id NON PRESENTE")
+
+
+elif hasattr(data, "game_id"):
+
+    print(f"game_id = {data.game_id}")
+
+else:
+
+    print("game_id NON PRESENTE")
+
+
+# ============================================================
+# FINE
+# ============================================================
+
+print("\n")
+print("=" * 60)
+print("FINE ISPEZIONE")
+print("=" * 60)

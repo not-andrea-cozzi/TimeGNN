@@ -32,7 +32,9 @@ class PipelineState:
             json.dump(self._data, f, indent=2, sort_keys=True)
         os.replace(tmp_path, self.path) 
 
-    def is_done(self, step: str) -> bool:
+    def is_done(self, step: str, skip: bool = False) -> bool:
+        if skip:
+            return False
         return self._data.get(step, {}).get("done", False)
 
     def mark_done(self, step: str, **meta):

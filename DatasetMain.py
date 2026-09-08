@@ -439,13 +439,16 @@ def main(config_path: str = "Yaml/main.yaml") -> None:
             for tag, count in sorted(result["source_counts"].items(), key=lambda kv: -kv[1]):
                 logger.info(f"    {tag}: {count:,}")
 
+    done : bool = False
+    if step is not None and step == "games_pipeline":
+        done = True
     if step is None or step == "games_pipeline":
         run_step(
             state,
             "games_pipeline",
-            is_ready_fn=lambda: state.is_done("games_pipeline"),
-            do_fn=_step_games_pipeline,
-        )
+        is_ready_fn=  lambda: state.is_done("games_pipeline", skip=done),
+        do_fn=_step_games_pipeline,
+    )
 
     # --------------------------------------------------------------------
     # STEP 3: decompress_puzzles
