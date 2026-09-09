@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import atexit
 import logging
 import os
 import sys
@@ -297,6 +298,8 @@ def main(config_path: str = "Yaml/main.yaml") -> None:
     state_path = os.path.join(dataset_dir, state_file)
 
     queue_state_path = os.path.join(dataset_dir, pipe_cfg.get("queue_state_file", "position_queue_state.json"))
+    flush_interval_minutes = pipe_cfg.get("flush_interval_minutes", 20)
+    flush_interval_seconds = flush_interval_minutes * 60 if flush_interval_minutes else None
 
     force = pipe_cfg.get("force_recompute", False)
     if force and os.path.exists(state_path):
@@ -312,6 +315,30 @@ def main(config_path: str = "Yaml/main.yaml") -> None:
 
     state = PipelineState(state_path)
     logger.info(f"Stato pipeline caricato da '{state_path}'.")
+
+    # Istanziato qui (prima di qualunque builder) cosi' il singleton nasce
+    # gia' con flush_interval_seconds configurato: GamesBuilder/PuzzleBuilder
+    # chiamano PositionQueueRegistry.instance(state_path=...) piu' avanti
+    # senza passare flush_interval_seconds, e instance() ignora i parametri
+    # extra se l'istanza esiste gia' (vedi PositionQueueRegistry.instance).
+    registry = PositionQueueRegistry.instance(
+        state_path=queue_state_path,
+        flush_interval_seconds=flush_interval_seconds,
+    )
+    logger.info(
+        f"PositionQueueRegistry pronto: state_path='{queue_state_path}', "
+        f"flush periodico={'ogni ' + str(flush_interval_minutes) + ' min' if flush_interval_seconds else 'disattivato'}."
+    )
+
+    # atexit invece di un try/finally attorno a tutto main(): garantisce
+    # lo stop del thread di flush periodico e un ultimo flush del buffer
+    # residuo su QUALUNQUE uscita del processo (successo, eccezione non
+    # gestita, sys.exit da un except a valle in __main__), senza dover
+    # re-indentare l'intero corpo di main() sotto un try/finally.
+    # idempotente: se finalize_splits gira, build_splits() ha gia' fermato
+    # il timer e flushato; questa seconda chiamata e' un no-op sicuro
+    # (_stop_flush_timer con thread gia' None, flush con buffer vuoto).
+    atexit.register(registry.shutdown)
 
     time_stats_path = os.path.join(dataset_dir, stats_cfg.get("output_filename", "avg_time_by_rating.json"))
     puzzle_csv_path = os.path.join(dataset_dir, puzzle_cfg.get("decompressed_csv_filename", "lichess_puzzles.csv"))
@@ -572,7 +599,6 @@ def main(config_path: str = "Yaml/main.yaml") -> None:
     }
 
     def _step_finalize_splits() -> None:
-        registry = PositionQueueRegistry.instance(state_path=queue_state_path)
         logger.info("Drenaggio registry e calcolo split stratificato...")
         splits = registry.build_splits(split_ratios=split_ratios, seed=pipe_cfg.get("seed", 42))
 

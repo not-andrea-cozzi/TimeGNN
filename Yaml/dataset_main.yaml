@@ -7,7 +7,7 @@
     force_recompute: false #SEMPRE FALSE
     log_level: "INFO"
     log_file: "Dataset/pipeline.log"
-    step: "games_pipeline"  # "time_stats", "games_pipeline", "puzzle_pipeline", "all"
+    step: null  # "time_stats", "games_pipeline", "puzzle_pipeline", "all"
     use_existing_games: false
 
   engine:
@@ -17,13 +17,13 @@
     syzygy_path: null
 
   raw_data:
-    games_zst: "RawData/lichess_db_standard_rated_2020-01.pgn.zst"
-    puzzles_zst: ""
-    fics_pgn: "" #"RawData/ficsgamesdb_2015_standard2000_movetimes_4339936.pgn"
+    games_zst: ""
+    puzzles_zst: "RawData/lichess_db_puzzle.csv.zst"
+    fics_pgn: "RawData/ficsgamesdb_201001_standard_movetimes_4340144.pgn"
     club_csv: ""
     raw_data:
-    games_source_tag: "games_lichess_time_2"
-    fics_source_tag: "" #Made 100'000 --> turn to _1 (2023, 2017_chess is now 2, done 2017) -- 2015: 100'000
+    games_source_tag: "games_lichess_time_5" #to done 5
+    fics_source_tag: "fics_standard_2010_0" #Made 100'000 --> turn to _1 (2023, 2017_chess is now 2, done 2017) -- 2015: 100'000
     club_source_tag: ""
     puzzles_source_tag: "licess_puzzles_0"
 
@@ -34,9 +34,9 @@
 
   games_pipeline:
     output_base_filename: "games.pt"
-    max_games: 300000                    # stesso, buon compromesso
-    skip_games_part1: 200000  #(done 100'000 2017 and whole 2014, 100'000 2015) (200'000 games)
-    fics_max_games:  0
+    max_games: 0                     # stesso, buon compromesso
+    skip_games_part1: 0  #(done 100'000 2017 and whole 2014, 100'000 2015) (200'000 games)
+    fics_max_games:  null
     fics_skip_games: 0
     fics_pgn_col: "pgn"
     club_max_games: 0
@@ -73,7 +73,7 @@
     decompressed_csv_filename: "lichess_puzzles.csv"
     chunk_size_bytes: 1048576
     max_puzzles: null
-    max_puzzles_per_theme: 100
+    max_puzzles_per_theme: 120000
     min_rating: 1200
     max_rating: null
 
@@ -84,7 +84,7 @@
     min_material_for_mate_attempt: 3
     min_material_diff_for_mate_attempt: 3
 
-    require_heavy_piece: true
+    require_heavy_piece: false
 
     # skip_trivial_endgame: true, stesso valore di games_pipeline.
     skip_trivial_endgame: true
