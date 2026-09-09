@@ -73,16 +73,16 @@
     decompressed_csv_filename: "lichess_puzzles.csv"
     chunk_size_bytes: 1048576
     max_puzzles: null
-    max_puzzles_per_theme: 120000
-    min_rating: 1200
+    max_puzzles_per_theme: 180000
+    min_rating: 800
     max_rating: null
 
     # max_piece_count: a livello di singola posizione solver. null =
     # nessun limite (allineato a games_pipeline.max_piece_count: null).
     max_piece_count: null
 
-    min_material_for_mate_attempt: 3
-    min_material_diff_for_mate_attempt: 3
+    min_material_for_mate_attempt: 0
+    min_material_diff_for_mate_attempt: 0
 
     require_heavy_piece: false
 
@@ -97,8 +97,8 @@
 
 
   splits:
-    train_ratio: 0.65
-    val_ratio: 0.15
-    test_ratio: 0.20
+    train_ratio: 0.75
+    val_ratio: 0.10
+    test_ratio: 0.15
 
 

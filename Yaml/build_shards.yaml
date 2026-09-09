@@ -1,0 +1,69 @@
+pipeline:
+  dataset_dir: "Dataset"
+  games_subfolder: "Games"
+  queue_state_file: "games_alone_shards.json"  
+  resume_state_file: "games_builder_resume.json"
+  log_level: "INFO"
+  log_file: "Dataset/build_shards.log"
+  seed: 42
+
+  time_stats_json: "Dataset/avg_time_by_rating.json"
+
+engine:
+  stockfish_path: "/usr/games/stockfish"
+  threads: 1
+  hash_mb: 32
+  syzygy_path: null
+
+games_pipeline:
+  sources:
+    - path: "RawData/ficsgamesdb_2015_standard2000_movetimes_4339936.pgn"
+      tag: "games_2017_00"
+      skip_games: 0
+      max_games: 100000
+
+    - path: "RawData/ficsgamesdb_2018_standard2000_movetimes_4339956.pgn"
+      tag: "games_2018_standard_00"
+      skip_games: 0
+      max_games: 100000
+
+
+  split_train_ratio: 0.65
+  split_val_ratio: 0.15
+  split_test_ratio: 0.20
+
+  mate_range_min: 1
+  mate_range_max: 10
+  search_depth: 12
+  time_limit_seconds: 0.2
+  max_piece_count: null
+  min_material_for_mate_attempt: 3
+  min_material_diff_for_mate_attempt: 3
+  only_decisive_games: true
+  skip_time_forfeit: true
+  ply_sample_step: 12
+  min_ply: 6
+  max_positions_per_game: 20
+  require_clock: true
+  drop_zero_clock: true
+  workers: null                 # null = auto (cpu_count - 1)
+  min_rating: 1200
+  max_rating: null
+  require_heavy_piece: false
+  skip_forced_moves: true
+  dedupe_positions: true
+  skip_trivial_endgame: true
+  min_game_plies: 20
+  candidate_min_legal_moves: 1
+  candidate_max_legal_moves: null
+  skip_if_in_check: false
+  default_move_seconds: 15.0
+  stockfish_retry_attempts: 2
+  stockfish_retry_backoff_seconds: 0.5
+  shard_size: 5000
+  pool_join_timeout: 20.0
+  save_debug_jsonl: true
+
+
+  auto_resume: true
+  resume_checkpoint_every: 5000

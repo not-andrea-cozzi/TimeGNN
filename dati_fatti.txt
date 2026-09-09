@@ -1,4 +1,2 @@
-2014-fics: tutto
-2015-fics: 300'000
-games_lichess: 800'000  (valide in tutto 85'000)
-2018-blitz-2000: 200'000
+2017: 100'000
+2018-standard: 100'000
