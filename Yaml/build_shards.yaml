@@ -1,11 +1,10 @@
 pipeline:
-  dataset_dir: "Dataset"
-  games_subfolder: "Games"
-  queue_state_file: "games_alone_shards.json"  
-  resume_state_file: "games_builder_resume.json"
-  log_level: "INFO"
-  log_file: "Dataset/build_shards.log"
-  seed: 42
+  dataset_dir: "Dataset"                          # STESSO di dataset_main.yaml
+  games_subfolder: "Games"                        # STESSO
+  queue_state_file: "position_queue_state.json"   
+  resume_state_file: "build_shard_resume.json"    
+  seed: 42                                        
+
 
   time_stats_json: "Dataset/avg_time_by_rating.json"
 
@@ -17,13 +16,13 @@ engine:
 
 games_pipeline:
   sources:
-    - path: "RawData/ficsgamesdb_2015_standard2000_movetimes_4339936.pgn"
-      tag: "games_2017_00"
+    - path: "RawData/ficsgamesdb_2013_chess2000_movetimes_4340162.pgn"
+      tag: "games_2013_chess2000_01"
       skip_games: 0
       max_games: 100000
 
-    - path: "RawData/ficsgamesdb_2018_standard2000_movetimes_4339956.pgn"
-      tag: "games_2018_standard_00"
+    - path: "RawData/ficsgamesdb_2012_chess2000_movetimes_4340163.pgn"
+      tag: "games_2012_chess2000_01"
       skip_games: 0
       max_games: 100000
 

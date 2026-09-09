@@ -232,6 +232,18 @@ class GamesBuilderConfig:
     # quello garantito ad ogni uscita da run() (normale, errore o Ctrl+C).
     resume_checkpoint_every: int = 500
 
+    # [FLUSH A TEMPO]: PositionQueueRegistry.enqueue() fa flush dello
+    # shard pendente SOLO quando raggiunge shard_size elementi. Con un
+    # throughput basso (molte posizioni scartate da Stockfish/filtri
+    # prima di essere accodate), pending_shard puo' restare parzialmente
+    # pieno per ore senza mai toccare shard_size: se il processo muore
+    # in quella finestra, quel lavoro non e' recuperabile (non e' ancora
+    # su disco). flush_every_seconds forza uno shard scritto su disco al
+    # massimo ogni N secondi, indipendentemente dal conteggio. None o
+    # <= 0 disabilita il flush a tempo (comportamento storico: solo a
+    # conteggio + flush finale garantito a fine run()).
+    flush_every_seconds: Optional[float] = None
+
 # ============================================================================
 # GAMES BUILDER
 # ============================================================================
@@ -844,6 +856,10 @@ class GamesBuilder:
 
         estimate = self._count_tasks_estimate()
 
+        # [FLUSH A TEMPO]: riferimento iniziale per flush_every_seconds,
+        # vedi docstring del campo in GamesBuilderConfig.
+        last_flush_time = time.monotonic()
+
         shutdown_in_progress = threading.Event()
 
         def _panic_kill() -> None:
@@ -946,6 +962,21 @@ class GamesBuilder:
                 self._resume_confirmed[resume_key] += 1
                 if cfg.auto_resume and processed_games % cfg.resume_checkpoint_every == 0:
                     self._persist_resume_state()
+
+                # [FLUSH A TEMPO]: indipendente dal conteggio di
+                # pending_shard, garantisce che non passino piu' di
+                # flush_every_seconds tra uno shard scritto su disco e
+                # il successivo (vedi docstring del campo in
+                # GamesBuilderConfig). Controllato ad ogni partita
+                # confermata, costo trascurabile rispetto al lavoro di
+                # Stockfish per partita.
+                if cfg.flush_every_seconds and (time.monotonic() - last_flush_time) >= cfg.flush_every_seconds:
+                    self._registry.flush()
+                    last_flush_time = time.monotonic()
+                    logger.debug(
+                        "[GamesBuilder] Flush periodico eseguito (flush_every_seconds=%.1f).",
+                        cfg.flush_every_seconds,
+                    )
 
                 records: List[Dict[str, Any]] = decode_from_ipc(payload)
                 if not records:

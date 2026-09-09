@@ -171,6 +171,16 @@ def main(config_path: str) -> Dict[str, Any]:
     os.makedirs(dataset_dir, exist_ok=True)
     os.makedirs(games_output_dir, exist_ok=True)
 
+    # NOTA CONDIVISIONE SPOOL CON DatasetMain.py: questo path deve
+    # risolvere ESATTAMENTE alla stessa stringa (stesso dataset_dir +
+    # stesso queue_state_file) usata in Yaml/dataset_main.yaml, perche'
+    # PositionQueueRegistry deriva la cartella di spool da
+    # _spool_dir_for(state_path) = {dirname(state_path)}/{stem}_spool.
+    # BuildShard.py e DatasetMain.py girano come processi separati: non
+    # condividono il singleton in RAM, SOLO lo spool su disco. Se i due
+    # YAML divergono su dataset_dir o queue_state_file, gli shard scritti
+    # qui finiscono in una cartella diversa e DatasetMain non li vedra'
+    # mai al momento di finalize_splits.
     queue_state_path = os.path.join(
         dataset_dir, pipe_cfg.get("queue_state_file", "position_queue_state.json")
     )
@@ -208,11 +218,11 @@ def main(config_path: str) -> Dict[str, Any]:
 
     sources = _build_sources_from_list(games_cfg.get("sources", []))
 
-    # --------------------------------------------------------------
-    # STESSO GamesBuilderConfig di DatasetMain._step_games_pipeline,
-    # nessun parametro reinventato: solo sources/queue_state_path/
-    # resume_state_path sono specifici di questo script.
-    # --------------------------------------------------------------
+    flush_every_seconds = games_cfg.get("flush_every_seconds", 1800.0)
+    if flush_every_seconds is not None and flush_every_seconds <= 0:
+        flush_every_seconds = None
+    flush_every_seconds = 1800.0
+
     gb_config = GamesBuilderConfig(
         sources=sources,
         stockfish_path=stockfish_path,
@@ -267,11 +277,14 @@ def main(config_path: str) -> Dict[str, Any]:
         auto_resume=games_cfg.get("auto_resume", True),
         resume_state_path=resume_state_path,
         resume_checkpoint_every=games_cfg.get("resume_checkpoint_every", 500),
+
+        flush_every_seconds=flush_every_seconds,
     )
 
     logger.info(
         f"GamesBuilderConfig pronto: {len(sources)} sorgenti, mate_range={mate_range}, "
-        f"queue_state_path='{queue_state_path}', resume_state_path='{resume_state_path}'."
+        f"queue_state_path='{queue_state_path}', resume_state_path='{resume_state_path}', "
+        f"flush_every_seconds={flush_every_seconds}."
     )
     for src in sources:
         logger.info(f"    - tag='{src.tag}' kind='{src.kind}' path='{src.path}'")
