@@ -9,17 +9,15 @@ from torch_geometric.data import Data
 # ============================================================================
 # VOCABOLARI FISSI
 # ============================================================================
+_PROMOTION_TYPES: Tuple[Optional[int], ...] = (None, chess.QUEEN, chess.ROOK, chess.BISHOP, chess.KNIGHT)
+_PROMOTION_OFFSET: Dict[Optional[int], int] = {pt: i for i, pt in enumerate(_PROMOTION_TYPES)}
+NUM_PROMOTION_SLOTS = len(_PROMOTION_TYPES)  # 5
 
-MOVE_VOCAB_SIZE = 64 * 64  # 4096: from_square*64 + to_square
+MOVE_VOCAB_SIZE = 64 * 64 * NUM_PROMOTION_SLOTS  # 20480: (from*64+to)*5 + promo_slot
 
 # event_ids: 0 = casella vuota, 1..12 = piece_type*2+color+1
 EVENT_ID_EMPTY = 0
 NUM_EVENT_ID_CATEGORIES = 13  # 0 (vuoto) + 12 (6 piece_type x 2 colori)
-
-# edge_attr: tipo di relazione spaziale tra caselle (stessa semantica del
-# vecchio GraphBuilder: EDGE_LEGAL_MOVE/ATTACK/PIN, senza EDGE_PAD qui
-# perche' una board reale ha sempre almeno un arco valido nel nostro caso
-# d'uso -- posizioni con mate_n valido non sono mai in stallo).
 EDGE_LEGAL_MOVE = 0
 EDGE_ATTACK = 1
 EDGE_PIN = 2
@@ -37,12 +35,60 @@ _PIECE_VALUES = {
 
 
 def encode_move(move: "chess.Move") -> int:
-    """Codifica una mossa nel vocabolario globale fisso (0..4095).
+    """Codifica una mossa nel vocabolario globale fisso (0..20479).
 
-    NOTA: la promozione NON e' codificata (vedi NOTA PROMOTION_COLLISION
-    nel docstring di modulo).
+    [MODIFICATO] Include lo slot di promozione: due mosse con stesso
+    from/to ma promozione diversa (o nessuna) ricevono ora id distinti,
+    a differenza della versione precedente che le collassava (vedi
+    NUM_PROMOTION_SLOTS sopra). move.promotion e' None per le mosse non
+    di promozione e vale chess.QUEEN/ROOK/BISHOP/KNIGHT altrimenti.
     """
-    return move.from_square * 64 + move.to_square
+    base = move.from_square * 64 + move.to_square
+    promo_slot = _PROMOTION_OFFSET[move.promotion]
+    return base * NUM_PROMOTION_SLOTS + promo_slot
+
+
+def decode_move(move_id: int) -> Tuple[int, int, Optional[int]]:
+    """Inversa di encode_move: ritorna (from_square, to_square, promotion).
+
+    Utile per debug/ispezione e per ricostruire una chess.Move da un id
+    predetto dal modello (chess.Move(from_square, to_square, promotion)).
+    """
+    promo_slot = move_id % NUM_PROMOTION_SLOTS
+    base = move_id // NUM_PROMOTION_SLOTS
+    from_square = base // 64
+    to_square = base % 64
+    return from_square, to_square, _PROMOTION_TYPES[promo_slot]
+
+
+def build_legal_move_mask(board: "chess.Board") -> torch.Tensor:
+    """Costruisce la maschera booleana [1, MOVE_VOCAB_SIZE] delle mosse
+    legali sulla posizione data, con la stessa codifica di encode_move.
+
+    Usata a valle (fuori da questo modulo) per mascherare i logit del
+    modello prima di softmax/argmax: senza questa maschera il modello
+    valuta 20480 classi assolute anche quando solo poche decine sono
+    fisicamente giocabili, il che rende il problema di apprendimento
+    molto piu' difficile del necessario a parita' di dati.
+
+    NOTA SHAPE [1, MOVE_VOCAB_SIZE] (non [MOVE_VOCAB_SIZE]):
+    torch_geometric.data.Batch.from_data_list concatena per default lungo
+    dim=0 gli attributi non riconosciuti come node/edge-level. Un tensore
+    [MOVE_VOCAB_SIZE] per singolo grafo verrebbe quindi appiattito in un
+    unico vettore [batch_size*MOVE_VOCAB_SIZE] invece di uno stack
+    [batch_size, MOVE_VOCAB_SIZE]. Salvandolo con una dimensione fittizia
+    iniziale, la concatenazione lungo dim=0 produce direttamente la shape
+    corretta [batch_size, MOVE_VOCAB_SIZE] attesa dal masking dopo il
+    pooling per-grafo (vedi TrainPipeline/Training/Loop.py).
+
+    Returns:
+        torch.BoolTensor di shape [1, MOVE_VOCAB_SIZE], True sugli indici
+        delle mosse legali sulla board data (board.turn = lato al comando).
+    """
+    mask = torch.zeros(1, MOVE_VOCAB_SIZE, dtype=torch.bool)
+    for move in board.legal_moves:
+        mask[0, encode_move(move)] = True
+    return mask
 
 
 def encode_square_event_id(board: "chess.Board", square: int) -> int:
@@ -153,8 +199,8 @@ def build_position_data(
         ply: indice del ply all'interno della finestra (tracciamento).
 
     Returns:
-        Data con event_ids/x/edge_index/edge_attr/time/y/rating/game_id/ply
-        come da docstring di modulo.
+        Data con event_ids/x/edge_index/edge_attr/time/y/legal_move_mask/
+        rating/game_id/ply come da docstring di modulo.
 
     Raises:
         ValueError: se best_move non e' una mossa legale su board (il
@@ -200,6 +246,12 @@ def build_position_data(
 
     y = torch.tensor(encode_move(best_move), dtype=torch.long)
 
+    # [NUOVO] Maschera delle mosse legali nel vocabolario esteso (20480).
+    # Salvata come bool denso: 20480 bit = 2560 byte/posizione, trascurabile
+    # rispetto al resto del Data. Consumata a valle nel training/eval loop
+    # per mascherare i logit prima della softmax (vedi TrainPipeline).
+    legal_move_mask = build_legal_move_mask(board)
+
     data = Data(
         event_ids=event_ids,
         x=x,
@@ -209,6 +261,7 @@ def build_position_data(
     data.edge_attr = edge_attr
     data.time = time_tensor
     data.y = y
+    data.legal_move_mask = legal_move_mask
     data.rating = torch.tensor(float(rating), dtype=torch.float16)
     data.game_id = game_id
     data.ply = torch.tensor(int(ply), dtype=torch.int64)

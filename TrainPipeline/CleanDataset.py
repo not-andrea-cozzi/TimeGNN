@@ -21,7 +21,17 @@ logger = logging.getLogger("step0_clean")
 
 # Campi richiesti dal forward di DualGATModel / DualGATTimeAwareModel
 # (vedi timegnn/models/gat_basic.py, gat_time_decay.py) + y per la loss.
-KEEP_FIELDS = ("event_ids", "x", "edge_index", "edge_attr", "time", "y", "num_nodes")
+# [MODIFICATO] Aggiunto legal_move_mask: senza questa riga, il campo
+# scritto da PositionGraphSchema.build_position_data viene silenziosamente
+# eliminato QUI, prima ancora di raggiungere lo sharding — il masking
+# delle mosse illegali in training fallirebbe non per un bug nel loop,
+# ma perche' il dato necessario non arriva mai a quel punto della
+# pipeline. Questo e' esattamente il tipo di rottura silenziosa che
+# KEEP_FIELDS e' progettato per fare di proposito (rimuove tutto cio' che
+# non serve al forward dei due modelli): va quindi aggiornato ogni volta
+# che si introduce un nuovo campo consumato a valle del forward stesso
+# (qui: nel training/eval loop, non nel modello).
+KEEP_FIELDS = ("event_ids", "x", "edge_index", "edge_attr", "time", "y", "legal_move_mask", "num_nodes")
 
 
 def _clean_single(data: Data) -> Data:
@@ -119,9 +129,6 @@ def clean_file(in_path: str, out_path: str, workers: int = 0) -> int:
     # ------------------------------------------------------------------
     # 3. Salvataggio atomico
     # ------------------------------------------------------------------
-    # ------------------------------------------------------------------
-    # 3. Salvataggio atomico
-    # ------------------------------------------------------------------
     os.makedirs(os.path.dirname(os.path.abspath(out_path)) or ".", exist_ok=True)
     tmp_path = out_path + ".tmp"
     torch.save(cleaned, tmp_path)
@@ -136,18 +143,3 @@ def clean_file(in_path: str, out_path: str, workers: int = 0) -> int:
 
     return n_cleaned
 
-
-# ----------------------------------------------------------------------
-# CLI (invariata, solo per test manuale)
-# ----------------------------------------------------------------------
-def _parse_args():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("input")
-    parser.add_argument("output")
-    parser.add_argument("--workers", type=int, default=0)
-    return parser.parse_args()
-
-
-if __name__ == "__main__":
-    args = _parse_args()
-    clean_file(args.input, args.output, workers=args.workers)
