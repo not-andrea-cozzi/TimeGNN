@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import logging
 import os
 import sys
@@ -73,7 +74,84 @@ def _infer_kind(path: str) -> str:
     return "fics"
 
 
-def _build_sources_from_list(sources_cfg: List[Dict[str, Any]]) -> List[SourceSpec]:
+def _load_resume_state(resume_state_path: str) -> Dict[str, int]:
+    if not os.path.exists(resume_state_path):
+        logger.info(
+            f"[Resume] Nessun file di resume trovato in '{resume_state_path}': "
+            f"verra' creato da GamesBuilder a fine run. Tutte le fonti partono da "
+            f"skip_games=0 (o dal valore esplicito nello YAML)."
+        )
+        return {}
+
+    try:
+        with open(resume_state_path, "r", encoding="utf-8") as f:
+            saved = json.load(f)
+    except (json.JSONDecodeError, OSError, ValueError) as e:
+        logger.warning(
+            f"[Resume] File di resume '{resume_state_path}' presente ma illeggibile ({e}): "
+            f"procedo come se fosse vuoto (skip_games da YAML, nessun incremento)."
+        )
+        return {}
+
+    if not isinstance(saved, dict):
+        logger.warning(
+            f"[Resume] File di resume '{resume_state_path}' non contiene un dizionario "
+            f"({type(saved).__name__}): ignorato."
+        )
+        return {}
+
+    if not saved:
+        logger.info(f"[Resume] File di resume '{resume_state_path}' presente ma vuoto: nessun progresso salvato.")
+
+    return saved
+
+
+def _apply_resume_to_sources(
+    sources: List[SourceSpec], resume_state: Dict[str, int]
+) -> None:
+    """Applica IN-PLACE skip_games += resume_state[key] per ogni SourceSpec
+    la cui chiave "kind:path" e' presente nel resume state.
+
+    Se una fonte NON e' presente nel resume state (chiave assente), non fa
+    nulla: skip_games resta quello dello YAML (default 0), la fonte
+    ripartira' da zero come una fonte nuova, e la chiave verra' creata da
+    GamesBuilder a fine run.
+
+    Se una chiave del resume state non corrisponde a NESSUNA fonte tra
+    quelle passate in questa run, viene ignorata silenziosamente (solo
+    log informativo): tipicamente e' progresso di una fonte usata in una
+    run/config precedente e non deve bloccare questa esecuzione.
+    """
+    used_keys = set()
+    for src in sources:
+        key = f"{src.kind}:{src.path}"
+        already_done = resume_state.get(key)
+        if already_done:
+            new_skip = src.skip_games + already_done
+            logger.info(
+                f"[Resume] '{key}': {already_done:,} partite gia' confermate -> "
+                f"skip_games: {src.skip_games} (YAML) + {already_done:,} (resume) = {new_skip:,}."
+            )
+            src.skip_games = new_skip
+            used_keys.add(key)
+        else:
+            logger.info(
+                f"[Resume] '{key}': nessuna voce nel resume state, skip_games resta "
+                f"{src.skip_games} (da YAML). Verra' aggiunta una nuova voce a fine run."
+            )
+
+    unused_keys = set(resume_state.keys()) - used_keys
+    if unused_keys:
+        logger.info(
+            f"[Resume] {len(unused_keys)} chiave/i nel file di resume non corrispondono a "
+            f"nessuna fonte di questa run (ignorate, preservate senza modifiche nel file): "
+            + ", ".join(sorted(unused_keys))
+        )
+
+
+def _build_sources_from_list(
+    sources_cfg: List[Dict[str, Any]], resume_state: Dict[str, int]
+) -> List[SourceSpec]:
     """Costruisce i SourceSpec dalla lista dichiarata nello YAML
     (games_pipeline.sources), una entry per file:
 
@@ -90,6 +168,11 @@ def _build_sources_from_list(sources_cfg: List[Dict[str, Any]]) -> List[SourceSp
     GamesBuilder._validate_config solleva un errore esplicito (game_id
     duplicati tra file diversi altrimenti), quindi il fallimento e'
     comunque sicuro anche se lo si dimentica qui.
+
+    Dopo la costruzione, skip_games viene incrementato in-place con il
+    valore salvato nel resume state (vedi _apply_resume_to_sources), cosi'
+    che ripassando la stessa fonte (stessa "kind:path") in una run
+    successiva si riparta da dove ci si era fermati.
     """
     if not sources_cfg:
         raise ConfigError(
@@ -131,8 +214,10 @@ def _build_sources_from_list(sources_cfg: List[Dict[str, Any]]) -> List[SourceSp
         )
         logger.info(
             f"Sorgente #{i}: path='{path}', tag='{tag}', kind='{kind}', "
-            f"skip_games={entry.get('skip_games', 0)}, max_games={entry.get('max_games')}."
+            f"skip_games(YAML)={entry.get('skip_games', 0)}, max_games={entry.get('max_games')}."
         )
+
+    _apply_resume_to_sources(sources, resume_state)
 
     return sources
 
@@ -171,27 +256,14 @@ def main(config_path: str) -> Dict[str, Any]:
     os.makedirs(dataset_dir, exist_ok=True)
     os.makedirs(games_output_dir, exist_ok=True)
 
-    # NOTA CONDIVISIONE SPOOL CON DatasetMain.py: questo path deve
-    # risolvere ESATTAMENTE alla stessa stringa (stesso dataset_dir +
-    # stesso queue_state_file) usata in Yaml/dataset_main.yaml, perche'
-    # PositionQueueRegistry deriva la cartella di spool da
-    # _spool_dir_for(state_path) = {dirname(state_path)}/{stem}_spool.
-    # BuildShard.py e DatasetMain.py girano come processi separati: non
-    # condividono il singleton in RAM, SOLO lo spool su disco. Se i due
-    # YAML divergono su dataset_dir o queue_state_file, gli shard scritti
-    # qui finiscono in una cartella diversa e DatasetMain non li vedra'
-    # mai al momento di finalize_splits.
     queue_state_path = os.path.join(
         dataset_dir, pipe_cfg.get("queue_state_file", "position_queue_state.json")
     )
+
     resume_state_path = os.path.join(
         dataset_dir, pipe_cfg.get("resume_state_file", "games_builder_resume.json")
     )
 
-    # avg_time_by_rating: opzionale, riusa un time_stats.json gia'
-    # calcolato dalla pipeline principale se disponibile, altrimenti
-    # ricade sul default costante/rating-bucket assente (identico
-    # comportamento a DatasetMain quando lo step time_stats e' saltato).
     avg_time_by_rating: Dict[int, float] = {}
     time_stats_path = pipe_cfg.get("time_stats_json")
     if time_stats_path:
@@ -216,12 +288,16 @@ def main(config_path: str) -> Dict[str, Any]:
     if abs(sum(split_ratios) - 1.0) > 1e-6:
         raise ConfigError(f"split_ratios deve sommare a 1.0 (attuale: {split_ratios}).")
 
-    sources = _build_sources_from_list(games_cfg.get("sources", []))
+    # Il resume state va letto PRIMA di costruire i SourceSpec, perche'
+    # l'incremento di skip_games avviene ora in questo script (vedi
+    # _apply_resume_to_sources), non piu' dentro GamesBuilder.
+    resume_state = _load_resume_state(resume_state_path)
+    sources = _build_sources_from_list(games_cfg.get("sources", []), resume_state)
 
-    flush_every_seconds = games_cfg.get("flush_every_seconds", 1800.0)
+
+    flush_every_seconds = games_cfg.get("flush_every_seconds", 3600.0)
     if flush_every_seconds is not None and flush_every_seconds <= 0:
         flush_every_seconds = None
-    flush_every_seconds = 1800.0
 
     gb_config = GamesBuilderConfig(
         sources=sources,
@@ -274,7 +350,7 @@ def main(config_path: str) -> Dict[str, Any]:
 
         pool_join_timeout=games_cfg.get("pool_join_timeout", 20.0),
 
-        auto_resume=games_cfg.get("auto_resume", True),
+        auto_resume=False,
         resume_state_path=resume_state_path,
         resume_checkpoint_every=games_cfg.get("resume_checkpoint_every", 500),
 
@@ -286,10 +362,12 @@ def main(config_path: str) -> Dict[str, Any]:
         f"queue_state_path='{queue_state_path}', resume_state_path='{resume_state_path}', "
         f"flush_every_seconds={flush_every_seconds}."
     )
+    logger.info("skip_games EFFETTIVO per fonte in questa run (YAML + resume gia' applicato sopra):")
     for src in sources:
-        logger.info(f"    - tag='{src.tag}' kind='{src.kind}' path='{src.path}'")
+        logger.info(f"    - tag='{src.tag}' kind='{src.kind}' path='{src.path}' skip_games={src.skip_games:,} max_games={src.max_games}")
 
     builder = GamesBuilder(gb_config)
+
     logger.info("GamesBuilder pronto, avvio run()...")
     result = builder.run()
 
@@ -311,6 +389,14 @@ def main(config_path: str) -> Dict[str, Any]:
         f"queue_state_path), oppure chiamare manualmente "
         f"registry.build_splits() + registry.commit_splits()."
     )
+    logger.info(
+        f"Stato di resume aggiornato in '{resume_state_path}' (persistito da GamesBuilder "
+        f"nel finally di run(): sopravvive a questo processo. Alla prossima invocazione di "
+        f"questo script, questo file verra' letto direttamente qui in main() e il numero di "
+        f"partite gia' confermate per ciascuna 'kind:path' verra' sommato a skip_games. Se una "
+        f"fonte non compare nel file, ripartira' da skip_games=0/valore YAML come fonte nuova, "
+        f"e la sua chiave verra' creata a fine run)."
+    )
     logger.info("=" * 70)
 
     return result
@@ -321,7 +407,9 @@ if __name__ == "__main__":
         description=(
             "Costruisce shard di posizioni da una lista di file PGN/PGN.ZST "
             "con tag associati, usando lo stesso GamesBuilder della pipeline "
-            "principale. Non esegue merge/split finale."
+            "principale. Non esegue merge/split finale. skip_games per ogni "
+            "fonte viene ricavato da YAML + games_builder_resume.json (somma), "
+            "applicato direttamente in questo script prima di avviare GamesBuilder."
         )
     )
     parser.add_argument(
@@ -338,8 +426,9 @@ if __name__ == "__main__":
         sys.exit(2)
     except KeyboardInterrupt:
         logging.getLogger("build_shards_standalone").warning(
-            "Interrotto dall'utente. Il resume (auto_resume=true) permette "
-            "di riprendere da dove eri arrivato rilanciando lo stesso comando."
+            "Interrotto dall'utente. Il resume (skip_games da YAML + resume file) permette "
+            "di riprendere da dove eri arrivato rilanciando lo stesso comando, purche' "
+            "GamesBuilder abbia salvato progresso in resume_state_path prima dell'interruzione."
         )
         sys.exit(130)
     except Exception as e:

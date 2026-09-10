@@ -16,22 +16,22 @@ engine:
 
 games_pipeline:
   sources:
-    - path: "RawData/ficsgamesdb_2013_chess2000_movetimes_4340162.pgn"
-      tag: "games_2013_chess2000_01"
+    - path: "RawData/ficsgamesdb_201701_chess_movetimes_4339526.pgn"
+      tag: "games_fics_17_6_10_01"
       skip_games: 0
       max_games: 100000
 
-    - path: "RawData/ficsgamesdb_2012_chess2000_movetimes_4340163.pgn"
-      tag: "games_2012_chess2000_01"
-      skip_games: 0
-      max_games: 100000
+    #- path: "RawData/ficsgamesdb_2018_standard2000_movetimes_4339956.pgn"
+    #  tag: "games_2018_standard2000_01"
+    #  skip_games: 0
+    #  max_games: 50000
 
 
   split_train_ratio: 0.65
   split_val_ratio: 0.15
   split_test_ratio: 0.20
 
-  mate_range_min: 1
+  mate_range_min: 6
   mate_range_max: 10
   search_depth: 12
   time_limit_seconds: 0.2
