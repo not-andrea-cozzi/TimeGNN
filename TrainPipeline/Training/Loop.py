@@ -30,7 +30,7 @@ import torch.nn as nn
 from torch_geometric.nn import global_mean_pool
 
 from Common.progress import LiveStats, stage_bar
-from train_state import TrainState
+from TrainPipeline.Training.State import TrainState
 
 logger = logging.getLogger("train_loop")
 

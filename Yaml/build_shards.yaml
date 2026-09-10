@@ -17,7 +17,7 @@ engine:
 games_pipeline:
   sources:
     - path: "RawData/ficsgamesdb_201701_chess_movetimes_4339526.pgn"
-      tag: "games_fics_17_6_10_01"
+      tag: "games_fics_17_0_1"
       skip_games: 0
       max_games: 100000
 
@@ -31,8 +31,8 @@ games_pipeline:
   split_val_ratio: 0.15
   split_test_ratio: 0.20
 
-  mate_range_min: 6
-  mate_range_max: 10
+  mate_range_min: 1
+  mate_range_max: 5
   search_depth: 12
   time_limit_seconds: 0.2
   max_piece_count: null

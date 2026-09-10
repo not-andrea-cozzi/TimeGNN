@@ -11,18 +11,18 @@ pipeline:
 
 clean:
   enabled: true
-  input_train: "Dataset/Train/train_raw.pt"      
-  input_val: "Dataset/Train/val_raw.pt"
-  input_test: ""       # opzionale
+  input_train: "Dataset/Train/train.pt"
+  input_val: "Dataset/Train/val.pt"
+  input_test: "Dataset/Train/test.pt"
   output_train: "Dataset/Train/train_clean.pt"
   output_val: "Dataset/Train/val_clean.pt"
   output_test: "Dataset/Test/test_clean.pt"
-  workers: 4
+  workers: 0
 
 shard:
   train_clean: "Dataset/Train/train_clean.pt"
   val_clean: "Dataset/Train/val_clean.pt"
-  shard_size: 4000
+  shard_size: 5900
 
 train_basic:
   enabled: true
@@ -30,11 +30,10 @@ train_basic:
   checkpoint: "Dataset/Train/checkpoints/basic"
   epochs: 50
   batch_size: 128
-  num_workers: 2
-  lr: 1e-3
+  num_workers: 1
+  lr: 1.0e-3
   seed: 42
   patience: 5
-  no_amp: true
   embedding_dims: 64
   gat_hidden_dim_event: 32
   gat_hidden_dim_embed: 128
@@ -44,19 +43,18 @@ train_basic:
   dropout: 0.2
   use_batch_norm: true
   activation: "elu"
-  weight_decay: 1e-4
+  weight_decay: 1.0e-4
 
 train_time_aware:
   enabled: true
   shards_dir: "Dataset/Train/shards"
-  checkpoint: "Dataset/Train/checkpoints/basic"
+  checkpoint: "Dataset/Train/checkpoints/time_aware"   # <-- corretto
   epochs: 50
   batch_size: 128
-  num_workers: 2
-  lr: 1e-3
+  num_workers: 1
+  lr: 1.0e-3
   seed: 42
   patience: 5
-  no_amp: true
   embedding_dims: 64
   gat_hidden_dim_event: 32
   gat_hidden_dim_embed: 128
@@ -67,7 +65,7 @@ train_time_aware:
   use_batch_norm: true
   activation: "elu"
   lambda_decay: 0.01
-  weight_decay: 1e-4
+  weight_decay: 1.0e-4
 
 evaluate:
   enabled: true
@@ -75,7 +73,7 @@ evaluate:
   plots_dir: "Dataset/Test/plots"
   out_dir: "Dataset/Test/metrics"
   max_n: 10
-  batch_size: 64
+  batch_size: 128
   num_workers: 2
-  model_basic_checkpoint: "Dataset/Train/checkpoints/basic.pt"
-  model_time_aware_checkpoint: "Dataset/Train/checkpoints/time_aware.pt"
+  model_basic_checkpoint: "Dataset/Train/checkpoints/basic_best.pt"        # <-- corretto
+  model_time_aware_checkpoint: "Dataset/Train/checkpoints/time_aware_best.pt"  # <-- corretto

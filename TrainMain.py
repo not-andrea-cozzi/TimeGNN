@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import gc
 import logging
 import os
 import sys
@@ -14,13 +15,13 @@ import torch.nn as nn
 import yaml
 from torch.utils.data import DataLoader
 
-# Stato pipeline (riutilizzato da DatasetPipeline)
+import torch.multiprocessing
+
+# ----------------------------------------------------------------------
+# Stato pipeline
+# ----------------------------------------------------------------------
 from DatasetPipeline.PipelineState import PipelineState, file_ready
-
-# Sharding
 from TrainPipeline.Shard.Sharding import shard_split
-
-# Componenti training
 from TrainPipeline.Training.State import TrainState
 from TrainPipeline.Training.Loop import train_epoch, evaluate_epoch
 from TrainPipeline.Shard.ShardDataset import ShardedGraphDataset
@@ -34,13 +35,49 @@ from TrainPipeline.CleanDataset import clean_file
 # ----------------------------------------------------------------------
 # Costanti
 # ----------------------------------------------------------------------
-NUM_EVENT_ID_CATEGORIES = 13
+NUM_EVENT_ID_CATEGORIES = 15   
 NUM_EVENT_FEATURES = 2
 MOVE_VOCAB_SIZE = 64 * 64
 NUM_EDGE_TYPES = 3
 TIME_EDGE_DIM = 1
 
-logger = logging.getLogger(__name__)  # [LOGGING] logger di modulo
+logger = logging.getLogger(__name__)
+
+
+# ----------------------------------------------------------------------
+# Helper memoria
+# ----------------------------------------------------------------------
+def free_memory(verbose: bool = False) -> None:
+    """Forza garbage collection e svuota la cache CUDA."""
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        torch.cuda.ipc_collect()
+    if verbose:
+        try:
+            import psutil
+            rss = psutil.Process(os.getpid()).memory_info().rss / 1024**3
+            logger.debug(f"RAM processo dopo free_memory: {rss:.2f} GB")
+        except ImportError:
+            pass
+
+
+def apply_memory_limit(max_ram_gb: Optional[float]) -> None:
+    """
+    Limita la memoria virtuale del processo.
+    ATTENZIONE: può interferire con CUDA. Usare solo se necessario.
+    """
+    if max_ram_gb is None or max_ram_gb <= 0:
+        return
+    try:
+        import resource
+        limit_bytes = int(max_ram_gb * 1024**3)
+        soft, hard = resource.getrlimit(resource.RLIMIT_AS)
+        new_hard = limit_bytes if hard == resource.RLIM_INFINITY else min(limit_bytes, hard)
+        resource.setrlimit(resource.RLIMIT_AS, (limit_bytes, new_hard))
+        logger.info(f"Limite RAM impostato a {max_ram_gb} GB (RLIMIT_AS).")
+    except (ImportError, ValueError, OSError) as e:
+        logger.warning(f"Impossibile impostare il limite RAM: {e}")
 
 
 # ----------------------------------------------------------------------
@@ -50,19 +87,20 @@ class PipelineConfigError(Exception):
     pass
 
 
-def setup_logging(log_level: str = "INFO", log_file: Optional[str] = None, max_bytes: int = 10_485_760, backup_count: int = 3) -> None:
-    """
-    Configura il logging con:
-      - livello specificato
-      - output su stdout (colorato opzionalmente) e su file (con rotazione)
-    """
+def setup_logging(
+    log_level: str = "INFO",
+    log_file: Optional[str] = None,
+    max_bytes: int = 10_485_760,
+    backup_count: int = 3,
+) -> None:
     level = getattr(logging, log_level.upper(), logging.INFO)
     handlers = [logging.StreamHandler(sys.stdout)]
 
     if log_file:
         os.makedirs(os.path.dirname(os.path.abspath(log_file)) or ".", exist_ok=True)
-        # Rotazione automatica quando il file supera max_bytes
-        file_handler = RotatingFileHandler(log_file, maxBytes=max_bytes, backupCount=backup_count, encoding="utf-8")
+        file_handler = RotatingFileHandler(
+            log_file, maxBytes=max_bytes, backupCount=backup_count, encoding="utf-8"
+        )
         handlers.append(file_handler)
 
     logging.basicConfig(
@@ -71,7 +109,6 @@ def setup_logging(log_level: str = "INFO", log_file: Optional[str] = None, max_b
         handlers=handlers,
         force=True,
     )
-    # [LOGGING] Imposta livello più basso per i logger di terze parti (opzionale)
     logging.getLogger("torch").setLevel(logging.WARNING)
     logging.getLogger("matplotlib").setLevel(logging.WARNING)
 
@@ -79,10 +116,6 @@ def setup_logging(log_level: str = "INFO", log_file: Optional[str] = None, max_b
 def load_yaml_config(config_path: str) -> Dict[str, Any]:
     if not os.path.exists(config_path):
         raise PipelineConfigError(f"File YAML non trovato: {config_path}")
-    try:
-        import yaml
-    except ImportError:
-        raise PipelineConfigError("Modulo 'pyyaml' non installato.")
     with open(config_path, "r", encoding="utf-8") as f:
         cfg = yaml.safe_load(f)
     if not isinstance(cfg, dict):
@@ -112,13 +145,15 @@ def run_step(state: PipelineState, step_name: str, is_ready_fn, do_fn) -> None:
         state.mark_failed(step_name, str(e))
         logger.error(f"[FAILED] Step '{step_name}': {e}", exc_info=True)
         raise
+    finally:
+        # Libera sempre la memoria dopo ogni step
+        free_memory()
     elapsed = time.monotonic() - t0
     state.mark_done(step_name)
     logger.info(f"[DONE] Step '{step_name}' in {elapsed:.2f}s.")
 
 
 def log_config(cfg: Dict[str, Any], heading: str = "Configurazione") -> None:
-    """Stampa la configurazione in modo leggibile."""
     logger.info("=" * 70)
     logger.info(f"{heading}:")
     logger.info("=" * 70)
@@ -133,34 +168,59 @@ def log_config(cfg: Dict[str, Any], heading: str = "Configurazione") -> None:
 
 
 # ----------------------------------------------------------------------
-# Training (basic / time‑aware) - con logging migliorato
+# Helper per costruire DataLoader in modo sicuro
+# ----------------------------------------------------------------------
+def build_dataloader(dataset, section: Dict[str, Any], collate_fn, shuffle: bool) -> DataLoader:
+    """
+    Costruisce un DataLoader con parametri sicuri rispetto alla RAM.
+    - num_workers: da config (default 0 = nessun worker, nessuna shared memory)
+    - persistent_workers: solo se num_workers > 0
+    - prefetch_factor: solo se num_workers > 0
+    - pin_memory: da config (default False)
+    """
+    num_workers = int(section.get("num_workers", 0))
+    persistent = bool(section.get("persistent_workers", False)) and num_workers > 0
+    prefetch = section.get("prefetch_factor", 2) if num_workers > 0 else None
+    pin_memory = bool(section.get("pin_memory", False))
+
+    kwargs = dict(
+        dataset=dataset,
+        batch_size=section["batch_size"],
+        shuffle=shuffle,
+        collate_fn=collate_fn,
+        num_workers=num_workers,
+        pin_memory=pin_memory,
+        persistent_workers=persistent,
+    )
+    if prefetch is not None:
+        kwargs["prefetch_factor"] = prefetch
+
+    return DataLoader(**kwargs)
+
+
+# ----------------------------------------------------------------------
+# Training (basic / time-aware)
 # ----------------------------------------------------------------------
 def run_training(
     cfg: Dict[str, Any],
-    model_type: str,              # "basic" o "time_aware"
+    model_type: str,
     shards_dir: str,
-    checkpoint_base: str,         # percorso base senza estensione (es. "basic")
+    checkpoint_base: str,
     device: str,
     use_amp: bool,
 ) -> None:
-    """
-    Addestra un modello (basic o time‑aware) usando i dati shardati.
-    Logging dettagliato di configurazione, progresso, metriche e checkpoint.
-    """
     section = cfg["train_basic"] if model_type == "basic" else cfg["train_time_aware"]
     logger.info(f"Avvio training {model_type} con configurazione: {section}")
 
-    # ------------------------------------------------------------------
-    # 1. Modello e dati
-    # ------------------------------------------------------------------
+    # 1. Modello e dati ----------------------------------------------------
     if model_type == "basic":
         model_class = DualGATModel
         edge_dim = NUM_EDGE_TYPES
-        extra_kwargs = {}
+        extra_kwargs: Dict[str, Any] = {}
     else:
         model_class = DualGATTimeAwareModel
         edge_dim = TIME_EDGE_DIM
-        extra_kwargs = {"lambda_decay": section.get("lambda_decay", 0.01)}
+        extra_kwargs = {"lambda_decay": float(section.get("lambda_decay", 0.01))}
 
     train_dir = os.path.join(shards_dir, "train")
     val_dir = os.path.join(shards_dir, "val")
@@ -168,24 +228,14 @@ def run_training(
     train_ds = ShardedGraphDataset(train_dir, shuffle=True, seed=section.get("seed", 42))
     val_ds = ShardedGraphDataset(val_dir, shuffle=False, seed=section.get("seed", 42))
 
-    train_loader = DataLoader(
-        train_ds,
-        batch_size=section["batch_size"],
-        shuffle=False,
-        collate_fn=custom_collate_graph,
-        num_workers=section.get("num_workers", 2),
-        persistent_workers=section.get("num_workers", 2) > 0,
-    )
-    val_loader = DataLoader(
-        val_ds,
-        batch_size=section["batch_size"],
-        shuffle=False,
-        collate_fn=custom_collate_graph,
-        num_workers=section.get("num_workers", 2),
-        persistent_workers=section.get("num_workers", 2) > 0,
-    )
+    train_loader = build_dataloader(train_ds, section, custom_collate_graph, shuffle=False)
+    val_loader = build_dataloader(val_ds, section, custom_collate_graph, shuffle=False)
 
-    logger.info(f"Train: {len(train_ds):,} samples in {len(train_loader)} batches | Val: {len(val_ds):,} samples in {len(val_loader)} batches")
+    logger.info(
+        f"Train: {len(train_ds):,} samples in {len(train_loader)} batches | "
+        f"Val: {len(val_ds):,} samples in {len(val_loader)} batches | "
+        f"num_workers={section.get('num_workers', 0)}"
+    )
 
     model = model_class(
         num_event_features=NUM_EVENT_FEATURES,
@@ -206,15 +256,13 @@ def run_training(
 
     optimizer = torch.optim.Adam(
         model.parameters(),
-        lr=section.get("lr", 1e-3),
-        weight_decay=section.get("weight_decay", 0.0),
+        lr=float(section.get("lr", 1e-3)),
+        weight_decay=float(section.get("weight_decay", 0.0)),
     )
     criterion = nn.CrossEntropyLoss()
     scaler = torch.amp.GradScaler("cuda", enabled=use_amp) if device == "cuda" else None
 
-    # ------------------------------------------------------------------
-    # 2. Percorsi per i checkpoint
-    # ------------------------------------------------------------------
+    # 2. Checkpoint --------------------------------------------------------
     base_dir = os.path.dirname(checkpoint_base) or "."
     base_name = os.path.basename(checkpoint_base)
     if base_name.endswith(".pt"):
@@ -235,106 +283,108 @@ def run_training(
     train_state = TrainState(checkpoint_path=resume_path)
     if resume_path:
         train_state.try_resume(model, optimizer, scaler, map_location=device)
-        logger.info(f"Checkpoint caricato: epoca {train_state.epoch}, best_val_loss={train_state.best_val_loss:.4f}")
+        logger.info(
+            f"Checkpoint caricato: epoca {train_state.epoch}, "
+            f"best_val_loss={train_state.best_val_loss:.4f}"
+        )
 
     early_stopping = EarlyStopping(patience=section.get("patience", 5))
     epochs = section.get("epochs", 20)
     best_val_loss = train_state.best_val_loss
-    log_interval = section.get("log_interval", 10)  # [LOGGING] ogni quanti batch loggare
 
-    # ------------------------------------------------------------------
-    # 3. Loop di training
-    # ------------------------------------------------------------------
-    for epoch in range(train_state.epoch, epochs):
-        train_ds.set_epoch(epoch)
+    # 3. Loop di training --------------------------------------------------
+    try:
+        for epoch in range(train_state.epoch, epochs):
+            train_ds.set_epoch(epoch)
 
-        # --- Epoch di training ---
-        t0 = time.monotonic()
-        # [LOGGING] passiamo log_interval per avere logging per-batch
-        train_loss, train_acc = train_epoch(
-            model,
-            train_loader,
-            optimizer,
-            criterion,
-            device,
-            scaler=scaler,
-            train_state=None,
-            checkpoint_every=None,
-            use_amp=use_amp,
-            total_items=len(train_ds),
-            epoch_label=f"Epoch {epoch+1}/{epochs} [train]",
-            log_interval=log_interval,  # supponiamo che train_epoch supporti questo parametro
-        )
+            t0 = time.monotonic()
 
-        # --- Validazione ---
-        val_loss, val_top1, val_top3 = evaluate_epoch(
-            model,
-            val_loader,
-            criterion,
-            device,
-            use_amp=use_amp,
-            total_items=len(val_ds),
-            epoch_label=f"Epoch {epoch+1}/{epochs} [val]",
-        )
+            train_loss, train_acc = train_epoch(
+                model,
+                train_loader,
+                optimizer,
+                criterion,
+                device,
+                scaler=scaler,
+                train_state=None,
+                checkpoint_every=None,
+                use_amp=use_amp,
+                total_items=len(train_ds),
+                epoch_label=f"Epoch {epoch+1}/{epochs} [train]",
+            )
 
-        elapsed = time.monotonic() - t0
+            val_loss, val_top1, val_top3 = evaluate_epoch(
+                model,
+                val_loader,
+                criterion,
+                device,
+                use_amp=use_amp,
+                total_items=len(val_ds),
+                epoch_label=f"Epoch {epoch+1}/{epochs} [val]",
+            )
 
-        # [LOGGING] log completo delle metriche
+            elapsed = time.monotonic() - t0
+
+            logger.info(
+                f"Epoch {epoch+1}/{epochs} ({elapsed:.1f}s) | "
+                f"train_loss={train_loss:.4f} train_acc={train_acc:.4f} | "
+                f"val_loss={val_loss:.4f} val_top1={val_top1:.4f} val_top3={val_top3:.4f}"
+            )
+
+            if device == "cuda":
+                mem_alloc = torch.cuda.memory_allocated(device) / 1024**3
+                mem_reserved = torch.cuda.memory_reserved(device) / 1024**3
+                logger.debug(
+                    f"GPU memoria: allocata {mem_alloc:.2f} GB, riservata {mem_reserved:.2f} GB"
+                )
+
+            train_state.epoch = epoch + 1
+            train_state.history.append({
+                "epoch": epoch + 1,
+                "train_loss": train_loss,
+                "train_acc": train_acc,
+                "val_loss": val_loss,
+                "val_top1": val_top1,
+                "val_top3": val_top3,
+            })
+
+            train_state.save(model, optimizer, scaler, checkpoint_path=last_path)
+            logger.debug(f"Last checkpoint salvato: {last_path}")
+
+            if val_loss < best_val_loss:
+                best_val_loss = val_loss
+                train_state.best_val_loss = best_val_loss
+                train_state.save(model, optimizer, scaler, checkpoint_path=best_path)
+                logger.info(
+                    f"Nuovo best checkpoint: {best_path} (val_loss={best_val_loss:.4f})"
+                )
+
+            early_stopping(val_loss)
+            if early_stopping.early_stop:
+                logger.info(f"Early stopping attivato all'epoca {epoch+1}.")
+                if os.path.exists(best_path):
+                    logger.info(f"Caricamento del best modello da {best_path}")
+                    best_state = torch.load(best_path, map_location=device)
+                    model.load_state_dict(best_state["model_state_dict"])
+                    del best_state
+                break
+
+            free_memory()
+
         logger.info(
-            f"Epoch {epoch+1}/{epochs} ({elapsed:.1f}s) | "
-            f"train_loss={train_loss:.4f} train_acc={train_acc:.4f} | "
-            f"val_loss={val_loss:.4f} val_top1={val_top1:.4f} val_top3={val_top3:.4f}"
+            f"Training {model_type} completato. Best val loss: {best_val_loss:.4f}"
         )
-
-        # [LOGGING] eventuale utilizzo GPU
-        if device == "cuda":
-            mem_alloc = torch.cuda.memory_allocated(device) / 1024**3
-            mem_reserved = torch.cuda.memory_reserved(device) / 1024**3
-            logger.debug(f"GPU memoria: allocata {mem_alloc:.2f} GB, riservata {mem_reserved:.2f} GB")
-
-        # Aggiorna stato
-        train_state.epoch = epoch + 1
-        train_state.history.append({
-            "epoch": epoch + 1,
-            "train_loss": train_loss,
-            "train_acc": train_acc,
-            "val_loss": val_loss,
-            "val_top1": val_top1,
-            "val_top3": val_top3,
-        })
-
-        # --- SALVA LAST checkpoint (sempre) ---
-        train_state.save(model, optimizer, scaler, checkpoint_path=last_path)
-        logger.debug(f"Last checkpoint salvato: {last_path}")
-
-        # --- SALVA BEST checkpoint (se migliora) ---
-        if val_loss < best_val_loss:
-            best_val_loss = val_loss
-            train_state.best_val_loss = best_val_loss
-            train_state.save(model, optimizer, scaler, checkpoint_path=best_path)
-            logger.info(f"Nuovo best checkpoint: {best_path} (val_loss={best_val_loss:.4f})")
-
-        # --- Early stopping ---
-        early_stopping(val_loss)
-        if early_stopping.early_stop:
-            logger.info(f"Early stopping attivato all'epoca {epoch+1}.")
-            if os.path.exists(best_path):
-                logger.info(f"Caricamento del best modello da {best_path}")
-                best_state = torch.load(best_path, map_location=device)
-                model.load_state_dict(best_state["model_state_dict"])
-            break
-
-    logger.info(f"Training {model_type} completato. Best val loss: {best_val_loss:.4f}")
+    finally:
+        # Libera esplicitamente dataset, loader, modello e ottimizzatore
+        del train_loader, val_loader, train_ds, val_ds
+        del model, optimizer, criterion, scaler, train_state, early_stopping
+        free_memory(verbose=True)
 
 
 # ----------------------------------------------------------------------
-# Valutazione e plot - con logging
+# Valutazione e plot
 # ----------------------------------------------------------------------
-def evaluate_models(
-    cfg: Dict[str, Any],
-    device: str,
-    use_amp: bool,
-) -> None:
+def evaluate_models(cfg: Dict[str, Any], device: str, use_amp: bool) -> None:
     eval_cfg = cfg["evaluate"]
     if not eval_cfg.get("enabled", True):
         logger.info("Valutazione disabilitata.")
@@ -346,7 +396,11 @@ def evaluate_models(
         return
 
     logger.info(f"Caricamento test set da {test_path}")
-    test_data = torch.load(test_path, map_location="cpu")
+    # mmap=True evita di caricare tutto in RAM (PyTorch >= 2.0)
+    try:
+        test_data = torch.load(test_path, map_location="cpu", mmap=True)
+    except (TypeError, RuntimeError):
+        test_data = torch.load(test_path, map_location="cpu")
 
     class SimpleTestDataset(torch.utils.data.Dataset):
         def __init__(self, data_list):
@@ -359,14 +413,11 @@ def evaluate_models(
             return self.data[idx]
 
     test_ds = SimpleTestDataset(test_data)
-    test_loader = DataLoader(
-        test_ds,
-        batch_size=eval_cfg.get("batch_size", 64),
-        shuffle=False,
-        collate_fn=custom_collate_graph,
-        num_workers=eval_cfg.get("num_workers", 2),
+    test_loader = build_dataloader(test_ds, eval_cfg, custom_collate_graph, shuffle=False)
+    logger.info(
+        f"Test set: {len(test_ds):,} samples in {len(test_loader)} batches | "
+        f"num_workers={eval_cfg.get('num_workers', 0)}"
     )
-    logger.info(f"Test set: {len(test_ds):,} samples in {len(test_loader)} batches")
 
     def load_model(checkpoint_path, model_class, edge_dim, extra_kwargs):
         logger.debug(f"Caricamento modello da {checkpoint_path}")
@@ -392,16 +443,16 @@ def evaluate_models(
                 model.load_state_dict(state_dict["model_state_dict"])
             else:
                 model.load_state_dict(state_dict)
+            del state_dict
             logger.info(f"Modello caricato da {checkpoint_path}")
         else:
-            logger.warning(f"Checkpoint non trovato: {checkpoint_path}, uso modello non addestrato.")
+            logger.warning(
+                f"Checkpoint non trovato: {checkpoint_path}, uso modello non addestrato."
+            )
         return model
 
     model_basic = load_model(
-        eval_cfg["model_basic_checkpoint"],
-        DualGATModel,
-        NUM_EDGE_TYPES,
-        {}
+        eval_cfg["model_basic_checkpoint"], DualGATModel, NUM_EDGE_TYPES, {}
     )
     model_basic.eval()
 
@@ -409,7 +460,7 @@ def evaluate_models(
         eval_cfg["model_time_aware_checkpoint"],
         DualGATTimeAwareModel,
         TIME_EDGE_DIM,
-        {"lambda_decay": cfg["train_time_aware"].get("lambda_decay", 0.01)}
+        {"lambda_decay": cfg["train_time_aware"].get("lambda_decay", 0.01)},
     )
     model_time.eval()
 
@@ -427,7 +478,9 @@ def evaluate_models(
                 edge_index = batch.edge_index.to(device)
                 edge_attr = batch.edge_attr.to(device)
                 y = batch.y.to(device)
-                mate_n = batch.mate_n.cpu().numpy() if hasattr(batch, "mate_n") else None
+                mate_n = (
+                    batch.mate_n.cpu().numpy() if hasattr(batch, "mate_n") else None
+                )
 
                 logits = model(x, edge_index, edge_attr)
                 pred = logits.argmax(dim=1)
@@ -436,17 +489,16 @@ def evaluate_models(
                 move_correct_list.extend(correct_move)
 
                 if mate_n is not None:
-                    mate_true = mate_n
-                    mate_pred = np.zeros_like(mate_n)
-                    mate_correct = np.zeros_like(mate_n, dtype=bool)
-                    mate_true_list.extend(mate_true)
-                    mate_pred_list.extend(mate_pred)
-                    mate_correct_list.extend(mate_correct)
+                    mate_true_list.extend(mate_n)
+                    mate_pred_list.extend(np.zeros_like(mate_n))
+                    mate_correct_list.extend(np.zeros_like(mate_n, dtype=bool))
                     mate_n_list.extend(mate_n)
 
-                # [LOGGING] log ogni 10 batch
                 if batch_idx % 10 == 0:
                     logger.debug(f"  batch {batch_idx+1}/{len(loader)} processato")
+
+                # libera tensori del batch
+                del x, edge_index, edge_attr, y, logits, pred
 
         results = {
             "move_correct": np.array(move_correct_list),
@@ -455,41 +507,49 @@ def evaluate_models(
             "mate_pred": np.array(mate_pred_list) if mate_pred_list else np.array([]),
             "mate_n": np.array(mate_n_list) if mate_n_list else np.array([]),
         }
-        logger.info(f"Modello {name}: move accuracy = {np.mean(move_correct_list):.4f}")
+        logger.info(
+            f"Modello {name}: move accuracy = {np.mean(move_correct_list):.4f}"
+        )
         return results
 
-    res_basic = evaluate_model(model_basic, test_loader, "basic")
-    res_time = evaluate_model(model_time, test_loader, "time_aware")
+    try:
+        res_basic = evaluate_model(model_basic, test_loader, "basic")
+        res_time = evaluate_model(model_time, test_loader, "time_aware")
 
-    plotter = EvaluatorPlotter(
-        plots_dir=eval_cfg["plots_dir"],
-        out_dir=eval_cfg["out_dir"]
-    )
-    max_n = eval_cfg.get("max_n", 5)
-
-    logger.info("Generazione dei grafici di valutazione...")
-    plotter.plot_depth_bars(res_time, res_basic, max_n=max_n, filename="bars_per_n.png")
-    plotter.plot_depth_curves(res_time, res_basic, max_n=max_n, filename="curves_per_n.png")
-    plotter.save_depth_metrics(res_time, res_basic, max_n=max_n, filename="metrics_per_n.csv")
-    plotter.plot_aggregate_bars(res_time, res_basic, filename="aggregate_bars.png")
-
-    if len(res_time.get("mate_true", [])) > 0:
-        plotter.plot_confusion_matrix(
-            res_time["mate_true"],
-            res_time["mate_pred"],
-            num_classes=max_n + 1,
-            title="Confusion matrix - Timed",
-            filename="cm_timed.png"
+        plotter = EvaluatorPlotter(
+            plots_dir=eval_cfg["plots_dir"], out_dir=eval_cfg["out_dir"]
         )
-        plotter.plot_confusion_matrix(
-            res_basic["mate_true"],
-            res_basic["mate_pred"],
-            num_classes=max_n + 1,
-            title="Confusion matrix - Untimed",
-            filename="cm_untimed.png"
-        )
+        max_n = eval_cfg.get("max_n", 5)
 
-    logger.info(f"Valutazione completata. Output salvati in {eval_cfg['plots_dir']} e {eval_cfg['out_dir']}")
+        logger.info("Generazione dei grafici di valutazione...")
+        plotter.plot_depth_bars(res_time, res_basic, max_n=max_n, filename="bars_per_n.png")
+        plotter.plot_depth_curves(res_time, res_basic, max_n=max_n, filename="curves_per_n.png")
+        plotter.save_depth_metrics(res_time, res_basic, max_n=max_n, filename="metrics_per_n.csv")
+        plotter.plot_aggregate_bars(res_time, res_basic, filename="aggregate_bars.png")
+
+        if len(res_time.get("mate_true", [])) > 0:
+            plotter.plot_confusion_matrix(
+                res_time["mate_true"],
+                res_time["mate_pred"],
+                num_classes=max_n + 1,
+                title="Confusion matrix - Timed",
+                filename="cm_timed.png",
+            )
+            plotter.plot_confusion_matrix(
+                res_basic["mate_true"],
+                res_basic["mate_pred"],
+                num_classes=max_n + 1,
+                title="Confusion matrix - Untimed",
+                filename="cm_untimed.png",
+            )
+
+        logger.info(
+            f"Valutazione completata. Output salvati in {eval_cfg['plots_dir']} e {eval_cfg['out_dir']}"
+        )
+    finally:
+        del test_loader, test_ds, test_data
+        del model_basic, model_time
+        free_memory(verbose=True)
 
 
 # ----------------------------------------------------------------------
@@ -502,22 +562,42 @@ def main(config_path: str = "Yaml/train_main.yaml") -> None:
     pipe_cfg = cfg["pipeline"]
     setup_logging(pipe_cfg.get("log_level", "INFO"), pipe_cfg.get("log_file"))
 
-    # [LOGGING] stampa configurazione
     log_config(cfg, "Configurazione pipeline")
 
     logger.info("=" * 70)
     logger.info("AVVIO PIPELINE TRAINING TIMEGNN")
     logger.info("=" * 70)
 
+    # --- Limite RAM opzionale (configurabile da YAML) ---
+    apply_memory_limit(pipe_cfg.get("max_ram_gb", None))
+
+    # --- Strategia di condivisione PyTorch (configurabile) ---
+    # 'file_descriptor' (default PyTorch) usa fd (richiede ulimit -n alto)
+    # 'file_system' usa /dev/shm (RAM!) -> può saturare la RAM
+    sharing = pipe_cfg.get("sharing_strategy", "file_descriptor")
+    if sharing not in ("file_descriptor", "file_system"):
+        logger.warning(
+            f"sharing_strategy '{sharing}' non valida, uso 'file_descriptor'."
+        )
+        sharing = "file_descriptor"
+    try:
+        torch.multiprocessing.set_sharing_strategy(sharing)
+        logger.info(f"Strategia condivisione PyTorch: {sharing}")
+    except RuntimeError as e:
+        logger.warning(f"Impossibile impostare sharing strategy '{sharing}': {e}")
+
     step_filter = pipe_cfg.get("step")
     valid_steps = ["clean", "shard", "train_basic", "train_time_aware", "evaluate"]
     if step_filter is not None and step_filter not in valid_steps:
         raise PipelineConfigError(f"'pipeline.step' non valido: {step_filter}")
 
-    # Directory
     dataset_dir = pipe_cfg.get("dataset_dir", "Dataset")
-    shards_dir = os.path.join(dataset_dir, pipe_cfg.get("shards_subfolder", "Train/shards"))
-    checkpoints_dir = os.path.join(dataset_dir, pipe_cfg.get("checkpoints_subfolder", "Train/checkpoints"))
+    shards_dir = os.path.join(
+        dataset_dir, pipe_cfg.get("shards_subfolder", "Train/shards")
+    )
+    checkpoints_dir = os.path.join(
+        dataset_dir, pipe_cfg.get("checkpoints_subfolder", "Train/checkpoints")
+    )
     os.makedirs(shards_dir, exist_ok=True)
     os.makedirs(checkpoints_dir, exist_ok=True)
 
@@ -551,7 +631,7 @@ def main(config_path: str = "Yaml/train_main.yaml") -> None:
             out_train = clean_cfg["output_train"]
             out_val = clean_cfg["output_val"]
             out_test = clean_cfg.get("output_test", None)
-            workers = clean_cfg.get("workers", 4)
+            workers = int(clean_cfg.get("workers", 1))
 
             for f in [in_train, in_val] + ([in_test] if in_test else []):
                 if not os.path.exists(f):
@@ -566,11 +646,14 @@ def main(config_path: str = "Yaml/train_main.yaml") -> None:
             def _do_clean():
                 logger.info(f"Pulizia train: {in_train} -> {out_train}")
                 clean_file(in_train, out_train, workers)
+                free_memory()
                 logger.info(f"Pulizia val: {in_val} -> {out_val}")
                 clean_file(in_val, out_val, workers)
+                free_memory()
                 if in_test and out_test:
                     logger.info(f"Pulizia test: {in_test} -> {out_test}")
                     clean_file(in_test, out_test, workers)
+                    free_memory()
 
             run_step(state, "clean", _is_clean_ready, _do_clean)
         else:
@@ -588,14 +671,19 @@ def main(config_path: str = "Yaml/train_main.yaml") -> None:
         val_shard_dir = os.path.join(shards_dir, "val")
 
         def _is_shard_ready():
-            return file_ready(os.path.join(train_shard_dir, "manifest.json")) and \
-                   file_ready(os.path.join(val_shard_dir, "manifest.json"))
+            return file_ready(os.path.join(train_shard_dir, "manifest.json")) and file_ready(
+                os.path.join(val_shard_dir, "manifest.json")
+            )
 
         def _do_shard():
-            logger.info(f"Sharding train: {train_clean} -> {train_shard_dir} con shard_size={shard_size}")
+            logger.info(
+                f"Sharding train: {train_clean} -> {train_shard_dir} con shard_size={shard_size}"
+            )
             shard_split(train_clean, train_shard_dir, shard_size)
+            free_memory()
             logger.info(f"Sharding val: {val_clean} -> {val_shard_dir}")
             shard_split(val_clean, val_shard_dir, shard_size)
+            free_memory()
 
         run_step(state, "shard", _is_shard_ready, _do_shard)
 
@@ -624,7 +712,9 @@ def main(config_path: str = "Yaml/train_main.yaml") -> None:
     if step_filter is None or step_filter == "train_time_aware":
         time_cfg = cfg["train_time_aware"]
         if time_cfg.get("enabled", True):
-            checkpoint = time_cfg.get("checkpoint", os.path.join(checkpoints_dir, "time_aware.pt"))
+            checkpoint = time_cfg.get(
+                "checkpoint", os.path.join(checkpoints_dir, "time_aware.pt")
+            )
             shards = time_cfg.get("shards_dir", shards_dir)
 
             def _is_time_ready():
@@ -643,6 +733,7 @@ def main(config_path: str = "Yaml/train_main.yaml") -> None:
     if step_filter is None or step_filter == "evaluate":
         eval_cfg = cfg["evaluate"]
         if eval_cfg.get("enabled", True):
+
             def _is_eval_ready():
                 plots_dir = eval_cfg.get("plots_dir", "Dataset/Test/plots")
                 return file_ready(os.path.join(plots_dir, "bars_per_n.png"))
@@ -654,6 +745,7 @@ def main(config_path: str = "Yaml/train_main.yaml") -> None:
         else:
             logger.info("Valutazione disabilitata.")
 
+    free_memory(verbose=True)
     logger.info("=" * 70)
     logger.info("PIPELINE COMPLETATA.")
     logger.info("=" * 70)
@@ -662,8 +754,13 @@ def main(config_path: str = "Yaml/train_main.yaml") -> None:
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", default="Yaml/train_main.yaml")
-    parser.add_argument("--log-level", default="INFO", help="Override del livello di log (DEBUG, INFO, WARNING, ERROR)")
+    parser.add_argument(
+        "--log-level",
+        default="INFO",
+        help="Override del livello di log (DEBUG, INFO, WARNING, ERROR)",
+    )
     args = parser.parse_args()
+    # Applica il livello di log passato da CLI PRIMA di main
     if args.log_level:
-        pass
+        os.environ["LOG_LEVEL_OVERRIDE"] = args.log_level
     main(args.config)

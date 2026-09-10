@@ -51,7 +51,7 @@ import json
 import logging
 import os
 import random
-from typing import Iterator, List, Optional
+from typing import Iterator, List, Optional, Tuple
 
 import torch
 import torch.multiprocessing as mp
@@ -62,6 +62,28 @@ logger = logging.getLogger("shard_dataset")
 
 MANIFEST_FILENAME = "manifest.json"
 SHARD_FILENAME_TEMPLATE = "shard_{:05d}.pt"
+
+
+def _label_from_data(data: Data) -> int:
+    """
+    Estrae la label scalare da un Data per il collate di pyg.py
+    (`custom_collate_graph` fa `torch.tensor(labels)`, quindi servono int).
+
+    Solleva ValueError se 'y' manca o non e' scalare.
+    """
+    y = getattr(data, "y", None)
+    if y is None:
+        raise ValueError(
+            "Data senza campo 'y': impossibile addestrare. "
+            "Controlla che clean_file abbia tenuto 'y' (KEEP_FIELDS)."
+        )
+    if isinstance(y, torch.Tensor):
+        if y.numel() == 1:
+            return int(y.item())
+        raise ValueError(
+            f"'y' ha {y.numel()} elementi, atteso scalare per-label di grafo."
+        )
+    return int(y)
 
 
 class ShardedGraphDataset(IterableDataset):
@@ -152,7 +174,7 @@ class ShardedGraphDataset(IterableDataset):
             logger.warning(f"Shard '{path}' illeggibile ({type(e).__name__}: {e}): saltato.")
             return None
 
-    def __iter__(self) -> Iterator[Data]:
+    def __iter__(self) -> Iterator[Tuple[Data, int]]:
         epoch = self._current_epoch()
         shard_order = self._shard_order_for_worker(epoch)
 
@@ -169,7 +191,7 @@ class ShardedGraphDataset(IterableDataset):
             if self.shuffle:
                 item_rng.shuffle(items)
             for item in items:
-                yield item
+                yield item, _label_from_data(item)
             del items  # libera esplicitamente prima del prossimo shard
 
 

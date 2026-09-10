@@ -73,7 +73,7 @@
     decompressed_csv_filename: "lichess_puzzles.csv"
     chunk_size_bytes: 1048576
     max_puzzles: null
-    max_puzzles_per_theme: 180000
+    max_puzzles_per_theme: 200000
     min_rating: 800
     max_rating: null
 
