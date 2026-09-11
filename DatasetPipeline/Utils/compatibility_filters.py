@@ -97,15 +97,8 @@ from typing import Dict, List, Optional, Tuple
 import chess
 import chess.pgn
 
-
-_PIECE_VALUES: Dict[int, int] = {
-    chess.PAWN: 1,
-    chess.KNIGHT: 3,
-    chess.BISHOP: 3,
-    chess.ROOK: 5,
-    chess.QUEEN: 9,
-}
-
+from DatasetPipeline.Model.ChessConstants import PIECE_VALUES as _CLASS_PIECE_VALUES
+_PIECE_VALUES: Dict[int, int] = _CLASS_PIECE_VALUES
 
 # ============================================================================
 # HARD REQUIREMENTS

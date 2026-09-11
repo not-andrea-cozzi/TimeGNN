@@ -31,15 +31,18 @@ from timegnn.data.pyg import custom_collate_graph
 from timegnn.train.early_stopping import EarlyStopping
 from Common.EvaluatorPlotter import EvaluatorPlotter
 from TrainPipeline.CleanDataset import clean_file
+from DatasetPipeline.Utils.position_pooling import pool_node_logits, apply_legal_move_mask
 
 # ----------------------------------------------------------------------
 # Costanti
 # ----------------------------------------------------------------------
-NUM_EVENT_ID_CATEGORIES = 15   
-NUM_EVENT_FEATURES = 2
-MOVE_VOCAB_SIZE = 64 * 64
-NUM_EDGE_TYPES = 3
-TIME_EDGE_DIM = 1
+from DatasetPipeline.Model.ChessConstants import (
+    NUM_EVENT_FEATURES,
+    NUM_EVENT_ID_CATEGORIES,
+    MOVE_VOCAB_SIZE,
+    NUM_EDGE_TYPES,
+    TIME_EDGE_DIM,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -381,9 +384,6 @@ def run_training(
         free_memory(verbose=True)
 
 
-# ----------------------------------------------------------------------
-# Valutazione e plot
-# ----------------------------------------------------------------------
 def evaluate_models(cfg: Dict[str, Any], device: str, use_amp: bool) -> None:
     eval_cfg = cfg["evaluate"]
     if not eval_cfg.get("enabled", True):
@@ -396,11 +396,7 @@ def evaluate_models(cfg: Dict[str, Any], device: str, use_amp: bool) -> None:
         return
 
     logger.info(f"Caricamento test set da {test_path}")
-    # mmap=True evita di caricare tutto in RAM (PyTorch >= 2.0)
-    try:
-        test_data = torch.load(test_path, map_location="cpu", mmap=True)
-    except (TypeError, RuntimeError):
-        test_data = torch.load(test_path, map_location="cpu")
+    test_data = torch.load(test_path, map_location="cpu", weights_only=False)
 
     class SimpleTestDataset(torch.utils.data.Dataset):
         def __init__(self, data_list):
@@ -438,7 +434,7 @@ def evaluate_models(cfg: Dict[str, Any], device: str, use_amp: bool) -> None:
             **extra_kwargs,
         ).to(device)
         if os.path.exists(checkpoint_path):
-            state_dict = torch.load(checkpoint_path, map_location=device)
+            state_dict = torch.load(checkpoint_path, map_location=device, weights_only=False)
             if "model_state_dict" in state_dict:
                 model.load_state_dict(state_dict["model_state_dict"])
             else:
@@ -473,22 +469,22 @@ def evaluate_models(cfg: Dict[str, Any], device: str, use_amp: bool) -> None:
         mate_n_list = []
 
         with torch.no_grad():
-            for batch_idx, batch in enumerate(loader):
-                x = batch.x.to(device)
-                edge_index = batch.edge_index.to(device)
-                edge_attr = batch.edge_attr.to(device)
-                y = batch.y.to(device)
-                mate_n = (
-                    batch.mate_n.cpu().numpy() if hasattr(batch, "mate_n") else None
-                )
+            for batch_idx, (batch_event, labels) in enumerate(loader):
+                batch_event = batch_event.to(device)
+                labels = labels.to(device)
 
-                logits = model(x, edge_index, edge_attr)
-                pred = logits.argmax(dim=1)
+                node_logits = model(batch_event)
+                graph_logits = pool_node_logits(node_logits, batch_event.batch)
 
-                correct_move = (pred == y).cpu().numpy()
+                if hasattr(batch_event, "legal_move_mask") and batch_event.legal_move_mask is not None:
+                    graph_logits = apply_legal_move_mask(graph_logits, batch_event.legal_move_mask)
+
+                pred = graph_logits.argmax(dim=1)
+                correct_move = (pred == labels).cpu().numpy()
                 move_correct_list.extend(correct_move)
 
-                if mate_n is not None:
+                if hasattr(batch_event, "position_mate_n") and batch_event.position_mate_n is not None:
+                    mate_n = batch_event.position_mate_n.cpu().numpy()
                     mate_true_list.extend(mate_n)
                     mate_pred_list.extend(np.zeros_like(mate_n))
                     mate_correct_list.extend(np.zeros_like(mate_n, dtype=bool))
@@ -497,8 +493,7 @@ def evaluate_models(cfg: Dict[str, Any], device: str, use_amp: bool) -> None:
                 if batch_idx % 10 == 0:
                     logger.debug(f"  batch {batch_idx+1}/{len(loader)} processato")
 
-                # libera tensori del batch
-                del x, edge_index, edge_attr, y, logits, pred
+                del batch_event, labels, node_logits, graph_logits, pred
 
         results = {
             "move_correct": np.array(move_correct_list),
@@ -550,8 +545,8 @@ def evaluate_models(cfg: Dict[str, Any], device: str, use_amp: bool) -> None:
         del test_loader, test_ds, test_data
         del model_basic, model_time
         free_memory(verbose=True)
-
-
+        
+        
 # ----------------------------------------------------------------------
 # Main
 # ----------------------------------------------------------------------

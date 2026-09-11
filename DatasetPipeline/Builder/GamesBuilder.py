@@ -194,7 +194,24 @@ class GamesBuilderConfig:
 
     # [OTTIMIZZAZIONE]: Campionamento alleggerito (scarta più mosse).
     min_ply: int = 8
-    ply_sample_step: int = 6 
+    ply_sample_step: int = 6
+
+    # Coda finale della partita: qui i mate_n piccoli (1-3, al centro
+    # della research question del progetto, vedi proggetto_ai.md) sono
+    # piu' probabili che nel resto della partita. Uno step di
+    # campionamento uniforme (ply_sample_step) sull'intera partita
+    # sotto-rappresenta sistematicamente queste sequenze corte rispetto
+    # ai mate_n grandi, che vengono trovati anche a meta' partita con
+    # ply piu' "diluiti". Per correggere questo bias, negli ultimi
+    # dense_tail_plies ply si usa ply_sample_step_tail (piu' fitto) al
+    # posto di ply_sample_step. dense_tail_plies=0 disattiva la coda
+    # densa e ripristina il comportamento a step fisso uniforme.
+    # max_positions_per_game resta comunque il tetto assoluto per game,
+    # quindi il costo aggiuntivo di chiamate Stockfish e' limitato anche
+    # nel caso peggiore (game molto lungo con coda densa piena).
+    dense_tail_plies: int = 24
+    ply_sample_step_tail: int = 3
+
     max_positions_per_game: Optional[int] = 5 
 
     only_decisive_games: bool = True
@@ -515,7 +532,8 @@ class GamesBuilder:
         if game is None: return game_id, resume_key, empty_payload
 
         try:
-            if game.end().ply() < cfg.min_game_plies: return game_id, resume_key, empty_payload
+            game_end_ply = game.end().ply()
+            if game_end_ply < cfg.min_game_plies: return game_id, resume_key, empty_payload
         except Exception: return game_id, resume_key, empty_payload
 
         time_control = game.headers.get("TimeControl", "")
@@ -564,10 +582,22 @@ class GamesBuilder:
 
                 if current_clock is not None: previous_clock[mover_color] = current_clock
 
-                # Filtri di selezione delle posizioni
+                # Filtri di selezione delle posizioni. Negli ultimi
+                # cfg.dense_tail_plies ply della partita si campiona con
+                # cfg.ply_sample_step_tail (piu' fitto) invece di
+                # cfg.ply_sample_step, perche' i mate_n piccoli tendono a
+                # concentrarsi vicino alla fine della partita e uno step
+                # uniforme li sotto-campiona sistematicamente rispetto ai
+                # mate_n grandi (vedi commento in GamesBuilderConfig).
+                is_in_dense_tail = (
+                    cfg.dense_tail_plies > 0
+                    and (game_end_ply - node.ply()) <= cfg.dense_tail_plies
+                )
+                effective_step = cfg.ply_sample_step_tail if is_in_dense_tail else cfg.ply_sample_step
+
                 if node.ply() < cfg.min_ply:
                     node = next_node; continue
-                if (node.ply() - cfg.min_ply) % cfg.ply_sample_step != 0:
+                if (node.ply() - cfg.min_ply) % effective_step != 0:
                     node = next_node; continue
                 if cfg.require_clock and not duration_is_real:
                     node = next_node; continue
@@ -763,9 +793,19 @@ class GamesBuilder:
         return total
 
     def _assign_split(self, game_id: str) -> str:
-        import random
-        rng = random.Random(self.config.split_seed + hash(game_id))
-        val = rng.random()
+        """Split deterministico per debug JSONL. Usa hashlib invece del
+        built-in hash() perche' quest'ultimo e' salato in modo casuale
+        per-processo su stringhe (randomizzazione hash attiva di default
+        da Python 3.3, a meno di fissare PYTHONHASHSEED): senza questo
+        fix, lo stesso game_id poteva finire in split diversi tra due
+        run dello stesso script, disallineando i log di debug dal reale
+        split usato in training (quello vero, in
+        PositionQueueRegistry.build_splits, e' gia' deterministico
+        perche' usa torch.Generator().manual_seed(seed) su liste
+        ordinate)."""
+        import hashlib
+        digest = hashlib.sha256(f"{self.config.split_seed}:{game_id}".encode("utf-8")).hexdigest()
+        val = int(digest[:8], 16) / 0xFFFFFFFF
         train, val_ratio, _ = self.config.split_ratios
         if val < train: return "train"
         if val < train + val_ratio: return "val"

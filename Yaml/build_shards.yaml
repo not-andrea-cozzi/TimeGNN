@@ -36,8 +36,8 @@ games_pipeline:
   search_depth: 12
   time_limit_seconds: 0.2
   max_piece_count: null
-  min_material_for_mate_attempt: 3
-  min_material_diff_for_mate_attempt: 3
+  min_material_for_mate_attempt: 0
+  min_material_diff_for_mate_attempt: 0
   only_decisive_games: true
   skip_time_forfeit: true
   ply_sample_step: 12

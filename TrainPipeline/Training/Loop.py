@@ -24,7 +24,8 @@ from __future__ import annotations
 
 import logging
 from typing import Optional, Tuple
-
+from torch_geometric.nn import global_mean_pool
+from DatasetPipeline.Utils.position_pooling import apply_legal_move_mask
 import torch
 import torch.nn as nn
 from torch_geometric.nn import global_mean_pool
@@ -62,28 +63,6 @@ def train_epoch(
     total_items: Optional[int] = None,
     epoch_label: Optional[str] = None,
 ) -> Tuple[float, float]:
-    """Un'epoca di training con pooling per-grafo e AMP opzionale.
-
-    Se train_state e checkpoint_every sono forniti, salva un checkpoint
-    ogni `checkpoint_every` step (non solo a fine epoca): su un'epoca
-    lunga (300k Data) un crash a meta' non fa perdere tutto il lavoro.
-    NOTA: il resume da un checkpoint step-based riparte comunque dall'
-    inizio dell'epoca corrente (l'IterableDataset non supporta skip a
-    metà epoca): il salvataggio frequente protegge i PESI del modello da
-    un crash, non fa un resume esatto infra-epoca.
-
-    max_grad_norm: se non None, applica gradient clipping (norma L2)
-    prima dello step di ottimizzazione. Con GAT + AMP i gradienti possono
-    esplodere in fp16; il clipping e' una salvaguardia a basso costo.
-
-    total_items: numero di POSIZIONI (non batch) nell'intero split, per
-    dimensionare la progress bar in modo esatto. Va passato esplicitamente
-    (es. len(dataset)) e non dedotto da len(loader): con un
-    IterableDataset e num_workers>0 ogni worker vede solo una fetta
-    disgiunta di shard, quindi len(loader) sovrastimerebbe il totale reale
-    (vedi nota in ShardedGraphDataset.__len__). Se None, la barra mostra
-    solo un contatore progressivo senza percentuale/ETA.
-    """
     model.train()
     total_loss = 0.0
     correct = 0
@@ -104,12 +83,10 @@ def train_epoch(
             with torch.autocast(device_type="cuda" if amp_enabled else "cpu", enabled=amp_enabled):
                 node_logits = model(batch_event)
                 graph_logits = pool_node_logits(node_logits, batch_event.batch)
+                graph_logits = apply_legal_move_mask(graph_logits, batch_event.legal_move_mask)
                 loss = criterion(graph_logits, labels)
 
             if not torch.isfinite(loss):
-                # Batch corrotto o istabilita' numerica: si salta lo step
-                # invece di propagare NaN nei pesi (che un checkpoint
-                # successivo salverebbe irreversibilmente).
                 skipped_batches += 1
                 logger.warning(f"Loss non finita ({loss.item()}) al batch: step saltato.")
                 pbar.update(labels.size(0))
@@ -190,6 +167,7 @@ def evaluate_epoch(
             with torch.autocast(device_type="cuda" if amp_enabled else "cpu", enabled=amp_enabled):
                 node_logits = model(batch_event)
                 graph_logits = pool_node_logits(node_logits, batch_event.batch)
+                graph_logits = apply_legal_move_mask(graph_logits, batch_event.legal_move_mask)
                 loss = criterion(graph_logits, labels)
 
             batch_size = labels.size(0)

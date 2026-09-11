@@ -21,13 +21,12 @@ logging.basicConfig(
 )
 logger = logging.getLogger("train_basic")
 
-# Vocabolario fisso dello schema scacchistico (PositionGraphSchema.py):
-# NON un iperparametro, deriva dalla codifica board 64x64.
-NUM_EVENT_ID_CATEGORIES = 13   # 0=vuota, 1..12=piece_type*2+color+1
-NUM_EVENT_FEATURES = 2         # is_occupied_by_mover, is_occupied_by_opponent
-MOVE_VOCAB_SIZE = 64 * 64      # 4096: output_dim del modello
-NUM_EDGE_TYPES = 3             # edge_attr = one-hot(EDGE_LEGAL_MOVE/ATTACK/PIN)
-
+from DatasetPipeline.Model.ChessConstants import (
+    NUM_EVENT_FEATURES,
+    NUM_EVENT_ID_CATEGORIES,
+    MOVE_VOCAB_SIZE,
+    NUM_EDGE_TYPES,
+)
 
 def build_model(args: argparse.Namespace, device: str) -> DualGATModel:
     model = DualGATModel(

@@ -25,7 +25,16 @@ EDGE_ATTACK = 1
 EDGE_PIN = 2
 NUM_EDGE_TYPES = 3
 
-NUM_EVENT_FEATURES = 2  # is_occupied_by_mover, is_occupied_by_opponent
+# NUM_EVENT_FEATURES: colonne di Data.x per nodo.
+# is_occupied_by_mover, is_occupied_by_opponent, clock_norm (feature di
+# timing esplicita per nodo, aggiunta oltre allo scalare costante gia'
+# presente su edge_attr/time: vedi build_position_data e _clock_norm
+# sotto). Questa costante e' duplicata in DatasetPipeline/Model/
+# ChessConstants.py, che e' la fonte canonica per il lato training: se
+# cambia di nuovo, va aggiornata in ENTRAMBI i posti (qui perche' e' la
+# definizione originaria legata alla codifica, li' perche' e' quello che
+# importano TrainMain/TrainBasic/TimeAware/EvaluateModels).
+NUM_EVENT_FEATURES = 3
 
 _PIECE_VALUES = {
     chess.PAWN: 1,
@@ -161,10 +170,15 @@ def encode_edge_type_onehot(edge_type: List[int]) -> torch.Tensor:
 def _clock_norm(clock_seconds: float, cap_seconds: float = 600.0) -> float:
     """Normalizzazione log-scale (preserva la differenza tra clock brevi
     senza schiacciare tutto cio' che supera pochi minuti come farebbe una
-    scala lineare). Non usata direttamente in x (che qui non contiene una
-    colonna tempo, vedi docstring: il tempo entra via `time`, non via x),
-    ma esposta per riuso nel builder se serve normalizzare clock_seconds
-    prima di passarlo come `time`.
+    scala lineare).
+
+    Usata in due punti di build_position_data: (1) come colonna
+    clock_norm in x, ripetuta identica sui 64 nodi della board (feature
+    di timing esplicita per nodo, oltre al valore costante su edge_attr/
+    time); (2) disponibile per normalizzare clock_seconds prima di
+    passarlo come `time` sugli edge, se in futuro serve un time scalato
+    invece del valore grezzo in secondi attualmente usato in
+    build_position_data.
     """
     import math
     denom = math.log1p(cap_seconds)
@@ -184,14 +198,25 @@ def build_position_data(
 ) -> Data:
     """Assembla un torch_geometric.data.Data a grana di SINGOLA POSIZIONE
     (64 nodi = caselle), pronto per DualGATModel e DualGATTimeAwareModel
-    senza alcuna modifica a quei modelli.
+    senza alcuna modifica a quei modelli (a parte NUM_EVENT_FEATURES=3,
+    vedi nota sopra).
 
     Args:
         board: posizione corrente (board.turn = lato che deve muovere).
         best_move: la mossa migliore per questa posizione (target).
         clock_seconds: tempo (secondi) impiegato per arrivare a questa
-            mossa. Diventa `time`, costante su tutti gli archi della board
-            (vedi motivazione nel docstring di modulo).
+            mossa. Entra nel Data in due forme: (1) come `time`, scalare
+            costante ripetuto su tutti gli archi della board (consumato
+            da TimeAwareGATConv come fattore di decadimento uniforme,
+            non differenziale tra archi); (2) come colonna clock_norm
+            normalizzata (via _clock_norm) in `x`, ripetuta identica sui
+            64 nodi (feature di timing esplicita che il modello puo'
+            usare senza passare dal meccanismo di decadimento sugli
+            edge). Le due rappresentazioni coesistono deliberatamente:
+            la prima alimenta i modelli time-decay esistenti senza
+            modificarne la forward, la seconda da' al modello un canale
+            diretto sul valore di clock indipendentemente dall'architettura
+            di attenzione usata.
         rating: rating (Elo) del giocatore di turno (mover) in questa
             posizione. OBBLIGATORIO (mai None): il chiamante deve
             risolvere un valore reale o di fallback prima di chiamare
@@ -209,6 +234,8 @@ def build_position_data(
     Returns:
         Data con event_ids/x/edge_index/edge_attr/time/y/legal_move_mask/
         rating/game_id/ply/[position_mate_n] come da docstring di modulo.
+        x ha ora shape [64, NUM_EVENT_FEATURES] con NUM_EVENT_FEATURES=3
+        (le prime due colonne come prima, la terza e' clock_norm).
 
     Raises:
         ValueError: se best_move non e' una mossa legale su board (il
@@ -242,15 +269,16 @@ def build_position_data(
         [[encode_square_event_id(board, sq)] for sq in range(64)], dtype=torch.long
     )
 
+    clock_feature = _clock_norm(clock_seconds)
     x_rows = []
     for sq in range(64):
         piece = board.piece_at(sq)
         if piece is None:
-            x_rows.append([0.0, 0.0])
+            x_rows.append([0.0, 0.0, clock_feature])
         elif piece.color == mover:
-            x_rows.append([1.0, 0.0])
+            x_rows.append([1.0, 0.0, clock_feature])
         else:
-            x_rows.append([0.0, 1.0])
+            x_rows.append([0.0, 1.0, clock_feature])
     x = torch.tensor(x_rows, dtype=torch.float)
 
     edge_src, edge_dst, edge_type_list = _build_spatial_edges(board)
@@ -269,11 +297,6 @@ def build_position_data(
     time_tensor = torch.full((num_edges,), float(clock_seconds), dtype=torch.float)
 
     y = torch.tensor(encode_move(best_move), dtype=torch.long)
-
-    # [NUOVO] Maschera delle mosse legali nel vocabolario esteso (20480).
-    # Salvata come bool denso: 20480 bit = 2560 byte/posizione, trascurabile
-    # rispetto al resto del Data. Consumata a valle nel training/eval loop
-    # per mascherare i logit prima della softmax (vedi TrainPipeline).
     legal_move_mask = build_legal_move_mask(board)
 
     data = Data(

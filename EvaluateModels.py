@@ -15,6 +15,8 @@ from torch.utils.data import DataLoader
 # Import delle classi dei modelli
 from timegnn.models.gat_basic import DualGATModel
 from timegnn.models.gat_time_decay import DualGATTimeAwareModel
+from timegnn.data.pyg import custom_collate_graph
+from DatasetPipeline.Utils.position_pooling import pool_node_logits, apply_legal_move_mask
 
 # Utilità per la gestione dei dati
 from timegnn.data.pyg import custom_collate_graph
@@ -152,34 +154,31 @@ def evaluate_model(
     mate_n_list = []
 
     with torch.no_grad():
-        for batch in dataloader:
-            # batch è un oggetto con attributi: x, edge_index, edge_attr, y, (eventualmente mate_n)
-            x = batch.x.to(device)
-            edge_index = batch.edge_index.to(device)
-            edge_attr = batch.edge_attr.to(device)
-            y = batch.y.to(device)  # target della mossa (classe)
+        for batch_event, labels in dataloader:
+            batch_event = batch_event.to(device)
+            labels = labels.to(device)
 
-            # Forward pass (con AMP se richiesto)
             if use_amp and device == "cuda":
                 with torch.cuda.amp.autocast():
-                    logits = model(x, edge_index, edge_attr)
+                    node_logits = model(batch_event)
             else:
-                logits = model(x, edge_index, edge_attr)
+                node_logits = model(batch_event)
 
-            pred = logits.argmax(dim=1)
-            correct_move = (pred == y).cpu().numpy()
+            graph_logits = pool_node_logits(node_logits, batch_event.batch)
+
+            if hasattr(batch_event, "legal_move_mask") and batch_event.legal_move_mask is not None:
+                graph_logits = apply_legal_move_mask(graph_logits, batch_event.legal_move_mask)
+
+            pred = graph_logits.argmax(dim=1)
+            correct_move = (pred == labels).cpu().numpy()
             move_correct_list.extend(correct_move)
 
-            # Se il batch ha l'attributo mate_n, lo registriamo per eventuali stratificazioni
-            if hasattr(batch, "mate_n") and batch.mate_n is not None:
-                mate_n = batch.mate_n.cpu().numpy()
+            if hasattr(batch_event, "position_mate_n") and batch_event.position_mate_n is not None:
+                mate_n = batch_event.position_mate_n.cpu().numpy()
                 mate_n_list.extend(mate_n)
                 mate_true_list.extend(mate_n)
                 mate_pred_list.extend(np.zeros_like(mate_n))
                 mate_correct_list.extend(np.zeros_like(mate_n, dtype=bool))
-            else:
-                # Se non c'è mate_n, usiamo array vuoti
-                pass
 
     results = {
         "move_correct": np.array(move_correct_list),
@@ -222,18 +221,12 @@ def main(config_path: str = "Yaml/evaluate_models.yaml") -> None:
         raise ConfigError(f"File di test non trovato: {test_path}")
 
     logger.info(f"Caricamento test set da {test_path}...")
-    test_data = torch.load(test_path, map_location="cpu")
+    test_data = torch.load(test_path, map_location="cpu", weights_only=False)
     if not isinstance(test_data, list):
-        # Se è un tensore o un dizionario, proviamo a convertirlo in lista
         logger.warning("Il test set non è una lista; provo a convertirlo in lista di campioni.")
-        # Assumiamo che sia un tensore di grafi o un dizionario con chiavi; per semplicità,
-        # se è un tensore, lo dividiamo in campioni separati (dimensione batch).
         if isinstance(test_data, torch.Tensor):
-            # Se è un tensore 3D (N, features, ...), lo spacchettiamo
-            # Ma qui ci aspettiamo una lista di dizionari, quindi meglio sollevare errore.
             raise ConfigError("Il dataset di test deve essere una lista di dizionari, non un tensore.")
         else:
-            # Se è un dizionario unico, lo mettiamo in una lista
             test_data = [test_data]
 
     test_ds = SimpleTestDataset(test_data)

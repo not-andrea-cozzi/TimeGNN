@@ -58,16 +58,10 @@ class PuzzleBuilderConfig:
     skip_trivial_endgame: bool = False
     dedupe_positions: bool = True
 
-
+from DatasetPipeline.Model.ChessConstants import PIECE_VALUES as _CLASS_PIECE_VALUES
 class PuzzleBuilder:
 
-    _PIECE_VALUES: Dict[int, int] = {
-        chess.PAWN: 1,
-        chess.KNIGHT: 3,
-        chess.BISHOP: 3,
-        chess.ROOK: 5,
-        chess.QUEEN: 9,
-    }
+    _PIECE_VALUES: Dict[int, int] = _CLASS_PIECE_VALUES
 
     def __init__(self, config: PuzzleBuilderConfig):
         self.config = config
@@ -244,16 +238,15 @@ class PuzzleBuilder:
         return 5.0 + (rating / 3000.0) * 55.0
 
     def _assign_split(self, game_id: str) -> str:
-        """Split deterministico per debug JSONL (usa lo stesso seed di GamesBuilder)."""
-        import random
-        rng = random.Random(self.config.split_seed + hash(game_id))
-        val = rng.random()
+        import hashlib
+        digest = hashlib.sha256(f"{self.config.split_seed}:{game_id}".encode("utf-8")).hexdigest()
+        val = int(digest[:8], 16) / 0xFFFFFFFF
         train, val_ratio, _ = self.config.split_ratios
         if val < train:
             return "train"
         if val < train + val_ratio:
             return "val"
-        return "test"
+        return "test"   
 
     # ------------------------------------------------------------------
     # FILTRI DI COMPATIBILITA' SU SINGOLA POSIZIONE SOLVER
@@ -372,9 +365,12 @@ class PuzzleBuilder:
                     board.push(move)
                     continue
 
+                import random as _random
+
                 current_mate_n = max(1, mate_n_iniziale - (ply_idx // 2))
-                # Simuliamo clock crescente con il numero di mosse
-                clock_seconds = clock_base * (1 + 0.1 * ply_idx)
+                base_scaled = clock_base * (1 + 0.1 * ply_idx)
+                noise_factor = _random.Random(f"{game_id}:{ply_idx}").gauss(1.0, 0.15)
+                clock_seconds = max(0.5, base_scaled * max(0.3, noise_factor))
 
                 try:
                     data = build_position_data(
