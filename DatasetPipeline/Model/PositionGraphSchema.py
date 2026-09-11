@@ -9,6 +9,7 @@ from torch_geometric.data import Data
 # ============================================================================
 # VOCABOLARI FISSI
 # ============================================================================
+
 _PROMOTION_TYPES: Tuple[Optional[int], ...] = (None, chess.QUEEN, chess.ROOK, chess.BISHOP, chess.KNIGHT)
 _PROMOTION_OFFSET: Dict[Optional[int], int] = {pt: i for i, pt in enumerate(_PROMOTION_TYPES)}
 NUM_PROMOTION_SLOTS = len(_PROMOTION_TYPES)  # 5
@@ -18,6 +19,7 @@ MOVE_VOCAB_SIZE = 64 * 64 * NUM_PROMOTION_SLOTS  # 20480: (from*64+to)*5 + promo
 # event_ids: 0 = casella vuota, 1..12 = piece_type*2+color+1
 EVENT_ID_EMPTY = 0
 NUM_EVENT_ID_CATEGORIES = 13  # 0 (vuoto) + 12 (6 piece_type x 2 colori)
+
 EDGE_LEGAL_MOVE = 0
 EDGE_ATTACK = 1
 EDGE_PIN = 2
@@ -178,6 +180,7 @@ def build_position_data(
     rating: float,
     game_id: str,
     ply: int,
+    mate_n: Optional[int] = None,
 ) -> Data:
     """Assembla un torch_geometric.data.Data a grana di SINGOLA POSIZIONE
     (64 nodi = caselle), pronto per DualGATModel e DualGATTimeAwareModel
@@ -197,14 +200,35 @@ def build_position_data(
             finestra/partita/puzzle di provenienza (es. "lichess_142",
             "puzzle_00sHx"). Stringa, non un tensore.
         ply: indice del ply all'interno della finestra (tracciamento).
+        mate_n: profondita' di matto REALE a QUESTA specifica posizione
+            (non il group_key di finestra: vedi NOTA POSITION_MATE_N sotto).
+            Se fornito, salvato come data.position_mate_n (uint8). Se None
+            (default, per non rompere chiamanti esistenti), il campo non
+            viene scritto sul Data.
 
     Returns:
         Data con event_ids/x/edge_index/edge_attr/time/y/legal_move_mask/
-        rating/game_id/ply come da docstring di modulo.
+        rating/game_id/ply/[position_mate_n] come da docstring di modulo.
 
     Raises:
         ValueError: se best_move non e' una mossa legale su board (il
-            target deve sempre essere verificabile sulla posizione data).
+            target deve sempre essere verificabile sulla posizione data),
+            o se mate_n e' fornito ma fuori dal dominio uint8 [0,255].
+
+    NOTA POSITION_MATE_N (da non confondere con il "mate_n" scritto da
+    DatasetPipeline.Utils.position_compression.compress_position_data):
+    quest'ultimo e' il group_key di FINESTRA (costante per tutte le
+    posizioni di uno stesso game_id, usato per lo split stratificato in
+    PositionQueueRegistry.build_splits), passato come parametro separato
+    a compress_position_data, non letto da un attributo del Data.
+    position_mate_n invece e' la profondita' di matto REALE alla
+    posizione specifica: in un puzzle mateIn4, la prima mossa-solver ha
+    position_mate_n=4, l'ultima ha position_mate_n=1 (vedi
+    PuzzleBuilder.current_mate_n). Sono due numeri diversi per la stessa
+    posizione tranne che sulla prima mossa della finestra, dove
+    coincidono. Il nome distinto evita di sovrascrivere per errore il
+    group_key di finestra quando build_splits legge item.data per
+    determinare i bucket di stratificazione.
     """
     if best_move not in board.legal_moves:
         raise ValueError(
@@ -265,5 +289,13 @@ def build_position_data(
     data.rating = torch.tensor(float(rating), dtype=torch.float16)
     data.game_id = game_id
     data.ply = torch.tensor(int(ply), dtype=torch.int64)
+
+    if mate_n is not None:
+        if not (0 <= mate_n <= 255):
+            raise ValueError(
+                f"build_position_data: mate_n={mate_n} fuori dal dominio "
+                f"uint8 [0,255] per position_mate_n (fen={board.fen()})."
+            )
+        data.position_mate_n = torch.tensor(int(mate_n), dtype=torch.uint8)
 
     return data

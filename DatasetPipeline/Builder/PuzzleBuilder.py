@@ -60,69 +60,6 @@ class PuzzleBuilderConfig:
 
 
 class PuzzleBuilder:
-    """
-    Builder per dataset puzzle Lichess, allineato al contratto di GamesBuilder.
-    Ogni puzzle viene trattato come una "finestra" di posizioni (i ply alterni)
-    e ogni posizione viene accodata in PositionQueueRegistry con un game_id
-    leggibile "puzzle_{PuzzleId}" (stringa), univoco per costruzione dato che
-    PuzzleId e' gia' univoco nel CSV Lichess: garantisce split coerenti (tutte
-    le posizioni di uno stesso puzzle vanno nello stesso split) e permette di
-    risalire al puzzle originale direttamente dal game_id, senza tabelle di
-    traduzione (stesso principio di GamesBuilder, che usa
-    "{source_tag}_{provisional_game_id}").
-
-    NOTA GROUP_KEY (fix stratificazione split): il group_key passato a
-    registry.enqueue() per OGNI posizione di uno stesso puzzle è COSTANTE
-    (= mate_n_iniziale, il tema dichiarato dal puzzle), perché
-    PositionQueueRegistry.build_splits impone l'invariante "un game_id -> un
-    solo group_key" (stratifica per finestra intera, non per singola
-    posizione). Il mate_n REALE per-posizione (current_mate_n, che decresce
-    ad ogni mossa-solver: è corretto che lo faccia, vedi sotto) resta
-    comunque salvato nel debug JSONL.
-
-    NOTA CAMPIONAMENTO STRATIFICATO (fix distribuzione mate_n):
-    current_mate_n = mate_n_iniziale - (mosse_solver_gia'_fatte) è calcolato
-    CORRETTAMENTE: la prima mossa-solver di un puzzle mateIn4 è davvero "a
-    4 mosse dal matto", l'ultima è davvero "matto in 1". Il problema NON è
-    questo calcolo, ma la SELEZIONE dei puzzle a monte: se _load_filtered_rows
-    taglia le prime `max_puzzles` righe del CSV che matchano il pattern
-    combinato "mateIn1|mateIn2|...|mateIn10", e la maggioranza dei puzzle
-    Lichess sono mateIn1/mateIn2 (vero per composizione naturale del dataset),
-    il campione finale conterra' quasi solo puzzle brevi, da cui derivano
-    quasi solo posizioni a mate_n basso -- gli n alti (8,9,10) restano vuoti
-    non perche' rari nel calcolo, ma perche' i puzzle SORGENTE mateIn8/9/10
-    non vengono mai pescati nel taglio non stratificato.
-    Fix: si campiona un tetto di puzzle per OGNI tema mateInN separatamente
-    (max_puzzles_per_theme), cosi' ogni bucket riceve una quota garantita di
-    puzzle sorgente, e le posizioni intermedie che ne derivano popolano anche
-    gli n alti.
-
-    NOTA FILTRI DI COMPATIBILITA': vedi docstring di PuzzleBuilderConfig per
-    la motivazione dettagliata di quali filtri di GamesBuilder sono stati
-    portati qui (min_rating/max_rating a livello di puzzle intero;
-    max_piece_count/min_material_for_mate_attempt/
-    min_material_diff_for_mate_attempt/require_heavy_piece/
-    skip_trivial_endgame/dedupe_positions a livello di singola posizione
-    solver) e quali sono stati esplicitamente esclusi perche' privi di un
-    dato o di un referente concettuale nel CSV puzzle.
-
-    Uso tipico:
-        config = PuzzleBuilderConfig(
-            csv_path="lichess_puzzles.csv",
-            mate_range=(1, 10),
-            max_puzzles_per_theme=500,   # es. fino a 500 puzzle per ciascun mateInN
-            min_rating=1200,
-            require_heavy_piece=False,
-            skip_trivial_endgame=True,
-            min_material_for_mate_attempt=3,
-            min_material_diff_for_mate_attempt=3,
-        )
-        builder = PuzzleBuilder(config)
-        result = builder.run()
-        # poi, insieme a GamesBuilder, chiamare:
-        registry = PositionQueueRegistry.instance()
-        splits = registry.build_splits(...)
-    """
 
     _PIECE_VALUES: Dict[int, int] = {
         chess.PAWN: 1,
@@ -177,23 +114,6 @@ class PuzzleBuilder:
     # LETTURA E FILTRO CSV
     # ------------------------------------------------------------------
     def _load_filtered_rows(self) -> List[Dict]:
-        """Legge il CSV a chunk, filtra per tema mateInN nel range configurato.
-
-        Se `max_puzzles_per_theme` è impostato, il campionamento è
-        STRATIFICATO: si accumulano fino a quel tetto di righe per CIASCUN
-        valore di mateInN separatamente (in ordine di apparizione nel CSV,
-        nessuno shuffle: sufficiente a garantire che ogni bucket riceva una
-        quota, vedi docstring di classe). Altrimenti si ricade sul
-        comportamento storico: taglio secco a `max_puzzles` righe totali sul
-        pattern combinato, che NON garantisce copertura di tutti i temi.
-
-        Il filtro min_rating/max_rating (se configurato) e' applicato QUI,
-        a livello di riga CSV, PRIMA ancora della stratificazione per tema:
-        un puzzle fuori range di rating non deve occupare una quota del
-        tetto per-tema (coerente con
-        compatibility_filters.passes_rating_range_filter, applicato a
-        livello di intero puzzle).
-        """
         lo, hi = self.config.mate_range
         themes_wanted = [f"mateIn{n}" for n in range(lo, hi + 1)]
         theme_pattern = "|".join(themes_wanted)
@@ -213,14 +133,6 @@ class PuzzleBuilder:
             return True
         rating = parse_rating_strict(row.get("Rating"))
         if rating is None:
-            # Rating assente/non numerico: coerente con il fallback usato
-            # altrove nel builder (_simulated_clock/1500.0 di default), non
-            # scartiamo per un dato mancante quando nessun bound e' certo
-            # di escluderlo; se pero' un bound e' configurato, un rating
-            # ignoto non puo' essere verificato: scartiamo per sicurezza
-            # (stesso principio HARD di has_valid_ratings in
-            # compatibility_filters, applicato qui perche' e' l'unico dato
-            # su cui il filtro puo' operare).
             return False
         if cfg.min_rating is not None and rating < cfg.min_rating:
             return False
@@ -357,19 +269,6 @@ class PuzzleBuilder:
         return white_mat, black_mat
 
     def _position_passes_quality_filters(self, board: "chess.Board") -> bool:
-        """Applica, sulla posizione SOLVER corrente (board.turn = lato che
-        deve trovare la mossa), i filtri di compatibilita' con un referente
-        concreto per un puzzle (vedi NOTA FILTRI DI COMPATIBILITA' nel
-        docstring di PuzzleBuilderConfig). Ritorna False se una qualunque
-        soglia configurata non e' soddisfatta: il chiamante scarta SOLO
-        questa posizione, non l'intero puzzle.
-
-        Riusa has_mating_material/mover_has_heavy_piece/
-        is_trivially_drawn_endgame da compatibility_filters.py (stessa
-        logica di GamesBuilder, senza duplicarla), passando un
-        QualityFilterConfig "sintetico" costruito dai campi equivalenti di
-        PuzzleBuilderConfig cosi' da non dover reimplementare le soglie.
-        """
         cfg = self.config
 
         if cfg.max_piece_count is not None and len(board.piece_map()) > cfg.max_piece_count:
@@ -485,6 +384,7 @@ class PuzzleBuilder:
                         rating=puzzle_rating,
                         game_id=game_id,
                         ply=ply_idx,
+                        mate_n=int(current_mate_n),
                     )
                 except ValueError as e:
                     logger.warning(

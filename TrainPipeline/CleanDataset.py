@@ -19,19 +19,17 @@ logging.basicConfig(
 )
 logger = logging.getLogger("step0_clean")
 
-# Campi richiesti dal forward di DualGATModel / DualGATTimeAwareModel
-# (vedi timegnn/models/gat_basic.py, gat_time_decay.py) + y per la loss.
-# [MODIFICATO] Aggiunto legal_move_mask: senza questa riga, il campo
-# scritto da PositionGraphSchema.build_position_data viene silenziosamente
-# eliminato QUI, prima ancora di raggiungere lo sharding — il masking
-# delle mosse illegali in training fallirebbe non per un bug nel loop,
-# ma perche' il dato necessario non arriva mai a quel punto della
-# pipeline. Questo e' esattamente il tipo di rottura silenziosa che
-# KEEP_FIELDS e' progettato per fare di proposito (rimuove tutto cio' che
-# non serve al forward dei due modelli): va quindi aggiornato ogni volta
-# che si introduce un nuovo campo consumato a valle del forward stesso
-# (qui: nel training/eval loop, non nel modello).
-KEEP_FIELDS = ("event_ids", "x", "edge_index", "edge_attr", "time", "y", "legal_move_mask", "num_nodes")
+KEEP_FIELDS = (
+    "event_ids",
+    "x",
+    "edge_index",
+    "edge_attr",
+    "time",
+    "y",
+    "legal_move_mask",
+    "position_mate_n",
+    "num_nodes",
+)
 
 
 def _clean_single(data: Data) -> Data:
@@ -142,4 +140,5 @@ def clean_file(in_path: str, out_path: str, workers: int = 0) -> int:
     gc.collect()
 
     return n_cleaned
+
 

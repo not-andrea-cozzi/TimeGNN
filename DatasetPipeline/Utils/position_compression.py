@@ -1,46 +1,3 @@
-"""
-position_compression.py
-
-Compressione/decompressione LOSSLESS di torch_geometric.data.Data prodotti
-da PositionGraphSchema.build_position_data, applicata SOLO nello spool su
-disco di PositionQueueRegistry (scrittura shard / reload shard).
-
-VINCOLO RISPETTATO: PositionGraphSchema.build_position_data non viene
-toccato. Ogni Data che esce da decompress_position_data() e' bit-per-bit
-equivalente (stesso dtype, stessa shape, stesso contenuto) a quello
-originariamente passato a compress_position_data(). I modelli
-(DualGATModel, DualGATTimeAwareModel) e Batch.from_data_list continuano a
-vedere sempre e solo Data nel formato originale: la compressione esiste
-unicamente nell'intervallo enqueue -> shard su disco -> reload/drain.
-
-PERCHE' QUESTI CAST SONO LOSSLESS (verificato contro PositionGraphSchema.py):
-    - event_ids: long, valori in [0, 12] (EVENT_ID_EMPTY=0, 1..12 da
-      encode_square_event_id). uint8 copre [0, 255]: nessuna perdita.
-    - x: float, colonne is_occupied_by_mover/is_occupied_by_opponent,
-      SOLO 0.0 o 1.0 per costruzione (build_position_data popola x_rows
-      con [0.0,0.0]/[1.0,0.0]/[0.0,1.0]). bool e' fedele.
-    - edge_attr: float, one-hot di NUM_EDGE_TYPES=3 categorie
-      (encode_edge_type_onehot usa F.one_hot(...).float()): SOLO 0.0/1.0.
-      bool e' fedele.
-    - time: float[E], valore COSTANTE ripetuto su tutti gli E archi
-      (torch.full((num_edges,), float(clock_seconds))): un solo scalare
-      float32 basta a ricostruire l'intero tensore, purche' si conosca E
-      (letto da edge_index.shape[1] al momento della decompressione).
-
-CONTROLLO RUNTIME (nessun fallback silenzioso): se un valore non rientra
-nel dominio atteso (es. event_ids > 255, x/edge_attr non strettamente
-binari, time non costante sull'arco), compress_position_data solleva
-ValueError esplicito invece di troncare o comprimere con perdita. Questo
-e' intenzionale: dati futuri che violino le assunzioni del builder attuale
-devono fermare la pipeline, non corrompersi silenziosamente.
-
-mate_n (uint8) e' un metadato AGGIUNTIVO opzionale, mai letto da
-nn.Embedding/GATConv/Batch.from_data_list: libero da vincoli di dtype.
-Serve a rendere il Data pronto per una futura stratificazione per
-profondita' di matto, senza bisogno di modificare PositionGraphSchema.py
-ora (vedi nota a fine file per il punto di innesto quando/se deciderete
-di aggiungerlo davvero al builder).
-"""
 from __future__ import annotations
 
 from typing import Optional
@@ -48,13 +5,12 @@ from typing import Optional
 import torch
 from torch_geometric.data import Data
 
-# Campi gestiti esplicitamente. Qualunque altro campo presente sul Data
-# (edge_index, game_id, ply, y, num_nodes, ...) viene copiato cosi' com'e',
-# senza compressione: e' gia' un dtype minimale (long/int64 scalare) o e'
-# un indice PyG non comprimibile senza rischio (edge_index).
 _COMPRESSIBLE_FLOAT_BINARY_FIELDS = ("x", "edge_attr")
 _COMPRESSIBLE_LONG_SMALLINT_FIELD = "event_ids"
 _COMPRESSIBLE_CONSTANT_EDGE_FIELD = "time"
+
+
+_PASSTHROUGH_BOOL_FIELDS = ("legal_move_mask",)
 
 _UINT8_MAX = 255
 
@@ -118,8 +74,9 @@ def compress_position_data(data: Data, mate_n: Optional[int] = None) -> Data:
 
     Returns:
         Nuova Data con event_ids:uint8, x:bool, edge_attr:bool (se
-        presenti), time:float32 scalare [1] invece di [E] (se presente).
-        Tutti gli altri campi sono copiati invariati.
+        presenti), time:float32 scalare [1] invece di [E] (se presente),
+        legal_move_mask:bool invariato (se presente). Tutti gli altri
+        campi sono copiati invariati.
 
     Raises:
         ValueError: se un campo non rientra nel dominio atteso per la
@@ -129,7 +86,9 @@ def compress_position_data(data: Data, mate_n: Optional[int] = None) -> Data:
     compressed = Data()
 
     for key, value in data:
-        if key == _COMPRESSIBLE_LONG_SMALLINT_FIELD and torch.is_tensor(value):
+        if key in _PASSTHROUGH_BOOL_FIELDS and torch.is_tensor(value):
+            compressed[key] = value.to(torch.bool)
+        elif key == _COMPRESSIBLE_LONG_SMALLINT_FIELD and torch.is_tensor(value):
             _assert_fits_uint8(value, key)
             compressed[key] = value.to(torch.uint8)
         elif key in _COMPRESSIBLE_FLOAT_BINARY_FIELDS and torch.is_tensor(value):
@@ -155,7 +114,7 @@ def compress_position_data(data: Data, mate_n: Optional[int] = None) -> Data:
 def decompress_position_data(data: Data) -> Data:
     """Inversa esatta di compress_position_data: ritorna una NUOVA Data
     con gli stessi dtype/shape dell'originale passato a
-    PositionGraphSchema.build_position_data (long/float/float[E]).
+    PositionGraphSchema.build_position_data (long/float/float[E]/bool).
 
     Il numero di archi E per la ri-espansione di `time` e' letto da
     edge_index.shape[1]: se edge_index manca o e' vuoto, `time` viene
@@ -174,7 +133,9 @@ def decompress_position_data(data: Data) -> Data:
     for key, value in data:
         if key == "mate_n":
             continue
-        if key == _COMPRESSIBLE_LONG_SMALLINT_FIELD and torch.is_tensor(value):
+        if key in _PASSTHROUGH_BOOL_FIELDS and torch.is_tensor(value):
+            decompressed[key] = value.to(torch.bool)
+        elif key == _COMPRESSIBLE_LONG_SMALLINT_FIELD and torch.is_tensor(value):
             decompressed[key] = value.to(torch.long)
         elif key in _COMPRESSIBLE_FLOAT_BINARY_FIELDS and torch.is_tensor(value):
             decompressed[key] = value.to(torch.float32)
@@ -190,17 +151,3 @@ def decompress_position_data(data: Data) -> Data:
 
     return decompressed
 
-
-# ----------------------------------------------------------------------
-# NOTA per un'eventuale adozione futura di mate_n dentro
-# PositionGraphSchema.build_position_data (NON fatto qui, su richiesta
-# esplicita di non toccare quel file senza permesso):
-#
-#   Il punto di innesto sarebbe passare mate_n come parametro aggiuntivo a
-#   build_position_data (propagato da GamesBuilder._enqueue_window, che
-#   gia' ha window.mate_n disponibile) e assegnarlo con:
-#       data.mate_n = torch.tensor(mate_n, dtype=torch.uint8)
-#   accanto a data.game_id/data.ply. A quel punto compress/decompress
-#   qui sopra lo tratterebbero gia' correttamente (branch "else: copia
-#   invariato", dato che sarebbe gia' uint8 in origine).
-# ----------------------------------------------------------------------

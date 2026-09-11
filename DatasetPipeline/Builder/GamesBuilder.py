@@ -104,12 +104,6 @@ def _close_engine() -> None:
             _tablebase = None
 
 def _worker_sigterm_handler(signum, frame) -> None:
-    """Il worker riceve SIGTERM solo durante uno shutdown forzato: niente
-    quit() 'educato' verso Stockfish, perche' se il motore e' incastrato
-    quel quit() puo' bloccarsi fino al timeout di comunicazione
-    dell'engine (default 10s). Si va dritti al kill del processo motore
-    e si esce subito: e' questa rapidita' che rende affidabile tutta la
-    catena di shutdown vista dal processo padre."""
     _watchdog_stop.set()
     pid = _engine_pid
     if pid is not None:
@@ -167,10 +161,7 @@ class _ClosingStream:
 class GamesBuilderConfig:
     sources: List[SourceSpec]
     stockfish_path: str
-    mate_range: Tuple[int, int] = (1, 10)
-    
-    # [OTTIMIZZAZIONE]: Sostituito il timer con un depth limit secco.
-    # Evita il blocco di 0.2 secondi per ogni posizione analizzata.
+    mate_range: Tuple[int, int] = (1, 5)
     search_depth: int = 6  
     analysis_time: Optional[float] = None
     
@@ -221,27 +212,9 @@ class GamesBuilderConfig:
 
     pool_join_timeout: Optional[float] = 20.0
 
-    # [RESUME]: se True, ogni sorgente riprende automaticamente da dove
-    # era arrivata l'ultima run interrotta (somma a src.skip_games il
-    # numero di partite gia' confermate come processate). Se False, si
-    # usa esattamente src.skip_games senza toccare lo stato salvato.
     auto_resume: bool = True
     resume_state_path: Optional[str] = None
-    # Ogni quante partite CONFERMATE (risultato ricevuto dal worker, non
-    # solo dispacciate) si fa un checkpoint intermedio su disco, oltre a
-    # quello garantito ad ogni uscita da run() (normale, errore o Ctrl+C).
-    resume_checkpoint_every: int = 500
-
-    # [FLUSH A TEMPO]: PositionQueueRegistry.enqueue() fa flush dello
-    # shard pendente SOLO quando raggiunge shard_size elementi. Con un
-    # throughput basso (molte posizioni scartate da Stockfish/filtri
-    # prima di essere accodate), pending_shard puo' restare parzialmente
-    # pieno per ore senza mai toccare shard_size: se il processo muore
-    # in quella finestra, quel lavoro non e' recuperabile (non e' ancora
-    # su disco). flush_every_seconds forza uno shard scritto su disco al
-    # massimo ogni N secondi, indipendentemente dal conteggio. None o
-    # <= 0 disabilita il flush a tempo (comportamento storico: solo a
-    # conteggio + flush finale garantito a fine run()).
+    resume_checkpoint_every: int = 2000
     flush_every_seconds: Optional[float] = None
 
 # ============================================================================
@@ -286,13 +259,6 @@ class GamesBuilder:
             os.makedirs(state_dir, exist_ok=True)
             self._resume_state_path = os.path.join(state_dir, "games_builder_resume.json")
 
-        # [RESUME]: skip_games effettivo = quello specificato dall'utente +
-        # quanto gia' confermato processato in run precedenti (se
-        # auto_resume e' attivo). _resume_base memorizza il punto di
-        # partenza EFFETTIVO di questa run per ogni sorgente, cosi' a fine
-        # run si puo' calcolare il nuovo totale da salvare come
-        # base + confermate_in_questa_run, senza perdere il progresso
-        # accumulato prima di questa run.
         saved_progress = self._load_resume_state() if config.auto_resume else {}
         self._resume_base: Dict[str, int] = {}
         self._resume_confirmed: Dict[str, int] = defaultdict(int)
@@ -659,14 +625,10 @@ class GamesBuilder:
                         rating=float(mover_rating_val),
                         game_id=full_game_id,
                         ply=node.ply(),
+                        mate_n=int(mate_n),
                     )
                 except ValueError: node = next_node; continue
 
-                # FIX: fissa il group_key della FINESTRA alla prima
-                # posizione accettata; le successive posizioni della
-                # stessa partita riusano questo stesso valore, cosi'
-                # enqueue/build_splits vedono un solo group_key per
-                # game_id (vedi commento sopra al loop).
                 if window_group_key is None:
                     window_group_key = int(mate_n)
 
@@ -773,12 +735,6 @@ class GamesBuilder:
             return {}
 
     def _persist_resume_state(self) -> None:
-        """Scrittura atomica (tmp+replace) e a merge: aggiorna solo le
-        chiavi delle sorgenti di QUESTA run, senza cancellare il progresso
-        salvato per sorgenti di altre run che non fanno parte di questa
-        config.sources. Non deve mai sollevare: viene chiamata anche
-        durante lo scaricamento di un KeyboardInterrupt/Exception, e un
-        errore qui non deve mai mascherare quello originale."""
         try:
             merged = self._load_resume_state()
             for key, base in self._resume_base.items():
@@ -794,30 +750,6 @@ class GamesBuilder:
             logger.warning("[GamesBuilder] Impossibile salvare lo stato di resume: %s", e)
 
     def _iter_all_tasks(self) -> Generator[Tuple[int, str, str, str], None, None]:
-        """Itera su tutte le sorgenti, propagando l'id LOCALE alla
-        sorgente (quello prodotto da _iter_source, stabile e deterministico
-        perche' dipende solo dalla posizione della partita nel file/CSV),
-        NON un contatore globale condiviso tra sorgenti.
-
-        FIX: la versione precedente usava un `global_id` unico per tutte
-        le sorgenti, incrementato da zero ad ogni chiamata di run(). Il
-        game_id finale costruito in _worker come "{tag}_{game_id}"
-        dipendeva quindi da QUANTE partite erano gia' state processate
-        in run precedenti (skip_games/resume), non dalla partita fisica
-        nel file. Al resume, global_id ripartiva comunque da 0: la stessa
-        prima partita "nuova" di una run 2 riceveva lo stesso global_id
-        gia' assegnato a una partita diversa nella run 1 -> game_id
-        duplicato tra run differenti, con rischio di collisione silenziosa
-        in PositionQueueRegistry.build_splits() (o errore intermittente,
-        a seconda che il group_key coincidesse o meno).
-
-        Usando local_id (per-sorgente, indipendente dal numero di run
-        eseguite) il game_id finale "{tag}_{local_id}" identifica sempre
-        la STESSA partita fisica, ad ogni run, garantendo l'univocita'
-        richiesta da PositionQueueRegistry. Per questo _validate_config
-        impone anche che ogni sorgente abbia un tag univoco: altrimenti
-        due sorgenti diverse con local_id che ripartono entrambi da 1
-        collidrebbero comunque tra loro."""
         for src in self.config.sources:
             resume_key = self._resume_key(src)
             for local_id, pgn_text in self._iter_source(src):
@@ -954,22 +886,11 @@ class GamesBuilder:
             ):
                 processed_games += 1
 
-                # [RESUME]: questa partita ha un risultato confermato (che
-                # sia stata accettata o scartata dai filtri non conta: e'
-                # comunque stata consumata dalla sorgente e non va
-                # riletta al prossimo resume). Checkpoint periodico oltre
-                # a quello garantito a fine run.
                 self._resume_confirmed[resume_key] += 1
                 if cfg.auto_resume and processed_games % cfg.resume_checkpoint_every == 0:
                     self._persist_resume_state()
 
-                # [FLUSH A TEMPO]: indipendente dal conteggio di
-                # pending_shard, garantisce che non passino piu' di
-                # flush_every_seconds tra uno shard scritto su disco e
-                # il successivo (vedi docstring del campo in
-                # GamesBuilderConfig). Controllato ad ogni partita
-                # confermata, costo trascurabile rispetto al lavoro di
-                # Stockfish per partita.
+
                 if cfg.flush_every_seconds and (time.monotonic() - last_flush_time) >= cfg.flush_every_seconds:
                     self._registry.flush()
                     last_flush_time = time.monotonic()
