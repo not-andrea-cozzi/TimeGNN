@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import List, Tuple
+from typing import List, Optional, Tuple
 
 import torch
 from torch.utils.data import Dataset
@@ -63,13 +63,16 @@ def prepare_data_y(event_encode, y_encode):
     return data_list
 
 
-def prepare_data_core_timedif(event_encode, core_encode, scaled_time_diffs, node_times):
-    """Build PyG Data objects with time-diff edge attributes."""
+def prepare_data_core_timedif(
+    event_encode,
+    core_encode,
+    scaled_time_diffs,
+    node_times: Optional[list] = None,
+):
     data_list_event = []
     for i in range(len(event_encode)):
         node_features = torch.tensor(event_encode[i], dtype=torch.float)
         node_core = torch.tensor(core_encode[i], dtype=torch.long)
-        time = torch.tensor(node_times[i], dtype=torch.float)
         num_events = (node_core[:, 0] != -1).sum()
 
         edge_index = torch.tensor(
@@ -87,7 +90,8 @@ def prepare_data_core_timedif(event_encode, core_encode, scaled_time_diffs, node
             event_ids=event_ids,
         )
         graph_data.num_nodes = num_events
-        graph_data.time = time
+        if node_times is not None:
+            graph_data.time = torch.tensor(node_times[i], dtype=torch.float)
         data_list_event.append(graph_data)
     return data_list_event
 

@@ -27,7 +27,7 @@ SHARD_GLOB_PATTERN = "shard_*.pt"
 
 
 class PositionQueueError(RuntimeError):
-    """Errore di uso scorretto della coda (es. build_splits senza dati)."""
+    pass
 
 
 @dataclass
@@ -39,24 +39,12 @@ class _QueuedPosition:
 
 
 def _spool_dir_for(state_path: str) -> str:
-    """Deriva la directory di spool dal path del file di stato JSON:
-    stessa cartella, sottocartella dedicata basata sul nome del file di
-    stato (senza estensione) + '_spool', cosi' piu' registry con
-    state_path diversi (es. in test) non condividono lo spool per errore.
-    """
     base_dir = os.path.dirname(os.path.abspath(state_path)) or "."
     stem = os.path.splitext(os.path.basename(state_path))[0]
     return os.path.join(base_dir, f"{stem}_spool")
 
 
 def _extract_game_id(data: Data) -> str:
-    """Estrae il game_id da un Data in formato stringa uniforme, tollerante
-    verso eventuali shard scritti da una versione precedente della
-    pipeline dove game_id era ancora un torch.Tensor (int64 scalare o
-    UUID troncato): in quel caso lo converte a stringa per uniformita' con
-    il nuovo schema "{fonte}_{id_originale}", ma senza poter recuperare la
-    fonte originale (shard legacy, solo per compatibilita' di lettura).
-    """
     raw = data.game_id
     if isinstance(raw, str):
         return raw
@@ -71,7 +59,6 @@ class PositionQueueRegistry:
     _instance_lock = threading.Lock()
 
     def __init__(self, state_path: str, shard_size: int = DEFAULT_SHARD_SIZE) -> None:
-        """Non chiamare direttamente: usare PositionQueueRegistry.instance()."""
         self._state_path = state_path
         self._shard_size = max(1, shard_size)
         self._spool_dir = _spool_dir_for(state_path)
@@ -86,9 +73,6 @@ class PositionQueueRegistry:
 
         self._reload_existing_shards()
 
-    # ------------------------------------------------------------------
-    # SINGLETON
-    # ------------------------------------------------------------------
     @classmethod
     def instance(cls, state_path: Optional[str] = None, shard_size: int = DEFAULT_SHARD_SIZE) -> "PositionQueueRegistry":
         with cls._instance_lock:
@@ -104,13 +88,9 @@ class PositionQueueRegistry:
 
     @classmethod
     def reset_for_testing(cls) -> None:
-        """Distrugge l'istanza Singleton. Da usare SOLO nei test."""
         with cls._instance_lock:
             cls._instance = None
 
-    # ------------------------------------------------------------------
-    # PERSISTENZA (contatore diagnostico)
-    # ------------------------------------------------------------------
     def _load_enqueued_count(self) -> int:
         if not os.path.exists(self._state_path):
             return 0
@@ -129,9 +109,6 @@ class PositionQueueRegistry:
             json.dump({"total_enqueued": self._enqueued_count}, f, indent=2)
         os.replace(tmp_path, self._state_path)
 
-    # ------------------------------------------------------------------
-    # SPOOL SU DISCO (shard batch)
-    # ------------------------------------------------------------------
     def _existing_shard_paths(self) -> List[str]:
         pattern = os.path.join(self._spool_dir, SHARD_GLOB_PATTERN)
         return sorted(glob.glob(pattern))
@@ -206,19 +183,7 @@ class PositionQueueRegistry:
             except OSError as e:
                 logger.warning(f"Impossibile rimuovere lo shard consumato {path}: {e}")
 
-    # ------------------------------------------------------------------
-    # ENQUEUE
-    # ------------------------------------------------------------------
     def enqueue(self, source_tag: str, data: Data, group_key: int) -> int:
-        """Accoda una posizione. Il game_id dentro `data` DEVE essere gia'
-        una stringa identificatore univoca per costruzione
-        ("{fonte}_{id_originale}", assegnata dal chiamante) -- questa
-        classe non lo traduce, non lo rimappa, non lo verifica per
-        unicita' (farlo richiederebbe comunque una tabella globale,
-        esattamente il design abbandonato: vedi docstring di modulo). Si
-        fida del fatto che l'id_originale sia gia' univoco nella sua
-        fonte (PuzzleId Lichess, contatore progressivo per-run per le
-        partite)."""
         if not hasattr(data, "game_id") or data.game_id is None:
             raise PositionQueueError(
                 f"enqueue rifiutato per source_tag='{source_tag}': il Data non ha un game_id valido."
@@ -250,9 +215,6 @@ class PositionQueueRegistry:
         with self._lock:
             self._flush_pending_shard_locked()
 
-    # ------------------------------------------------------------------
-    # DRAIN + SPLIT STRATIFICATO
-    # ------------------------------------------------------------------
     def _drain_all(self) -> List[_QueuedPosition]:
         with self._lock:
             self._flush_pending_shard_locked()
@@ -266,23 +228,6 @@ class PositionQueueRegistry:
         split_ratios: Tuple[float, float, float] = (0.7, 0.1, 0.2),
         seed: int = 42,
     ) -> Dict[str, List[Data]]:
-        """Drena la coda e calcola lo split stratificato IN MEMORIA.
-
-        IMPORTANTE (fix data-loss, vedi docstring di classe): questa
-        funzione NON tocca piu' lo spool su disco. Gli shard restano
-        scritti finche' il chiamante non conferma esplicitamente il
-        successo della scrittura dei file finali chiamando
-        commit_splits(). Se il processo muore tra build_splits() e
-        commit_splits() (es. Ctrl+C durante torch.save dei file finali),
-        gli shard sono ancora li' e un prossimo avvio li ricarica
-        automaticamente (vedi _reload_existing_shards, chiamato dal
-        costruttore/instance()).
-
-        Sequenza corretta lato chiamante:
-            splits = registry.build_splits(...)
-            # scrivere e VERIFICARE train.pt / val.pt / test.pt qui
-            registry.commit_splits()   # <-- solo se la scrittura e' andata a buon fine
-        """
         if len(split_ratios) != 3 or abs(sum(split_ratios) - 1.0) > 1e-6:
             raise PositionQueueError("split_ratios deve contenere 3 valori che sommano a 1.0.")
 
@@ -295,7 +240,7 @@ class PositionQueueRegistry:
             game_id = _extract_game_id(item.data)
             windows[game_id].append(item)
 
-        window_group_key: Dict[str, int] = {}
+        window_strata: Dict[str, Tuple[int, str]] = {}
         for game_id, items in windows.items():
             keys_in_window = {item.group_key for item in items}
             if len(keys_in_window) != 1:
@@ -306,19 +251,25 @@ class PositionQueueRegistry:
                     f"accodato piu' volte, o se c'e' un bug nel chiamante che riusa un game_id tra "
                     f"finestre diverse."
                 )
-            window_group_key[game_id] = keys_in_window.pop()
+            source_tags_in_window = {item.source_tag for item in items}
+            if len(source_tags_in_window) != 1:
+                raise PositionQueueError(
+                    f"game_id={game_id!r} ha posizioni con source_tag diversi ({sorted(source_tags_in_window)})."
+                )
+            window_strata[game_id] = (keys_in_window.pop(), source_tags_in_window.pop())
 
-        groups_of_windows: Dict[int, List[str]] = defaultdict(list)
-        for game_id, key in window_group_key.items():
-            groups_of_windows[key].append(game_id)
+        groups_of_windows: Dict[Tuple[int, str], List[str]] = defaultdict(list)
+        for game_id, stratum in window_strata.items():
+            groups_of_windows[stratum].append(game_id)
 
         generator = torch.Generator().manual_seed(seed)
         train_ratio, val_ratio, _test_ratio = split_ratios
         result: Dict[str, List[Data]] = {"train": [], "val": [], "test": []}
         window_counts: Dict[str, int] = {"train": 0, "val": 0, "test": 0}
+        stratum_window_counts: Dict[Tuple[int, str], Dict[str, int]] = {}
 
-        for key in sorted(groups_of_windows.keys()):
-            game_ids_in_group = sorted(groups_of_windows[key])
+        for stratum in sorted(groups_of_windows.keys(), key=lambda s: (s[0], s[1])):
+            game_ids_in_group = sorted(groups_of_windows[stratum])
             n = len(game_ids_in_group)
 
             n_train = min(int(train_ratio * n), n)
@@ -333,10 +284,13 @@ class PositionQueueRegistry:
                 + [("test", gid) for gid in shuffled_game_ids[n_train + n_val:]]
             )
 
+            stratum_counts = {"train": 0, "val": 0, "test": 0}
             for split_name, game_id in split_assignment:
                 for item in windows[game_id]:
                     result[split_name].append(item.data)
                 window_counts[split_name] += 1
+                stratum_counts[split_name] += 1
+            stratum_window_counts[stratum] = stratum_counts
 
         for split_name, data_list in result.items():
             if not data_list:
@@ -344,7 +298,7 @@ class PositionQueueRegistry:
             perm = torch.randperm(len(data_list), generator=generator)
             result[split_name] = [data_list[i] for i in perm.tolist()]
 
-        self._log_distribution(result, groups_of_windows, window_counts)
+        self._log_distribution(result, groups_of_windows, window_counts, stratum_window_counts)
         logger.info(
             "[PositionQueueRegistry] build_splits calcolato in memoria. "
             "Lo spool su disco NON e' stato cancellato: chiamare "
@@ -356,16 +310,6 @@ class PositionQueueRegistry:
         return result
 
     def commit_splits(self) -> None:
-        """Conferma che i file finali (train/val/test) sono stati scritti
-        con successo su disco: SOLO A QUESTO PUNTO e' sicuro cancellare lo
-        spool e persistere il contatore diagnostico. Va chiamato subito
-        dopo l'ultimo os.replace() riuscito (e idealmente verificato, es.
-        con torch_pt_ready) sui file finali nel chiamante (vedi
-        DatasetMain._step_finalize_splits), MAI prima.
-
-        Idempotente: chiamabile anche se lo spool e' gia' vuoto (es.
-        seconda chiamata accidentale) senza effetti collaterali negativi.
-        """
         with self._lock:
             self._persist_enqueued_count()
             self._clear_spool()
@@ -377,18 +321,27 @@ class PositionQueueRegistry:
     def _log_distribution(
         self,
         result: Dict[str, List[Data]],
-        groups_of_windows: Dict[int, List[str]],
+        groups_of_windows: Dict[Tuple[int, str], List[str]],
         window_counts: Dict[str, int],
+        stratum_window_counts: Dict[Tuple[int, str], Dict[str, int]],
     ) -> None:
         total_positions = sum(len(v) for v in result.values())
         total_windows = sum(window_counts.values())
         logger.info(
-            f"[PositionQueueRegistry] build_splits completato (split-safe per finestra): "
-            f"{len(groups_of_windows)} group_key distinti, "
+            f"[PositionQueueRegistry] build_splits completato (split-safe per finestra, "
+            f"stratificato per (mate_n, source_tag)): "
+            f"{len(groups_of_windows)} strati distinti, "
             f"{total_windows} finestre, {total_positions} posizioni totali."
         )
         for split_name in ("train", "val", "test"):
             logger.info(
                 f"    {split_name}: {window_counts[split_name]} finestre, "
                 f"{len(result[split_name])} posizioni"
+            )
+        for stratum in sorted(stratum_window_counts.keys(), key=lambda s: (s[0], s[1])):
+            mate_n, source_tag = stratum
+            counts = stratum_window_counts[stratum]
+            logger.debug(
+                f"    strato mate_n={mate_n} source_tag={source_tag}: "
+                f"train={counts['train']}, val={counts['val']}, test={counts['test']}"
             )
