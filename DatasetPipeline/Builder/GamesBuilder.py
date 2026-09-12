@@ -33,10 +33,6 @@ from DatasetPipeline.Utils.ipc_safe_data import (
 
 logger = logging.getLogger(__name__)
 
-# ============================================================================
-# STATO GLOBALE PER WORKER (Stockfish + Syzygy + watchdog)
-# ============================================================================
-
 _engine: Optional[chess.engine.SimpleEngine] = None
 _engine_pid: Optional[int] = None
 _tablebase: Optional["chess.syzygy.Tablebase"] = None
@@ -118,10 +114,6 @@ def _worker_sigterm_handler(signum, frame) -> None:
             pass
     os._exit(0)
 
-# ============================================================================
-# SOURCE SPEC
-# ============================================================================
-
 @dataclass
 class SourceSpec:
     kind: str
@@ -153,18 +145,14 @@ class _ClosingStream:
                 self._raw_file.close()
         return False
 
-# ============================================================================
-# CONFIG (MODIFICATA PER MAX THROUGHPUT)
-# ============================================================================
-
 @dataclass
 class GamesBuilderConfig:
     sources: List[SourceSpec]
     stockfish_path: str
     mate_range: Tuple[int, int] = (1, 5)
-    search_depth: int = 6  
+    search_depth: int = 6
     analysis_time: Optional[float] = None
-    
+
     workers: Optional[int] = None
     threads: int = 1
     hash_mb: int = 128
@@ -192,27 +180,13 @@ class GamesBuilderConfig:
     min_rating: Optional[int] = 1200
     max_rating: Optional[int] = None
 
-    # [OTTIMIZZAZIONE]: Campionamento alleggerito (scarta più mosse).
     min_ply: int = 8
     ply_sample_step: int = 6
 
-    # Coda finale della partita: qui i mate_n piccoli (1-3, al centro
-    # della research question del progetto, vedi proggetto_ai.md) sono
-    # piu' probabili che nel resto della partita. Uno step di
-    # campionamento uniforme (ply_sample_step) sull'intera partita
-    # sotto-rappresenta sistematicamente queste sequenze corte rispetto
-    # ai mate_n grandi, che vengono trovati anche a meta' partita con
-    # ply piu' "diluiti". Per correggere questo bias, negli ultimi
-    # dense_tail_plies ply si usa ply_sample_step_tail (piu' fitto) al
-    # posto di ply_sample_step. dense_tail_plies=0 disattiva la coda
-    # densa e ripristina il comportamento a step fisso uniforme.
-    # max_positions_per_game resta comunque il tetto assoluto per game,
-    # quindi il costo aggiuntivo di chiamate Stockfish e' limitato anche
-    # nel caso peggiore (game molto lungo con coda densa piena).
     dense_tail_plies: int = 24
     ply_sample_step_tail: int = 3
 
-    max_positions_per_game: Optional[int] = 5 
+    max_positions_per_game: Optional[int] = 5
 
     only_decisive_games: bool = True
     skip_time_forfeit: bool = True
@@ -233,10 +207,6 @@ class GamesBuilderConfig:
     resume_state_path: Optional[str] = None
     resume_checkpoint_every: int = 2000
     flush_every_seconds: Optional[float] = None
-
-# ============================================================================
-# GAMES BUILDER
-# ============================================================================
 
 class GamesBuilder:
     _PIECE_VALUES: Dict[int, int] = {
@@ -259,16 +229,18 @@ class GamesBuilder:
         cpu_count = os.cpu_count() or 2
         self._workers = config.workers or max(1, cpu_count - 1)
 
-        self._debug_records: Dict[str, List[Dict]] = {"train": [], "val": [], "test": []}
+        self._debug_records: List[Dict] = []
         self._debug_jsonl_path = None
+        self._debug_records_raw_path = None
         if config.save_debug_jsonl:
             if config.debug_jsonl_dir:
                 os.makedirs(config.debug_jsonl_dir, exist_ok=True)
-                self._debug_jsonl_path = os.path.join(config.debug_jsonl_dir, "games_debug.jsonl")
+                debug_dir = config.debug_jsonl_dir
             else:
-                state_dir = os.path.dirname(config.queue_state_path) if config.queue_state_path else "."
-                os.makedirs(state_dir, exist_ok=True)
-                self._debug_jsonl_path = os.path.join(state_dir, "games_debug.jsonl")
+                debug_dir = os.path.dirname(config.queue_state_path) if config.queue_state_path else "."
+                os.makedirs(debug_dir, exist_ok=True)
+            self._debug_jsonl_path = os.path.join(debug_dir, "games_debug.jsonl")
+            self._debug_records_raw_path = os.path.join(debug_dir, "games_debug_records.pending.jsonl")
 
         self._resume_state_path = config.resume_state_path
         if self._resume_state_path is None:
@@ -306,13 +278,6 @@ class GamesBuilder:
         )
 
     def _validate_config(self) -> None:
-        """Controlli bloccanti sulla config, in particolare l'unicita' del
-        tag tra sorgenti: dato che il game_id finale e' costruito come
-        "{tag}_{local_id}" e local_id riparte da 1 in OGNI sorgente (vedi
-        _iter_all_tasks), due SourceSpec con lo stesso tag produrrebbero
-        game_id identici per partite fisicamente diverse -> collisioni
-        silenziose o errori intermittenti in PositionQueueRegistry.
-        build_splits(). Meglio bloccare subito con un errore chiaro."""
         tags_seen: Dict[str, SourceSpec] = {}
         for src in self.config.sources:
             if src.tag in tags_seen:
@@ -407,13 +372,12 @@ class GamesBuilder:
         return self.config.avg_time_by_rating[closest]
 
     def _headers_are_eligible(self, headers) -> bool:
-        """[OTTIMIZZAZIONE]: Filtra usando i soli metadata, saltando l'albero mosse."""
         cfg = self.config
         if cfg.only_decisive_games:
             result = headers.get("Result", "")
             if result not in ("1-0", "0-1"):
                 return False
-        
+
         if cfg.skip_time_forfeit:
             termination = headers.get("Termination", "")
             if "Time forfeit" in termination:
@@ -512,17 +476,15 @@ class GamesBuilder:
         empty_payload = encode_for_ipc([])
         if _engine is None: return game_id, resume_key, empty_payload
 
-        # [OTTIMIZZAZIONE]: Fase 1: Fast parsing solo degli headers
         pgn_io = io.StringIO(pgn_text)
         headers = chess.pgn.read_headers(pgn_io)
-        
+
         if headers is None or headers.get("Variant", "Standard").lower() not in ("standard", "normal"):
             return game_id, resume_key, empty_payload
-            
+
         if not self._headers_are_eligible(headers):
             return game_id, resume_key, empty_payload
 
-        # Fase 2: Parse completo solo se supera i filtri rapidi
         pgn_io.seek(0)
         try:
             game = chess.pgn.read_game(pgn_io)
@@ -582,13 +544,6 @@ class GamesBuilder:
 
                 if current_clock is not None: previous_clock[mover_color] = current_clock
 
-                # Filtri di selezione delle posizioni. Negli ultimi
-                # cfg.dense_tail_plies ply della partita si campiona con
-                # cfg.ply_sample_step_tail (piu' fitto) invece di
-                # cfg.ply_sample_step, perche' i mate_n piccoli tendono a
-                # concentrarsi vicino alla fine della partita e uno step
-                # uniforme li sotto-campiona sistematicamente rispetto ai
-                # mate_n grandi (vedi commento in GamesBuilderConfig).
                 is_in_dense_tail = (
                     cfg.dense_tail_plies > 0
                     and (game_end_ply - node.ply()) <= cfg.dense_tail_plies
@@ -616,7 +571,6 @@ class GamesBuilder:
 
                 if self._syzygy_says_no_mate(board): node = next_node; continue
 
-                # Analisi Stockfish
                 info = self._analyse_position(board)
                 positions_analysed += 1
                 if not info: node = next_node; continue
@@ -624,16 +578,16 @@ class GamesBuilder:
                 best_info = info[0]
                 score = best_info.get("score")
                 if score is None: node = next_node; continue
-                
+
                 relative_score = score.relative
                 if not relative_score.is_mate(): node = next_node; continue
-                
+
                 mate_n = relative_score.mate()
                 if mate_n is None or not (mate_n > 0 and mate_lo <= mate_n <= mate_hi): node = next_node; continue
 
                 pv = best_info.get("pv")
                 if not pv: node = next_node; continue
-                
+
                 best_move = pv[0]
                 if best_move not in legal_moves: node = next_node; continue
 
@@ -746,8 +700,6 @@ class GamesBuilder:
 
     @staticmethod
     def _resume_key(src: SourceSpec) -> str:
-        """Chiave stabile per il progresso di resume: kind+path (non il
-        tag, che puo' ripetersi su piu' sorgenti dello stesso kind)."""
         return f"{src.kind}:{src.path}"
 
     def _load_resume_state(self) -> Dict[str, int]:
@@ -792,25 +744,6 @@ class GamesBuilder:
             else: return None
         return total
 
-    def _assign_split(self, game_id: str) -> str:
-        """Split deterministico per debug JSONL. Usa hashlib invece del
-        built-in hash() perche' quest'ultimo e' salato in modo casuale
-        per-processo su stringhe (randomizzazione hash attiva di default
-        da Python 3.3, a meno di fissare PYTHONHASHSEED): senza questo
-        fix, lo stesso game_id poteva finire in split diversi tra due
-        run dello stesso script, disallineando i log di debug dal reale
-        split usato in training (quello vero, in
-        PositionQueueRegistry.build_splits, e' gia' deterministico
-        perche' usa torch.Generator().manual_seed(seed) su liste
-        ordinate)."""
-        import hashlib
-        digest = hashlib.sha256(f"{self.config.split_seed}:{game_id}".encode("utf-8")).hexdigest()
-        val = int(digest[:8], 16) / 0xFFFFFFFF
-        train, val_ratio, _ = self.config.split_ratios
-        if val < train: return "train"
-        if val < train + val_ratio: return "val"
-        return "test"
-
     def run(self) -> Dict[str, Any]:
         cfg = self.config
         harden_process_for_ipc()
@@ -828,18 +761,11 @@ class GamesBuilder:
 
         estimate = self._count_tasks_estimate()
 
-        # [FLUSH A TEMPO]: riferimento iniziale per flush_every_seconds,
-        # vedi docstring del campo in GamesBuilderConfig.
         last_flush_time = time.monotonic()
 
         shutdown_in_progress = threading.Event()
 
         def _panic_kill() -> None:
-            """Ultima spiaggia, senza join ne' logica annidata: SIGKILL
-            diretto su ogni worker noto ed uscita immediata. Scatta solo se
-            l'utente chiede un secondo stop mentre il primo e' gia' in
-            corso, cosi' non si resta MAI bloccati in terminale, qualunque
-            cosa vada storta altrove."""
             for proc in getattr(pool, "_pool", []):
                 try:
                     os.kill(proc.pid, signal.SIGKILL)
@@ -856,14 +782,6 @@ class GamesBuilder:
         previous_sigint = signal.signal(signal.SIGINT, _sigint_handler)
 
         def _shutdown_pool(graceful_first: bool) -> None:
-            """Chiude il pool con un tempo massimo garantito su ogni fase.
-            graceful_first=True (percorso di successo, task gia' finiti)
-            concede prima un margine di attesa naturale; con False
-            (interruzione o errore) si salta dritti a terminate()+SIGKILL,
-            perche' lo stop e' gia' stato richiesto e non ha senso
-            aspettare. L'intero corpo e' avvolto in un try/except: era
-            proprio un errore imprevisto qui dentro (logger non definito)
-            a impedire il SIGKILL finale in produzione."""
             try:
                 if graceful_first:
                     timeout = cfg.pool_join_timeout if cfg.pool_join_timeout is not None else 15.0
@@ -874,9 +792,6 @@ class GamesBuilder:
                             break
                         proc.join(timeout=remaining)
 
-                # SIGTERM ai processi ancora vivi (chi e' appeso dentro
-                # _engine.analyse() con Stockfish non responsivo non torna
-                # mai al loop del pool da solo).
                 pool.terminate()
 
                 kill_deadline = time.monotonic() + 5.0
@@ -884,8 +799,6 @@ class GamesBuilder:
                     remaining = kill_deadline - time.monotonic()
                     proc.join(timeout=max(remaining, 0.1))
 
-                # Rete di sicurezza: se anche dopo terminate() qualcuno e'
-                # ancora vivo, SIGKILL diretto sul pid.
                 for proc in pool._pool:
                     if proc.is_alive():
                         logger.warning(
@@ -899,9 +812,6 @@ class GamesBuilder:
                         except Exception as e:
                             logger.warning("[GamesBuilder] SIGKILL su pid=%s fallito: %s", proc.pid, e)
 
-                # Join finale, breve: a questo punto i processi sono morti
-                # o morenti. Non deve mai bloccare a lungo; se scade
-                # comunque si prosegue (zombie residui li ripulisce l'OS).
                 for proc in pool._pool:
                     proc.join(timeout=2.0)
             except Exception:
@@ -929,7 +839,6 @@ class GamesBuilder:
                 self._resume_confirmed[resume_key] += 1
                 if cfg.auto_resume and processed_games % cfg.resume_checkpoint_every == 0:
                     self._persist_resume_state()
-
 
                 if cfg.flush_every_seconds and (time.monotonic() - last_flush_time) >= cfg.flush_every_seconds:
                     self._registry.flush()
@@ -962,8 +871,7 @@ class GamesBuilder:
                     mate_n_counts[debug_entry["mate_n"]] += 1
 
                     if cfg.save_debug_jsonl:
-                        split_name = self._assign_split(debug_entry["game_id"])
-                        self._debug_records[split_name].append(debug_entry)
+                        self._debug_records.append(debug_entry)
 
         except KeyboardInterrupt:
             print("\n[WARNING] Interruzione richiesta: arresto forzato dei worker in corso...")
@@ -974,28 +882,16 @@ class GamesBuilder:
             _shutdown_pool(graceful_first=False)
             raise
         else:
-            # Percorso "normale": pool.close() (niente nuovi task), poi
-            # comunque la stessa chiusura con tempo massimo garantito, perche'
-            # il blocco visto in produzione avveniva PROPRIO qui, non solo
-            # sui rami d'eccezione.
             pool.close()
             _shutdown_pool(graceful_first=True)
         finally:
-            # Garantita SEMPRE: successo, errore o Ctrl+C. E' proprio
-            # questo il punto del checkpoint di resume: se l'utente
-            # interrompe, il progresso fatto fin qui non va perso.
             self._persist_resume_state()
             signal.signal(signal.SIGINT, previous_sigint)
 
         self._registry.flush()
 
-        if cfg.save_debug_jsonl and self._debug_jsonl_path:
-            tmp_path = self._debug_jsonl_path + ".tmp"
-            with open(tmp_path, "w", encoding="utf-8") as f:
-                for split in ("train", "val", "test"):
-                    for rec in self._debug_records.get(split, []):
-                        f.write(json.dumps(rec, ensure_ascii=False) + "\n")
-            os.replace(tmp_path, self._debug_jsonl_path)
+        if self.config.save_debug_jsonl and self._debug_records_raw_path:
+            self._persist_pending_debug_records()
 
         return {
             "processed_games": processed_games,
@@ -1005,3 +901,91 @@ class GamesBuilder:
             "source_counts": dict(source_counts),
             "clock_source_counts": dict(clock_source_counts),
         }
+
+    def _persist_pending_debug_records(self) -> None:
+        tmp_path = self._debug_records_raw_path + ".tmp"
+        with open(tmp_path, "a", encoding="utf-8") as f:
+            for rec in self._debug_records:
+                f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+        if os.path.exists(self._debug_records_raw_path):
+            with open(self._debug_records_raw_path, "r", encoding="utf-8") as existing, \
+                 open(tmp_path, "r", encoding="utf-8") as new_part:
+                merged_lines = existing.readlines() + new_part.readlines()
+            with open(tmp_path, "w", encoding="utf-8") as merged:
+                merged.writelines(merged_lines)
+        os.replace(tmp_path, self._debug_records_raw_path)
+
+    @staticmethod
+    def write_debug_jsonl_from_pending(
+        pending_path: str,
+        output_path: str,
+        split_assignment: Dict[str, str],
+    ) -> Optional[str]:
+        if not os.path.exists(pending_path):
+            return None
+
+        missing_game_ids = set()
+        tmp_path = output_path + ".tmp"
+        wrote_any = False
+        with open(pending_path, "r", encoding="utf-8") as src, \
+             open(tmp_path, "w", encoding="utf-8") as dst:
+            for line in src:
+                line = line.strip()
+                if not line:
+                    continue
+                rec = json.loads(line)
+                game_id = rec["game_id"]
+                split_name = split_assignment.get(game_id)
+                if split_name is None:
+                    missing_game_ids.add(game_id)
+                    continue
+                rec["split"] = split_name
+                dst.write(json.dumps(rec, ensure_ascii=False) + "\n")
+                wrote_any = True
+
+        if not wrote_any:
+            os.remove(tmp_path)
+            return None
+
+        os.replace(tmp_path, output_path)
+        os.remove(pending_path)
+
+        if missing_game_ids:
+            logger.warning(
+                "[GamesBuilder] %d game_id presenti nel debug JSONL ma assenti "
+                "dallo split_assignment reale (probabile game_id scartato dal "
+                "registry prima di build_splits): esclusi dal file scritto.",
+                len(missing_game_ids),
+            )
+
+        return output_path
+
+    def write_debug_jsonl(self, split_assignment: Dict[str, str]) -> Optional[str]:
+        if not self.config.save_debug_jsonl or not self._debug_jsonl_path:
+            return None
+        if not self._debug_records:
+            return None
+
+        missing_game_ids = set()
+        tmp_path = self._debug_jsonl_path + ".tmp"
+        with open(tmp_path, "w", encoding="utf-8") as f:
+            for rec in self._debug_records:
+                game_id = rec["game_id"]
+                split_name = split_assignment.get(game_id)
+                if split_name is None:
+                    missing_game_ids.add(game_id)
+                    continue
+                rec_out = dict(rec)
+                rec_out["split"] = split_name
+                f.write(json.dumps(rec_out, ensure_ascii=False) + "\n")
+        os.replace(tmp_path, self._debug_jsonl_path)
+
+        if missing_game_ids:
+            logger.warning(
+                "[GamesBuilder] %d game_id presenti nel debug JSONL ma assenti "
+                "dallo split_assignment reale (probabile game_id scartato dal "
+                "registry prima di build_splits): esclusi dal file scritto.",
+                len(missing_game_ids),
+            )
+
+        return self._debug_jsonl_path

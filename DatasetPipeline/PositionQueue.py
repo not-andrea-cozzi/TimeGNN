@@ -70,6 +70,7 @@ class PositionQueueRegistry:
         self._next_local_ref = 0
         self._next_shard_index = 0
         self._enqueued_count = self._load_enqueued_count()
+        self._last_split_assignment: Optional[Dict[str, str]] = None
 
         self._reload_existing_shards()
 
@@ -267,6 +268,7 @@ class PositionQueueRegistry:
         result: Dict[str, List[Data]] = {"train": [], "val": [], "test": []}
         window_counts: Dict[str, int] = {"train": 0, "val": 0, "test": 0}
         stratum_window_counts: Dict[Tuple[int, str], Dict[str, int]] = {}
+        game_id_to_split: Dict[str, str] = {}
 
         for stratum in sorted(groups_of_windows.keys(), key=lambda s: (s[0], s[1])):
             game_ids_in_group = sorted(groups_of_windows[stratum])
@@ -286,6 +288,7 @@ class PositionQueueRegistry:
 
             stratum_counts = {"train": 0, "val": 0, "test": 0}
             for split_name, game_id in split_assignment:
+                game_id_to_split[game_id] = split_name
                 for item in windows[game_id]:
                     result[split_name].append(item.data)
                 window_counts[split_name] += 1
@@ -307,7 +310,19 @@ class PositionQueueRegistry:
             "recuperabili al prossimo avvio."
         )
 
+        with self._lock:
+            self._last_split_assignment = game_id_to_split
+
         return result
+
+    def get_split_assignment(self) -> Dict[str, str]:
+        with self._lock:
+            if self._last_split_assignment is None:
+                raise PositionQueueError(
+                    "get_split_assignment chiamato prima di build_splits: nessuna "
+                    "assegnazione game_id -> split disponibile."
+                )
+            return dict(self._last_split_assignment)
 
     def commit_splits(self) -> None:
         with self._lock:
