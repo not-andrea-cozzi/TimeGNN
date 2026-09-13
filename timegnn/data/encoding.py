@@ -437,13 +437,48 @@ def encode_event_prefix(
     return encoded_subsequences, y_values, output_size
 
 
-def length_stratified_split(event_feature_list, test_size: float = 0.2, n_bins: int = 5):
-    """Split sequences into train/test with length-stratified bins."""
+def length_stratified_split(
+    event_feature_list,
+    test_size: float = 0.2,
+    n_bins: int = 5,
+    seed: int = 42,
+):
+    """Split sequences into train/test with length-stratified bins.
+
+    FIX: la versione precedente ordinava gli indici di ciascun bin per
+    lunghezza e tagliava gli ULTIMI n_test come test set. Questo produce
+    due bias sistematici: (1) a lunghezze diverse dentro lo stesso bin,
+    il test set finisce sempre con le sequenze piu' lunghe della fascia,
+    non un campione casuale; (2) a parita' di lunghezza esatta, sort()
+    e' stabile quindi l'ordine relativo resta quello di inserimento
+    originale (che riflette l'ordine del dataset grezzo, es. ordine di
+    processing per sorgente) — gli "ultimi" a parita' di lunghezza sono
+    quindi anche gli ultimi per ordine di comparizione nel dataset, non
+    una scelta casuale.
+
+    Il fix mantiene la stratificazione per bin di lunghezza (train/test
+    restano bilanciati per fascia), ma mescola con un generatore seedato
+    gli indici DENTRO ciascun bin prima del taglio: il test set resta
+    cosi' un campione casuale e riproducibile della fascia, non
+    sistematicamente le code piu' lunghe o piu' recenti nell'ordine di
+    inserimento.
+
+    Args:
+        event_feature_list: lista di oggetti con attributo .x (righe = nodi).
+        test_size: frazione di ciascun bin destinata al test.
+        n_bins: numero di fasce di lunghezza.
+        seed: seed del generatore di shuffle, per riproducibilita'.
+
+    Returns:
+        Tuple (train_indices, test_indices).
+    """
     sequence_lengths = [data.x.shape[0] for data in event_feature_list]
     min_len, max_len = min(sequence_lengths), max(sequence_lengths)
     bin_edges = np.linspace(min_len, max_len + 1, n_bins + 1)
     bins = np.digitize(sequence_lengths, bin_edges) - 1
     bins = np.clip(bins, 0, n_bins - 1)
+
+    rng = np.random.default_rng(seed)
 
     train_indices = []
     test_indices = []
@@ -456,10 +491,10 @@ def length_stratified_split(event_feature_list, test_size: float = 0.2, n_bins: 
         n_test = max(1, int(len(bin_indices) * test_size))
         n_train = len(bin_indices) - n_test
 
-        bin_indices_with_lengths = [(i, sequence_lengths[i]) for i in bin_indices]
-        bin_indices_with_lengths.sort(key=lambda x: x[1])
+        shuffled_bin_indices = list(bin_indices)
+        rng.shuffle(shuffled_bin_indices)
 
-        train_indices.extend([idx for idx, _ in bin_indices_with_lengths[:n_train]])
-        test_indices.extend([idx for idx, _ in bin_indices_with_lengths[n_train:]])
+        train_indices.extend(shuffled_bin_indices[:n_train])
+        test_indices.extend(shuffled_bin_indices[n_train:])
 
     return train_indices, test_indices

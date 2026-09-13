@@ -31,6 +31,8 @@ from DatasetPipeline.Utils.ipc_safe_data import (
     harden_process_for_ipc,
 )
 
+from DatasetPipeline.Utils.time_edge_weighting import apply_edge_type_time_weighting
+
 logger = logging.getLogger(__name__)
 
 _engine: Optional[chess.engine.SimpleEngine] = None
@@ -611,6 +613,12 @@ class GamesBuilder:
                         ply=node.ply(),
                         mate_n=int(mate_n),
                     )
+                    # FIX: differenzia il tempo costante per tipo di arco
+                    # (legal_move/attack/pin) invece di lasciarlo identico
+                    # su tutti gli E archi della board. Vedi docstring di
+                    # modulo in time_edge_weighting.py per la motivazione
+                    # completa. Non tocca build_position_data.
+                    data = apply_edge_type_time_weighting(data)
                 except ValueError: node = next_node; continue
 
                 if window_group_key is None:
@@ -988,4 +996,4 @@ class GamesBuilder:
                 len(missing_game_ids),
             )
 
-        return self._debug_jsonl_path
+        return self._debug_jsonl_paths

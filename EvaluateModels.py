@@ -24,12 +24,13 @@ from timegnn.data.pyg import custom_collate_graph
 # Plotter
 from Common.EvaluatorPlotter import EvaluatorPlotter
 
-# Costanti derivate da PositionGraphSchema (devono coincidere con quelle del training)
-NUM_EVENT_ID_CATEGORIES = 13
-NUM_EVENT_FEATURES = 2
-MOVE_VOCAB_SIZE = 64 * 64
-NUM_EDGE_TYPES = 3
-TIME_EDGE_DIM = 1
+from DatasetPipeline.Model.ChessConstants import (
+    NUM_EVENT_FEATURES,
+    NUM_EVENT_ID_CATEGORIES,
+    MOVE_VOCAB_SIZE,
+    NUM_EDGE_TYPES,
+    TIME_EDGE_DIM,
+)
 
 logger = logging.getLogger("evaluate_models")
 

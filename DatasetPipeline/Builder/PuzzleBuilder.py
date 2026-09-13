@@ -19,6 +19,7 @@ from DatasetPipeline.Utils.compatibility_filters import (
     mover_has_heavy_piece,
     parse_rating_strict,
 )
+from DatasetPipeline.Utils.time_edge_weighting import apply_edge_type_time_weighting
 
 logger = logging.getLogger("puzzle_builder")
 
@@ -335,6 +336,7 @@ class PuzzleBuilder:
                         ply=ply_idx,
                         mate_n=int(current_mate_n),
                     )
+                    data = apply_edge_type_time_weighting(data)
                 except ValueError as e:
                     logger.warning(
                         f"PuzzleId={row.get('PuzzleId')} ply={ply_idx}: "

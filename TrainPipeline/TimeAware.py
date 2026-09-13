@@ -3,17 +3,13 @@ from __future__ import annotations
 import argparse
 import logging
 import os
-import time
-
+from DatasetPipeline.Model.ChessConstants import NUM_EVENT_FEATURES
+from DatasetPipeline.Model.PositionGraphSchema import MOVE_VOCAB_SIZE, NUM_EVENT_ID_CATEGORIES
 import torch
 import torch.nn as nn
-
-from shard_dataset import ShardedGraphDataset
+from TrainPipeline.Shard.ShardDataset import ShardedGraphDataset
 from timegnn.data.pyg import custom_collate_graph
 from timegnn.models.gat_time_decay import DualGATTimeAwareModel
-from timegnn.train.early_stopping import EarlyStopping
-from TrainPipeline.Training.Loop import evaluate_epoch, train_epoch
-from TrainPipeline.Training.State import TrainState
 
 logging.basicConfig(
     level=logging.INFO,
@@ -21,12 +17,6 @@ logging.basicConfig(
 )
 logger = logging.getLogger("train_time_aware")
 
-# Vocabolario fisso dello schema scacchistico (PositionGraphSchema.py):
-# NON un iperparametro, deriva dalla codifica board 64x64.
-NUM_EVENT_ID_CATEGORIES = 13   # 0=vuota, 1..12=piece_type*2+color+1
-NUM_EVENT_FEATURES = 2         # is_occupied_by_mover, is_occupied_by_opponent
-MOVE_VOCAB_SIZE = 64 * 64      # 4096: output_dim del modello
-TIME_EDGE_DIM = 1              # edge_attr = data.time, scalare per arco
 
 
 def build_model(args: argparse.Namespace, device: str) -> DualGATTimeAwareModel:
@@ -60,7 +50,7 @@ def build_dataloaders(args: argparse.Namespace):
     train_loader = DataLoader(
         train_ds,
         batch_size=args.batch_size,
-        shuffle=False,  # gestito dal dataset (IterableDataset)
+        shuffle=False,  
         collate_fn=custom_collate_graph,
         num_workers=args.num_workers,
         persistent_workers=args.num_workers > 0,
@@ -74,4 +64,3 @@ def build_dataloaders(args: argparse.Namespace):
         persistent_workers=args.num_workers > 0,
     )
     return train_loader, train_ds, val_loader, val_ds
-

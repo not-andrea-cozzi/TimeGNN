@@ -25,6 +25,7 @@ class TrainState:
         epoch: int = 0,
         history: Optional[List[Dict[str, float]]] = None,
         best_val_loss: float = float("inf"),
+        global_step: int = 0,
     ):
         """
         Args:
@@ -32,11 +33,21 @@ class TrainState:
             epoch: Epoca di partenza (0 = nessuna epoca completata).
             history: Lista di dizionari con metriche per epoca.
             best_val_loss: Miglior loss di validazione finora.
+            global_step: Contatore di step di training completati, usato dal
+                checkpoint automatico "ogni N step" in
+                TrainPipeline/Training/Loop.py (train_epoch, quando gli
+                viene passato un'istanza reale di TrainState con
+                checkpoint_every impostato). FIX: prima non esisteva come
+                attributo, quindi "train_state.global_step += 1" in Loop.py
+                sollevava AttributeError al primo step in cui la funzione
+                riceveva un TrainState non-None — il meccanismo descritto
+                nel docstring di modulo di Loop.py era di fatto inutilizzabile.
         """
         self.checkpoint_path = checkpoint_path
         self.epoch = epoch
         self.history = history if history is not None else []
         self.best_val_loss = best_val_loss
+        self.global_step = global_step
 
     def try_resume(
         self,
@@ -48,8 +59,8 @@ class TrainState:
     ) -> bool:
         """
         Tenta di caricare lo stato da un checkpoint. Se il file esiste, aggiorna
-        model, optimizer, scaler, self.epoch, self.history, self.best_val_loss.
-        Restituisce True se il caricamento è riuscito.
+        model, optimizer, scaler, self.epoch, self.history, self.best_val_loss,
+        self.global_step. Restituisce True se il caricamento è riuscito.
 
         Args:
             checkpoint_path: Se None, usa self.checkpoint_path.
@@ -85,10 +96,14 @@ class TrainState:
         self.epoch = state.get("epoch", 0)
         self.history = state.get("history", [])
         self.best_val_loss = state.get("best_val_loss", float("inf"))
+        # FIX: ripristina anche global_step, se assente nel checkpoint
+        # (es. checkpoint scritti prima di questo fix) riparte da 0
+        # invece di sollevare KeyError o lasciare un valore incoerente.
+        self.global_step = state.get("global_step", 0)
 
         logger.info(
             f"Checkpoint caricato: epoca {self.epoch}, best_val_loss={self.best_val_loss:.4f}, "
-            f"{len(self.history)} epoche in history."
+            f"{len(self.history)} epoche in history, global_step={self.global_step}."
         )
         return True
 
@@ -119,10 +134,11 @@ class TrainState:
             "scaler_state_dict": scaler.state_dict() if scaler is not None else None,
             "best_val_loss": self.best_val_loss,
             "history": self.history,
+            "global_step": self.global_step,
         }
 
         # Salvataggio atomico (scrive su .tmp poi rinomina)
         tmp_path = path + ".tmp"
         torch.save(state, tmp_path)
         os.replace(tmp_path, path)
-        logger.debug(f"Checkpoint salvato in {path} (epoca {self.epoch})")
+        logger.debug(f"Checkpoint salvato in {path} (epoca {self.epoch}, global_step={self.global_step})")
