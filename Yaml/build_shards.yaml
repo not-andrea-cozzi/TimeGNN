@@ -16,8 +16,8 @@ engine:
 
 games_pipeline:
   sources:
-    - path: "RawData/ficsgamesdb_201701_chess_movetimes_4339526.pgn"
-      tag: "games_fics_17_0_1"
+    - path: "RawData/lichess_db_standard_rated_2020-01.pgn.zst"
+      tag: "lichess_games_00"
       skip_games: 0
       max_games: 100000
 
@@ -26,18 +26,17 @@ games_pipeline:
     #  skip_games: 0
     #  max_games: 50000
 
-
   split_train_ratio: 0.65
   split_val_ratio: 0.15
   split_test_ratio: 0.20
-
+ 
   mate_range_min: 1
   mate_range_max: 5
   search_depth: 12
   time_limit_seconds: 0.2
   max_piece_count: null
-  min_material_for_mate_attempt: 0
-  min_material_diff_for_mate_attempt: 0
+  min_material_for_mate_attempt: 2
+  min_material_diff_for_mate_attempt: 2
   only_decisive_games: true
   skip_time_forfeit: true
   ply_sample_step: 12
@@ -62,7 +61,6 @@ games_pipeline:
   shard_size: 5000
   pool_join_timeout: 20.0
   save_debug_jsonl: true
-
-
+ 
   auto_resume: true
   resume_checkpoint_every: 5000

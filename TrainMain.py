@@ -31,7 +31,8 @@ from timegnn.data.pyg import custom_collate_graph
 from timegnn.train.early_stopping import EarlyStopping
 from Common.EvaluatorPlotter import EvaluatorPlotter
 from TrainPipeline.CleanDataset import clean_file
-from DatasetPipeline.Utils.position_pooling import pool_node_logits, apply_legal_move_mask
+from DatasetPipeline.Utils.position_pooling import pool_node_logits
+from Common.sparse_legal_moves import sparse_legal_argmax
 
 # ----------------------------------------------------------------------
 # Costanti
@@ -262,6 +263,11 @@ def run_training(
         lr=float(section.get("lr", 1e-3)),
         weight_decay=float(section.get("weight_decay", 0.0)),
     )
+    # NOTA: criterion non e' piu' usato per calcolare la loss dentro
+    # train_epoch/evaluate_epoch (TrainPipeline/Training/Loop.py usa
+    # sparse_legal_cross_entropy internamente, vedi Common/sparse_legal_moves.py).
+    # Mantenuto qui solo per compatibilita' di firma con le due funzioni,
+    # che lo accettano ma lo ignorano.
     criterion = nn.CrossEntropyLoss()
     scaler = torch.amp.GradScaler("cuda", enabled=use_amp) if device == "cuda" else None
 
@@ -477,9 +483,15 @@ def evaluate_models(cfg: Dict[str, Any], device: str, use_amp: bool) -> None:
                 graph_logits = pool_node_logits(node_logits, batch_event.batch)
 
                 if hasattr(batch_event, "legal_move_mask") and batch_event.legal_move_mask is not None:
-                    graph_logits = apply_legal_move_mask(graph_logits, batch_event.legal_move_mask)
+                    # sparse_legal_argmax evita di costruire il tensore
+                    # full-size masked_fill([-inf]) su MOVE_VOCAB_SIZE
+                    # colonne quasi tutte illegali; restituisce comunque
+                    # l'indice nel vocabolario originale, confrontabile
+                    # direttamente con `labels` come prima.
+                    pred = sparse_legal_argmax(graph_logits, batch_event.legal_move_mask)
+                else:
+                    pred = graph_logits.argmax(dim=1)
 
-                pred = graph_logits.argmax(dim=1)
                 correct_move = (pred == labels).cpu().numpy()
                 move_correct_list.extend(correct_move)
 
@@ -545,8 +557,8 @@ def evaluate_models(cfg: Dict[str, Any], device: str, use_amp: bool) -> None:
         del test_loader, test_ds, test_data
         del model_basic, model_time
         free_memory(verbose=True)
-        
-        
+
+
 # ----------------------------------------------------------------------
 # Main
 # ----------------------------------------------------------------------
@@ -755,7 +767,6 @@ if __name__ == "__main__":
         help="Override del livello di log (DEBUG, INFO, WARNING, ERROR)",
     )
     args = parser.parse_args()
-    # Applica il livello di log passato da CLI PRIMA di main
     if args.log_level:
         os.environ["LOG_LEVEL_OVERRIDE"] = args.log_level
     main(args.config)

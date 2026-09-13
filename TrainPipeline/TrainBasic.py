@@ -7,15 +7,7 @@ import time
 
 import torch
 import torch.nn as nn
-
-from TrainPipeline.Shard.ShardDataset import ShardedGraphDataset
-from timegnn.data.pyg import custom_collate_graph
-from timegnn.models.gat_basic import DualGATModel
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-)
-logger = logging.getLogger("train_basic")
+from torch.utils.data import DataLoader
 
 from DatasetPipeline.Model.ChessConstants import (
     NUM_EVENT_FEATURES,
@@ -23,6 +15,16 @@ from DatasetPipeline.Model.ChessConstants import (
     MOVE_VOCAB_SIZE,
     NUM_EDGE_TYPES,
 )
+from TrainPipeline.Shard.ShardDataset import ShardedGraphDataset
+from timegnn.data.pyg import custom_collate_graph
+from timegnn.models.gat_basic import DualGATModel
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+)
+logger = logging.getLogger("train_basic")
+
 
 def build_model(args: argparse.Namespace, device: str) -> DualGATModel:
     model = DualGATModel(
@@ -44,8 +46,6 @@ def build_model(args: argparse.Namespace, device: str) -> DualGATModel:
 
 
 def build_dataloaders(args: argparse.Namespace):
-    from torch.utils.data import DataLoader
-
     train_dir = os.path.join(args.shards_dir, "train")
     val_dir = os.path.join(args.shards_dir, "val")
 

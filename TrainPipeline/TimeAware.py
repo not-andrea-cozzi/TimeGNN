@@ -3,10 +3,17 @@ from __future__ import annotations
 import argparse
 import logging
 import os
-from DatasetPipeline.Model.ChessConstants import NUM_EVENT_FEATURES
-from DatasetPipeline.Model.PositionGraphSchema import MOVE_VOCAB_SIZE, NUM_EVENT_ID_CATEGORIES
+
 import torch
 import torch.nn as nn
+from torch.utils.data import DataLoader
+
+from DatasetPipeline.Model.ChessConstants import (
+    NUM_EVENT_FEATURES,
+    NUM_EVENT_ID_CATEGORIES,
+    MOVE_VOCAB_SIZE,
+    TIME_EDGE_DIM,
+)
 from TrainPipeline.Shard.ShardDataset import ShardedGraphDataset
 from timegnn.data.pyg import custom_collate_graph
 from timegnn.models.gat_time_decay import DualGATTimeAwareModel
@@ -16,7 +23,6 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
 )
 logger = logging.getLogger("train_time_aware")
-
 
 
 def build_model(args: argparse.Namespace, device: str) -> DualGATTimeAwareModel:
@@ -39,8 +45,6 @@ def build_model(args: argparse.Namespace, device: str) -> DualGATTimeAwareModel:
 
 
 def build_dataloaders(args: argparse.Namespace):
-    from torch.utils.data import DataLoader
-
     train_dir = os.path.join(args.shards_dir, "train")
     val_dir = os.path.join(args.shards_dir, "val")
 
@@ -50,7 +54,7 @@ def build_dataloaders(args: argparse.Namespace):
     train_loader = DataLoader(
         train_ds,
         batch_size=args.batch_size,
-        shuffle=False,  
+        shuffle=False,  # gestito dal dataset (IterableDataset)
         collate_fn=custom_collate_graph,
         num_workers=args.num_workers,
         persistent_workers=args.num_workers > 0,
