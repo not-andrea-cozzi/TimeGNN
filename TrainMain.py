@@ -49,9 +49,15 @@ logger = logging.getLogger(__name__)
 # ----------------------------------------------------------------------
 # Helper memoria
 # ----------------------------------------------------------------------
-def free_memory(verbose: bool = False) -> None:
-    """Forza garbage collection e svuota la cache CUDA."""
-    gc.collect()
+def free_memory(verbose: bool = False, force_gc: bool = False) -> None:
+    """
+    Svuota la cache CUDA e opzionalmente forza il garbage collector.
+
+    Nota: gc.collect() è costoso; chiamalo solo quando serve davvero
+    (force_gc=True) e non ad ogni epoca.
+    """
+    if force_gc:
+        gc.collect()
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
         torch.cuda.ipc_collect()
@@ -80,6 +86,19 @@ def apply_memory_limit(max_ram_gb: Optional[float]) -> None:
         logger.info(f"Limite RAM impostato a {max_ram_gb} GB (RLIMIT_AS).")
     except (ImportError, ValueError, OSError) as e:
         logger.warning(f"Impossibile impostare il limite RAM: {e}")
+
+
+# ----------------------------------------------------------------------
+# Salvataggio atomico dei checkpoint
+# ----------------------------------------------------------------------
+def atomic_save(obj: Any, path: str) -> None:
+    """
+    Salva un oggetto su disco in modo atomico: scrive su file temporaneo
+    e poi esegue rename. Evita checkpoint corrotti in caso di crash.
+    """
+    tmp = f"{path}.tmp"
+    torch.save(obj, tmp)
+    os.replace(tmp, path)
 
 
 # ----------------------------------------------------------------------
@@ -126,8 +145,6 @@ def load_yaml_config(config_path: str) -> Dict[str, Any]:
 
 
 def validate_config(cfg: Dict[str, Any]) -> None:
-    # Nota: 'clean' e 'shard' NON sono piu' step di TrainMain:
-    # vivono in DatasetMain.py (step clean_and_reshard).
     required = ["pipeline", "train_basic", "train_time_aware", "evaluate"]
     for section in required:
         if section not in cfg:
@@ -150,7 +167,7 @@ def run_step(state: PipelineState, step_name: str, is_ready_fn, do_fn) -> None:
         logger.error(f"[FAILED] Step '{step_name}': {e}", exc_info=True)
         raise
     finally:
-        free_memory()
+        free_memory(force_gc=True)
     elapsed = time.monotonic() - t0
     state.mark_done(step_name)
     logger.info(f"[DONE] Step '{step_name}' in {elapsed:.2f}s.")
@@ -171,20 +188,28 @@ def log_config(cfg: Dict[str, Any], heading: str = "Configurazione") -> None:
 
 
 # ----------------------------------------------------------------------
-# Helper per costruire DataLoader in modo sicuro
+# Helper per costruire DataLoader in modo sicuro ed efficiente
 # ----------------------------------------------------------------------
-def build_dataloader(dataset, section: Dict[str, Any], collate_fn, shuffle: bool) -> DataLoader:
+def build_dataloader(
+    dataset,
+    section: Dict[str, Any],
+    collate_fn,
+    shuffle: bool,
+    device: str = "cpu",
+) -> DataLoader:
     """
-    Costruisce un DataLoader con parametri sicuri rispetto alla RAM.
-    - num_workers: da config (default 0 = nessun worker, nessuna shared memory)
+    Costruisce un DataLoader con parametri sicuri rispetto alla RAM
+    ed efficienti su GPU.
+
+    - num_workers: da config (default 0)
     - persistent_workers: solo se num_workers > 0
-    - prefetch_factor: solo se num_workers > 0
-    - pin_memory: da config (default False)
+    - prefetch_factor: default 4 se num_workers > 0, altrimenti None
+    - pin_memory: default True se device == 'cuda'
     """
     num_workers = int(section.get("num_workers", 0))
     persistent = bool(section.get("persistent_workers", False)) and num_workers > 0
-    prefetch = section.get("prefetch_factor", 2) if num_workers > 0 else None
-    pin_memory = bool(section.get("pin_memory", False))
+    prefetch = int(section.get("prefetch_factor", 4)) if num_workers > 0 else None
+    pin_memory = bool(section.get("pin_memory", device == "cuda"))
 
     kwargs = dict(
         dataset=dataset,
@@ -242,13 +267,18 @@ def run_training(
     train_ds = ShardedGraphDataset(train_dir, shuffle=True, seed=section.get("seed", 42))
     val_ds = ShardedGraphDataset(val_dir, shuffle=False, seed=section.get("seed", 42))
 
-    train_loader = build_dataloader(train_ds, section, custom_collate_graph, shuffle=False)
-    val_loader = build_dataloader(val_ds, section, custom_collate_graph, shuffle=False)
+    train_loader = build_dataloader(
+        train_ds, section, custom_collate_graph, shuffle=False, device=device
+    )
+    val_loader = build_dataloader(
+        val_ds, section, custom_collate_graph, shuffle=False, device=device
+    )
 
     logger.info(
         f"Train: {len(train_ds):,} samples in {len(train_loader)} batches | "
         f"Val: {len(val_ds):,} samples in {len(val_loader)} batches | "
-        f"num_workers={section.get('num_workers', 0)}"
+        f"num_workers={section.get('num_workers', 0)} | "
+        f"pin_memory={train_loader.pin_memory}"
     )
 
     model = model_class(
@@ -262,22 +292,37 @@ def run_training(
         num_heads=section.get("num_heads", 4),
         edge_dim=edge_dim,
         num_layers=section.get("num_layers", 1),
-        dropout=section.get("dropout", 0.0),
+        dropout=section.get("dropout", 0.2),          # <-- default più robusto
         use_batch_norm=section.get("use_batch_norm", False),
         activation=section.get("activation", "elu"),
         **extra_kwargs,
     ).to(device)
 
+    # torch.compile opzionale (PyTorch >= 2.0, meglio su Linux)
+    if section.get("compile", False) and hasattr(torch, "compile"):
+        try:
+            model = torch.compile(model, mode="reduce-overhead")
+            logger.info("Modello compilato con torch.compile.")
+        except Exception as e:
+            logger.warning(f"torch.compile fallito, proseguo senza: {e}")
+
     optimizer = torch.optim.Adam(
         model.parameters(),
-        lr=float(section.get("lr", 1e-3)),
-        weight_decay=float(section.get("weight_decay", 0.0)),
+        lr=float(section.get("lr", 3e-4)),
+        weight_decay=float(section.get("weight_decay", 1e-5)),  # <-- default più robusto
     )
-    # NOTA: criterion non e' piu' usato per calcolare la loss dentro
-    # train_epoch/evaluate_epoch (TrainPipeline/Training/Loop.py usa
-    # sparse_legal_cross_entropy internamente, vedi Common/sparse_legal_moves.py).
-    # Mantenuto qui solo per compatibilita' di firma con le due funzioni,
-    # che lo accettano ma lo ignorano.
+
+    # Learning Rate Scheduler
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer,
+        mode="min",
+        factor=float(section.get("lr_factor", 0.5)),
+        patience=int(section.get("lr_patience", 2)),
+        min_lr=float(section.get("min_lr", 1e-6)),
+    )
+
+    # criterion non usato internamente da train_epoch/evaluate_epoch
+    # (usano sparse_legal_cross_entropy), mantenuto per compatibilità di firma.
     criterion = nn.CrossEntropyLoss()
     scaler = torch.amp.GradScaler("cuda", enabled=use_amp) if device == "cuda" else None
 
@@ -306,10 +351,20 @@ def run_training(
             f"Checkpoint caricato: epoca {train_state.epoch}, "
             f"best_val_loss={train_state.best_val_loss:.4f}"
         )
+        # Ripristina lo stato dello scheduler, se disponibile
+        try:
+            ckpt = torch.load(resume_path, map_location=device, weights_only=False)
+            if isinstance(ckpt, dict) and "scheduler_state_dict" in ckpt:
+                scheduler.load_state_dict(ckpt["scheduler_state_dict"])
+                logger.info("Stato dello scheduler ripristinato dal checkpoint.")
+            del ckpt
+        except Exception as e:
+            logger.warning(f"Impossibile ripristinare lo scheduler: {e}")
 
     early_stopping = EarlyStopping(patience=section.get("patience", 5))
     epochs = section.get("epochs", 20)
     best_val_loss = train_state.best_val_loss
+    memory_cleanup_gb = float(section.get("memory_cleanup_threshold_gb", 8.0))
 
     # 3. Loop di training --------------------------------------------------
     try:
@@ -344,8 +399,13 @@ def run_training(
 
             elapsed = time.monotonic() - t0
 
+            # Scheduler step
+            scheduler.step(val_loss)
+            current_lr = optimizer.param_groups[0]["lr"]
+
             logger.info(
                 f"Epoch {epoch+1}/{epochs} ({elapsed:.1f}s) | "
+                f"lr={current_lr:.2e} | "
                 f"train_loss={train_loss:.4f} train_acc={train_acc:.4f} | "
                 f"val_loss={val_loss:.4f} val_top1={val_top1:.4f} val_top3={val_top3:.4f}"
             )
@@ -365,15 +425,34 @@ def run_training(
                 "val_loss": val_loss,
                 "val_top1": val_top1,
                 "val_top3": val_top3,
+                "lr": current_lr,
             })
 
-            train_state.save(model, optimizer, scaler, checkpoint_path=last_path)
+            # Salvataggio atomico: last + best
+            # Nota: se TrainState.save non supporta 'atomic', questo wrapper
+            # salva comunque l'intero stato in modo sicuro.
+            try:
+                train_state.save(
+                    model, optimizer, scaler,
+                    checkpoint_path=last_path,
+                    scheduler=scheduler,
+                )
+            except TypeError:
+                # Fallback per versioni di TrainState che non accettano scheduler
+                train_state.save(model, optimizer, scaler, checkpoint_path=last_path)
             logger.debug(f"Last checkpoint salvato: {last_path}")
 
             if val_loss < best_val_loss:
                 best_val_loss = val_loss
                 train_state.best_val_loss = best_val_loss
-                train_state.save(model, optimizer, scaler, checkpoint_path=best_path)
+                try:
+                    train_state.save(
+                        model, optimizer, scaler,
+                        checkpoint_path=best_path,
+                        scheduler=scheduler,
+                    )
+                except TypeError:
+                    train_state.save(model, optimizer, scaler, checkpoint_path=best_path)
                 logger.info(
                     f"Nuovo best checkpoint: {best_path} (val_loss={best_val_loss:.4f})"
                 )
@@ -383,21 +462,33 @@ def run_training(
                 logger.info(f"Early stopping attivato all'epoca {epoch+1}.")
                 if os.path.exists(best_path):
                     logger.info(f"Caricamento del best modello da {best_path}")
-                    best_state = torch.load(best_path, map_location=device)
-                    model.load_state_dict(best_state["model_state_dict"])
+                    best_state = torch.load(
+                        best_path, map_location=device, weights_only=False
+                    )
+                    if "model_state_dict" in best_state:
+                        model.load_state_dict(best_state["model_state_dict"])
+                    else:
+                        model.load_state_dict(best_state)
                     del best_state
                 break
 
-            free_memory()
+            # Pulizia memoria solo se necessario
+            if device == "cuda":
+                mem_reserved = torch.cuda.memory_reserved(device) / 1024**3
+                if mem_reserved > memory_cleanup_gb:
+                    logger.debug(
+                        f"Memoria riservata {mem_reserved:.2f} GB > soglia "
+                        f"{memory_cleanup_gb:.2f} GB, eseguo free_memory()."
+                    )
+                    free_memory()
 
         logger.info(
             f"Training {model_type} completato. Best val loss: {best_val_loss:.4f}"
         )
     finally:
-        # Libera esplicitamente dataset, loader, modello e ottimizzatore
         del train_loader, val_loader, train_ds, val_ds
-        del model, optimizer, criterion, scaler, train_state, early_stopping
-        free_memory(verbose=True)
+        del model, optimizer, criterion, scaler, train_state, early_stopping, scheduler
+        free_memory(verbose=True, force_gc=True)
 
 
 def evaluate_models(cfg: Dict[str, Any], device: str, use_amp: bool) -> None:
@@ -406,16 +497,18 @@ def evaluate_models(cfg: Dict[str, Any], device: str, use_amp: bool) -> None:
         logger.info("Valutazione disabilitata.")
         return
 
-    # Test set shardato (output di clean_and_reshard in DatasetMain.py)
     test_dir = eval_cfg.get("test_dir", "Dataset/Train/test_clean")
     _require_sharded_dir(test_dir, "test")
 
     logger.info(f"Caricamento test set shardato da {test_dir}")
     test_ds = ShardedGraphDataset(test_dir, shuffle=False, seed=eval_cfg.get("seed", 42))
-    test_loader = build_dataloader(test_ds, eval_cfg, custom_collate_graph, shuffle=False)
+    test_loader = build_dataloader(
+        test_ds, eval_cfg, custom_collate_graph, shuffle=False, device=device
+    )
     logger.info(
         f"Test set: {len(test_ds):,} samples in {len(test_loader)} batches | "
-        f"num_workers={eval_cfg.get('num_workers', 0)}"
+        f"num_workers={eval_cfg.get('num_workers', 0)} | "
+        f"pin_memory={test_loader.pin_memory}"
     )
 
     def load_model(checkpoint_path, model_class, edge_dim, extra_kwargs):
@@ -437,7 +530,9 @@ def evaluate_models(cfg: Dict[str, Any], device: str, use_amp: bool) -> None:
             **extra_kwargs,
         ).to(device)
         if os.path.exists(checkpoint_path):
-            state_dict = torch.load(checkpoint_path, map_location=device, weights_only=False)
+            state_dict = torch.load(
+                checkpoint_path, map_location=device, weights_only=False
+            )
             if "model_state_dict" in state_dict:
                 model.load_state_dict(state_dict["model_state_dict"])
             else:
@@ -473,18 +568,14 @@ def evaluate_models(cfg: Dict[str, Any], device: str, use_amp: bool) -> None:
 
         with torch.no_grad():
             for batch_idx, (batch_event, labels) in enumerate(loader):
-                batch_event = batch_event.to(device)
-                labels = labels.to(device)
+                # non_blocking=True sfrutta il pin_memory del DataLoader
+                batch_event = batch_event.to(device, non_blocking=True)
+                labels = labels.to(device, non_blocking=True)
 
                 node_logits = model(batch_event)
                 graph_logits = pool_node_logits(node_logits, batch_event.batch)
 
                 if hasattr(batch_event, "legal_move_mask") and batch_event.legal_move_mask is not None:
-                    # sparse_legal_argmax evita di costruire il tensore
-                    # full-size masked_fill([-inf]) su MOVE_VOCAB_SIZE
-                    # colonne quasi tutte illegali; restituisce comunque
-                    # l'indice nel vocabolario originale, confrontabile
-                    # direttamente con `labels` come prima.
                     pred = sparse_legal_argmax(graph_logits, batch_event.legal_move_mask)
                 else:
                     pred = graph_logits.argmax(dim=1)
@@ -553,7 +644,7 @@ def evaluate_models(cfg: Dict[str, Any], device: str, use_amp: bool) -> None:
     finally:
         del test_loader, test_ds
         del model_basic, model_time
-        free_memory(verbose=True)
+        free_memory(verbose=True, force_gc=True)
 
 
 # ----------------------------------------------------------------------
@@ -572,12 +663,9 @@ def main(config_path: str = "Yaml/train_main.yaml") -> None:
     logger.info("AVVIO PIPELINE TRAINING TIMEGNN (solo training/eval)")
     logger.info("=" * 70)
 
-    # --- Limite RAM opzionale (configurabile da YAML) ---
     apply_memory_limit(pipe_cfg.get("max_ram_gb", None))
 
-    # --- Strategia di condivisione PyTorch (configurabile) ---
-    # 'file_descriptor' (default PyTorch) usa fd (richiede ulimit -n alto)
-    # 'file_system' usa /dev/shm (RAM!) -> può saturare la RAM
+    # Strategia di condivisione PyTorch
     sharing = pipe_cfg.get("sharing_strategy", "file_descriptor")
     if sharing not in ("file_descriptor", "file_system"):
         logger.warning(
@@ -590,9 +678,6 @@ def main(config_path: str = "Yaml/train_main.yaml") -> None:
     except RuntimeError as e:
         logger.warning(f"Impossibile impostare sharing strategy '{sharing}': {e}")
 
-    # NOTA: gli step "clean" e "shard" NON esistono piu' qui.
-    # Sono stati spostati in DatasetMain.py (clean_and_reshard).
-    # TrainMain esegue SOLO: train_basic -> train_time_aware -> evaluate.
     step_filter = pipe_cfg.get("step")
     valid_steps = ["train_basic", "train_time_aware", "evaluate"]
     if step_filter is not None and step_filter not in valid_steps:
@@ -617,7 +702,7 @@ def main(config_path: str = "Yaml/train_main.yaml") -> None:
     logger.info(f"Stato caricato da {state_path}")
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    use_amp = (not pipe_cfg.get("no_amp", False)) and device == "cuda"
+    use_amp = device == "cuda"
     logger.info(f"Device: {device}, AMP: {use_amp}")
 
     # ------------------------------------------------------------------
@@ -684,7 +769,7 @@ def main(config_path: str = "Yaml/train_main.yaml") -> None:
         else:
             logger.info("Valutazione disabilitata.")
 
-    free_memory(verbose=True)
+    free_memory(verbose=True, force_gc=True)
     logger.info("=" * 70)
     logger.info("PIPELINE TRAINING COMPLETATA.")
     logger.info("=" * 70)

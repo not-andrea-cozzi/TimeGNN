@@ -52,6 +52,8 @@ def build_dataloaders(args: argparse.Namespace):
     train_ds = ShardedGraphDataset(train_dir, shuffle=True, seed=args.seed)
     val_ds = ShardedGraphDataset(val_dir, shuffle=False, seed=args.seed)
 
+    use_cuda = torch.cuda.is_available() and getattr(args, "device", "cpu") != "cpu"
+
     train_loader = DataLoader(
         train_ds,
         batch_size=args.batch_size,
@@ -59,6 +61,8 @@ def build_dataloaders(args: argparse.Namespace):
         collate_fn=custom_collate_graph,
         num_workers=args.num_workers,
         persistent_workers=args.num_workers > 0,
+        pin_memory=use_cuda,
+        prefetch_factor=4 if args.num_workers > 0 else None,
     )
     val_loader = DataLoader(
         val_ds,
@@ -67,5 +71,7 @@ def build_dataloaders(args: argparse.Namespace):
         collate_fn=custom_collate_graph,
         num_workers=args.num_workers,
         persistent_workers=args.num_workers > 0,
+        pin_memory=use_cuda,
+        prefetch_factor=4 if args.num_workers > 0 else None,
     )
     return train_loader, train_ds, val_loader, val_ds
