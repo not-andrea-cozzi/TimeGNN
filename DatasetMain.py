@@ -63,14 +63,12 @@ def require_executable(path: str) -> None:
 # ShardWriter per lo split finale (streaming su disco)
 # ---------------------------------------------------------------------------
 class _ShardWriter:
-    """Accumula fino a `shard_size` record e li salva in <split>_<NNNNN>.pt.
-
-    RAM di picco: `shard_size` oggetti `Data`. Non materializza mai l'intero
-    split in memoria.
-    """
+    """Accumula fino a `shard_size` record e li salva in
+    <out_dir>/<split_name>/shard_NNNNN.pt."""
 
     def __init__(self, out_dir: str, split_name: str, shard_size: int) -> None:
-        self.out_dir = out_dir
+        self.split_dir = os.path.join(out_dir, split_name)
+        os.makedirs(self.split_dir, exist_ok=True)
         self.split_name = split_name
         self.shard_size = max(1, int(shard_size))
         self.buf: List[Any] = []
@@ -88,7 +86,7 @@ class _ShardWriter:
         if not self.buf:
             return
         import torch
-        path = os.path.join(self.out_dir, f"{self.split_name}_{self.shard_idx:05d}.pt")
+        path = os.path.join(self.split_dir, f"shard_{self.shard_idx:05d}.pt")
         tmp_path = path + ".tmp"
         torch.save(self.buf, tmp_path)
         os.replace(tmp_path, path)
@@ -98,10 +96,13 @@ class _ShardWriter:
 
     def close(self) -> List[str]:
         self._flush()
-        manifest = os.path.join(self.out_dir, f"{self.split_name}_index.json")
+        manifest = os.path.join(self.split_dir, "manifest.json")
         tmp_manifest = manifest + ".tmp"
         with open(tmp_manifest, "w", encoding="utf-8") as f:
-            json.dump({"files": self.files, "total": self.total}, f, indent=2)
+            json.dump(
+                {"num_shards": self.shard_idx, "shard_size": self.shard_size, "total": self.total},
+                f, indent=2,
+            )
         os.replace(tmp_manifest, manifest)
         return self.files
 
