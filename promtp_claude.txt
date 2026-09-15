@@ -1,0 +1,27 @@
+\goal: mi sistemi gli step 0 e 1 della pipeline di traingin di pulizia e ridivisione, in quanto ora nel DatasetMain.py non mi salva più il singolo file ma in tante shard. La pulizia deve essere sequenziale una sharda alla volta
+
+Guardo cosa c'è ora in CleanDataset.py e Sharding.py, e come DatasetMain.py/finalize_splits produce l'output attuale (shard, non più file monolitici).
+
+Situazione attuale: finalize_splits in DatasetMain.py scrive già train/val/test come shard (_ShardWriter, output in Dataset/Train/<split>/shard_NNNNN.pt + manifest.json), non più train.pt/val.pt/test.pt monolitici.
+
+Ma TrainMain.py step 0 (clean) e step 1 (shard) assumono ancora l'input vecchio:
+
+    clean_file (TrainPipeline/CleanDataset.py) fa torch.load(in_path) su un singolo .pt monolitico.
+    shard_split (TrainPipeline/Shard/Sharding.py) fa lo stesso: carica un intero .pt, poi lo spezza in shard.
+
+Con l'output nuovo di DatasetMain.py questi due step non hanno più un singolo file da caricare: hanno una cartella di shard già pronta. Quindi vanno riscritti così:
+
+    Step "clean" deve iterare gli shard di input uno alla volta (leggere manifest.json, per ogni shard_NNNNN.pt: torch.load, pulire i Data con _clean_chunk, scrivere lo shard pulito nella cartella di output, aggiornare un manifest di output), mai caricare tutto in RAM insieme.
+    Step "shard" a quel punto diventa superfluo come "ri-frammentazione da monolite", ma può restare utile per ri-shardare con una dimensione diversa (shard_size) — anche questo va fatto sharda-per-sharda, non ricaricando tutto.
+
+Prima di scrivere il codice, confermo l'interfaccia con te:
+
+    Path di input attesi per lo step "clean": Dataset/Train/<split>/shard_*.pt + manifest.json (l'output di finalize_splits)?
+    Vuoi che "clean" scriva output in una nuova cartella (es. Dataset/Train/<split>_clean/) mantenendo lo stesso shard_size di input, oppure vuoi unificare clean+reshard in un solo step che pulisce e contemporaneamente riscrive con lo shard_size di Yaml/train_main.yaml (shard.shard_size: 5900)?
+    Lo step "shard" separato lo elimino (dato che l'input è già shardato) o lo mantieni per permettere di cambiare shard_size dopo il clean?
+
+Q: Come vuoi gestire clean+shard rispetto al nuovo output già shardato di finalize_splits?
+A: Unisci clean e reshard in un solo step (pulisce e riscrive a shard_size target in un passaggio)
+
+Q: Dove deve scrivere l'output lo step clean?
+A: Nuove cartelle dedicate (es. Dataset/Train/train_clean/, val_clean/, test_clean/)

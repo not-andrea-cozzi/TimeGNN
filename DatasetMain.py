@@ -7,6 +7,8 @@ import os
 import sys
 from typing import Any, Dict, List, Optional
 
+from TrainPipeline.CleanDataset import clean_sharded_directory
+
 try:
     import yaml
 except ImportError:
@@ -59,6 +61,18 @@ def require_executable(path: str) -> None:
         raise ConfigError(f"Eseguibile non trovato o non eseguibile: {path}")
 
 
+def free_memory() -> None:
+    """Forza GC e svuota la cache CUDA se disponibile."""
+    import gc
+    gc.collect()
+    try:
+        import torch
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+    except Exception:
+        pass
+
+
 # ---------------------------------------------------------------------------
 # ShardWriter per lo split finale (streaming su disco)
 # ---------------------------------------------------------------------------
@@ -70,7 +84,7 @@ class _ShardWriter:
         self.split_dir = os.path.join(out_dir, split_name)
         os.makedirs(self.split_dir, exist_ok=True)
         self.split_name = split_name
-        self.shard_size = max(1, int(shard_size))
+        self.shard_size = max(15000, int(shard_size))
         self.buf: List[Any] = []
         self.shard_idx = 0
         self.files: List[str] = []
@@ -489,6 +503,105 @@ def _step_finalize_splits(
 
 
 # ---------------------------------------------------------------------------
+# STEP 5: clean + reshard  (step 0 della pipeline di training)
+# ---------------------------------------------------------------------------
+def _step_clean_and_reshard(
+    cfg: Dict[str, Any], state: PipelineState, dataset_dir: str,
+) -> Dict[str, Any]:
+    """
+    Legge le cartelle shardate prodotte da `finalize_splits`
+    (Dataset/Train/<split>/shard_*.pt + manifest.json), pulisce ogni Data
+    e riscrive in nuove cartelle dedicate (Dataset/Train/<split>_clean/)
+    con la dimensione target `clean.target_shard_size`.
+
+    Sequenziale, shard-by-shard: non carica mai l'intero dataset in RAM.
+    Idempotente: se lo stato dice 'done' e i manifest di output esistono, salta.
+    """
+    pipe_cfg = cfg.get("pipeline", {})
+    clean_cfg = cfg.get("clean", {})
+
+    if not clean_cfg.get("enabled", True):
+        logger.info("[clean] disabilitato da config: skip.")
+        return {}
+
+    # Input (output di finalize_splits)
+    in_train_dir = clean_cfg["input_dir_train"]
+    in_val_dir = clean_cfg["input_dir_val"]
+    in_test_dir = clean_cfg.get("input_dir_test")
+
+    # Output (nuove cartelle dedicate)
+    out_train_dir = clean_cfg["output_dir_train"]
+    out_val_dir = clean_cfg["output_dir_val"]
+    out_test_dir = clean_cfg.get("output_dir_test")
+
+    target_shard_size = int(clean_cfg.get("target_shard_size", 8000))
+    workers = int(clean_cfg.get("workers", 0))
+
+    # Pre-check: i manifest di input devono esistere
+    for d in [in_train_dir, in_val_dir] + ([in_test_dir] if in_test_dir else []):
+        manifest = os.path.join(d, "manifest.json")
+        if not os.path.exists(manifest):
+            raise ConfigError(f"[clean] Manifest di input non trovato: {manifest}")
+
+    def _is_ready() -> bool:
+        ready = (
+            os.path.exists(os.path.join(out_train_dir, "manifest.json"))
+            and os.path.exists(os.path.join(out_val_dir, "manifest.json"))
+        )
+        if out_test_dir:
+            ready = ready and os.path.exists(
+                os.path.join(out_test_dir, "manifest.json")
+            )
+        return ready
+
+    if state.is_done("clean", skip=pipe_cfg.get("force_recompute", False)) and _is_ready():
+        logger.info("[clean] Gia' completato: skip.")
+        return state.get_meta("clean")
+
+    logger.info("-" * 70)
+    logger.info("STEP 0: clean + reshard (shard-by-shard)")
+    logger.info("-" * 70)
+
+    try:
+        logger.info(f"[clean][train] {in_train_dir} -> {out_train_dir}")
+        m_train = clean_sharded_directory(
+            in_train_dir, out_train_dir, target_shard_size, workers
+        )
+        free_memory()
+
+        logger.info(f"[clean][val] {in_val_dir} -> {out_val_dir}")
+        m_val = clean_sharded_directory(
+            in_val_dir, out_val_dir, target_shard_size, workers
+        )
+        free_memory()
+
+        m_test: Dict[str, Any] = {}
+        if in_test_dir and out_test_dir:
+            logger.info(f"[clean][test] {in_test_dir} -> {out_test_dir}")
+            m_test = clean_sharded_directory(
+                in_test_dir, out_test_dir, target_shard_size, workers
+            )
+            free_memory()
+
+    except Exception as e:
+        state.mark_failed("clean", str(e))
+        raise
+
+    meta = {
+        "train_total": m_train.get("total", 0),
+        "train_shards": m_train.get("num_shards", 0),
+        "val_total": m_val.get("total", 0),
+        "val_shards": m_val.get("num_shards", 0),
+        "test_total": m_test.get("total", 0),
+        "test_shards": m_test.get("num_shards", 0),
+        "target_shard_size": target_shard_size,
+    }
+    state.mark_done("clean", **meta)
+    logger.info(f"[clean] Completato: {meta}")
+    return meta
+
+
+# ---------------------------------------------------------------------------
 # ORCHESTRAZIONE
 # ---------------------------------------------------------------------------
 def main(config_path: str) -> Dict[str, Any]:
@@ -500,7 +613,7 @@ def main(config_path: str) -> Dict[str, Any]:
     setup_logging(log_level, log_file)
 
     logger.info("=" * 70)
-    logger.info("DATASET PIPELINE (time_stats -> games -> puzzles -> finalize_splits)")
+    logger.info("DATASET PIPELINE (time_stats -> games -> puzzles -> finalize_splits -> clean)")
     logger.info("=" * 70)
 
     dataset_dir = pipe_cfg.get("dataset_dir", "Dataset")
@@ -515,10 +628,20 @@ def main(config_path: str) -> Dict[str, Any]:
     step = pipe_cfg.get("step") or "all"
     results: Dict[str, Any] = {}
 
-    steps_to_run = (
-        ["time_stats", "games_pipeline", "puzzle_pipeline", "finalize_splits"]
-        if step == "all" else [step]
-    )
+    all_steps = [
+        "time_stats",
+        "games_pipeline",
+        "puzzle_pipeline",
+        "finalize_splits",
+        "clean",              # <-- step 0 della pipeline di training
+    ]
+
+    if step == "all":
+        steps_to_run = all_steps
+    else:
+        if step not in all_steps:
+            raise ConfigError(f"pipeline.step sconosciuto: '{step}'. Validi: {all_steps}")
+        steps_to_run = [step]
 
     for s in steps_to_run:
         if s == "time_stats":
@@ -535,6 +658,10 @@ def main(config_path: str) -> Dict[str, Any]:
             results["finalize_splits"] = _step_finalize_splits(
                 cfg, state, dataset_dir, queue_state_path
             )
+        elif s == "clean":
+            results["clean"] = _step_clean_and_reshard(
+                cfg, state, dataset_dir
+            )
         else:
             raise ConfigError(f"pipeline.step sconosciuto: '{s}'")
 
@@ -546,7 +673,7 @@ def main(config_path: str) -> Dict[str, Any]:
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
-        description="Pipeline completa: time_stats -> games_pipeline -> puzzle_pipeline -> finalize_splits."
+        description="Pipeline completa: time_stats -> games_pipeline -> puzzle_pipeline -> finalize_splits -> clean."
     )
     parser.add_argument("--config", default="Yaml/dataset_main.yaml")
     args = parser.parse_args()

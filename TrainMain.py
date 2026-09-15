@@ -21,7 +21,6 @@ import torch.multiprocessing
 # Stato pipeline
 # ----------------------------------------------------------------------
 from DatasetPipeline.PipelineState import PipelineState, file_ready
-from TrainPipeline.Shard.Sharding import shard_split
 from TrainPipeline.Training.State import TrainState
 from TrainPipeline.Training.Loop import train_epoch, evaluate_epoch
 from TrainPipeline.Shard.ShardDataset import ShardedGraphDataset
@@ -30,7 +29,6 @@ from timegnn.models.gat_time_decay import DualGATTimeAwareModel
 from timegnn.data.pyg import custom_collate_graph
 from timegnn.train.early_stopping import EarlyStopping
 from Common.EvaluatorPlotter import EvaluatorPlotter
-from TrainPipeline.CleanDataset import clean_file
 from DatasetPipeline.Utils.position_pooling import pool_node_logits
 from Common.sparse_legal_moves import sparse_legal_argmax
 
@@ -128,7 +126,9 @@ def load_yaml_config(config_path: str) -> Dict[str, Any]:
 
 
 def validate_config(cfg: Dict[str, Any]) -> None:
-    required = ["pipeline", "clean", "shard", "train_basic", "train_time_aware", "evaluate"]
+    # Nota: 'clean' e 'shard' NON sono piu' step di TrainMain:
+    # vivono in DatasetMain.py (step clean_and_reshard).
+    required = ["pipeline", "train_basic", "train_time_aware", "evaluate"]
     for section in required:
         if section not in cfg:
             raise PipelineConfigError(f"Sezione mancante: '{section}'.")
@@ -150,7 +150,6 @@ def run_step(state: PipelineState, step_name: str, is_ready_fn, do_fn) -> None:
         logger.error(f"[FAILED] Step '{step_name}': {e}", exc_info=True)
         raise
     finally:
-        # Libera sempre la memoria dopo ogni step
         free_memory()
     elapsed = time.monotonic() - t0
     state.mark_done(step_name)
@@ -202,19 +201,33 @@ def build_dataloader(dataset, section: Dict[str, Any], collate_fn, shuffle: bool
     return DataLoader(**kwargs)
 
 
+def _require_sharded_dir(path: str, label: str) -> None:
+    """Verifica che `path` sia una cartella shardata con manifest.json."""
+    if not os.path.isdir(path):
+        raise PipelineConfigError(f"{label}: cartella non trovata: {path}")
+    manifest = os.path.join(path, "manifest.json")
+    if not os.path.exists(manifest):
+        raise PipelineConfigError(f"{label}: manifest.json non trovato in {path}")
+
+
 # ----------------------------------------------------------------------
 # Training (basic / time-aware)
 # ----------------------------------------------------------------------
 def run_training(
     cfg: Dict[str, Any],
     model_type: str,
-    shards_dir: str,
+    train_dir: str,
+    val_dir: str,
     checkpoint_base: str,
     device: str,
     use_amp: bool,
 ) -> None:
     section = cfg["train_basic"] if model_type == "basic" else cfg["train_time_aware"]
     logger.info(f"Avvio training {model_type} con configurazione: {section}")
+
+    # 0. Verifica input shardati
+    _require_sharded_dir(train_dir, "train")
+    _require_sharded_dir(val_dir, "val")
 
     # 1. Modello e dati ----------------------------------------------------
     if model_type == "basic":
@@ -225,9 +238,6 @@ def run_training(
         model_class = DualGATTimeAwareModel
         edge_dim = TIME_EDGE_DIM
         extra_kwargs = {"lambda_decay": float(section.get("lambda_decay", 0.01))}
-
-    train_dir = os.path.join(shards_dir, "train")
-    val_dir = os.path.join(shards_dir, "val")
 
     train_ds = ShardedGraphDataset(train_dir, shuffle=True, seed=section.get("seed", 42))
     val_ds = ShardedGraphDataset(val_dir, shuffle=False, seed=section.get("seed", 42))
@@ -396,25 +406,12 @@ def evaluate_models(cfg: Dict[str, Any], device: str, use_amp: bool) -> None:
         logger.info("Valutazione disabilitata.")
         return
 
-    test_path = eval_cfg["test_data"]
-    if not os.path.exists(test_path):
-        logger.warning(f"Test set non trovato: {test_path}. Salto la valutazione.")
-        return
+    # Test set shardato (output di clean_and_reshard in DatasetMain.py)
+    test_dir = eval_cfg.get("test_dir", "Dataset/Train/test_clean")
+    _require_sharded_dir(test_dir, "test")
 
-    logger.info(f"Caricamento test set da {test_path}")
-    test_data = torch.load(test_path, map_location="cpu", weights_only=False)
-
-    class SimpleTestDataset(torch.utils.data.Dataset):
-        def __init__(self, data_list):
-            self.data = data_list
-
-        def __len__(self):
-            return len(self.data)
-
-        def __getitem__(self, idx):
-            return self.data[idx]
-
-    test_ds = SimpleTestDataset(test_data)
+    logger.info(f"Caricamento test set shardato da {test_dir}")
+    test_ds = ShardedGraphDataset(test_dir, shuffle=False, seed=eval_cfg.get("seed", 42))
     test_loader = build_dataloader(test_ds, eval_cfg, custom_collate_graph, shuffle=False)
     logger.info(
         f"Test set: {len(test_ds):,} samples in {len(test_loader)} batches | "
@@ -554,7 +551,7 @@ def evaluate_models(cfg: Dict[str, Any], device: str, use_amp: bool) -> None:
             f"Valutazione completata. Output salvati in {eval_cfg['plots_dir']} e {eval_cfg['out_dir']}"
         )
     finally:
-        del test_loader, test_ds, test_data
+        del test_loader, test_ds
         del model_basic, model_time
         free_memory(verbose=True)
 
@@ -572,7 +569,7 @@ def main(config_path: str = "Yaml/train_main.yaml") -> None:
     log_config(cfg, "Configurazione pipeline")
 
     logger.info("=" * 70)
-    logger.info("AVVIO PIPELINE TRAINING TIMEGNN")
+    logger.info("AVVIO PIPELINE TRAINING TIMEGNN (solo training/eval)")
     logger.info("=" * 70)
 
     # --- Limite RAM opzionale (configurabile da YAML) ---
@@ -593,19 +590,20 @@ def main(config_path: str = "Yaml/train_main.yaml") -> None:
     except RuntimeError as e:
         logger.warning(f"Impossibile impostare sharing strategy '{sharing}': {e}")
 
+    # NOTA: gli step "clean" e "shard" NON esistono piu' qui.
+    # Sono stati spostati in DatasetMain.py (clean_and_reshard).
+    # TrainMain esegue SOLO: train_basic -> train_time_aware -> evaluate.
     step_filter = pipe_cfg.get("step")
-    valid_steps = ["clean", "shard", "train_basic", "train_time_aware", "evaluate"]
+    valid_steps = ["train_basic", "train_time_aware", "evaluate"]
     if step_filter is not None and step_filter not in valid_steps:
-        raise PipelineConfigError(f"'pipeline.step' non valido: {step_filter}")
+        raise PipelineConfigError(
+            f"'pipeline.step' non valido: {step_filter}. Validi: {valid_steps}"
+        )
 
     dataset_dir = pipe_cfg.get("dataset_dir", "Dataset")
-    shards_dir = os.path.join(
-        dataset_dir, pipe_cfg.get("shards_subfolder", "Train/shards")
-    )
     checkpoints_dir = os.path.join(
         dataset_dir, pipe_cfg.get("checkpoints_subfolder", "Train/checkpoints")
     )
-    os.makedirs(shards_dir, exist_ok=True)
     os.makedirs(checkpoints_dir, exist_ok=True)
 
     state_file = pipe_cfg.get("state_file", "train_pipeline_state.json")
@@ -623,98 +621,29 @@ def main(config_path: str = "Yaml/train_main.yaml") -> None:
     logger.info(f"Device: {device}, AMP: {use_amp}")
 
     # ------------------------------------------------------------------
-    # STEP 0: Clean dataset
-    # ------------------------------------------------------------------
-    if step_filter is None or step_filter == "clean":
-        clean_cfg = cfg.get("clean", {})
-        if clean_cfg.get("enabled", True):
-            logger.info("-" * 70)
-            logger.info("STEP 0/4: clean (rimozione campi superflui)")
-            logger.info("-" * 70)
-
-            in_train = clean_cfg["input_train"]
-            in_val = clean_cfg["input_val"]
-            in_test = clean_cfg.get("input_test", None)
-            out_train = clean_cfg["output_train"]
-            out_val = clean_cfg["output_val"]
-            out_test = clean_cfg.get("output_test", None)
-            workers = int(clean_cfg.get("workers", 1))
-
-            for f in [in_train, in_val] + ([in_test] if in_test else []):
-                if not os.path.exists(f):
-                    raise PipelineConfigError(f"File di input non trovato: {f}")
-
-            def _is_clean_ready():
-                ready = file_ready(out_train) and file_ready(out_val)
-                if out_test:
-                    ready = ready and file_ready(out_test)
-                return ready
-
-            def _do_clean():
-                logger.info(f"Pulizia train: {in_train} -> {out_train}")
-                clean_file(in_train, out_train, workers)
-                free_memory()
-                logger.info(f"Pulizia val: {in_val} -> {out_val}")
-                clean_file(in_val, out_val, workers)
-                free_memory()
-                if in_test and out_test:
-                    logger.info(f"Pulizia test: {in_test} -> {out_test}")
-                    clean_file(in_test, out_test, workers)
-                    free_memory()
-
-            run_step(state, "clean", _is_clean_ready, _do_clean)
-        else:
-            logger.info("clean disabilitato.")
-
-    # ------------------------------------------------------------------
-    # STEP 1: Sharding
-    # ------------------------------------------------------------------
-    if step_filter is None or step_filter == "shard":
-        shard_cfg = cfg["shard"]
-        train_clean = shard_cfg.get("train_clean", "Dataset/Train/train_clean.pt")
-        val_clean = shard_cfg.get("val_clean", "Dataset/Train/val_clean.pt")
-        shard_size = shard_cfg.get("shard_size", 8000)
-        train_shard_dir = os.path.join(shards_dir, "train")
-        val_shard_dir = os.path.join(shards_dir, "val")
-
-        def _is_shard_ready():
-            return file_ready(os.path.join(train_shard_dir, "manifest.json")) and file_ready(
-                os.path.join(val_shard_dir, "manifest.json")
-            )
-
-        def _do_shard():
-            logger.info(
-                f"Sharding train: {train_clean} -> {train_shard_dir} con shard_size={shard_size}"
-            )
-            shard_split(train_clean, train_shard_dir, shard_size)
-            free_memory()
-            logger.info(f"Sharding val: {val_clean} -> {val_shard_dir}")
-            shard_split(val_clean, val_shard_dir, shard_size)
-            free_memory()
-
-        run_step(state, "shard", _is_shard_ready, _do_shard)
-
-    # ------------------------------------------------------------------
-    # STEP 2: Train Basic
+    # STEP 1: Train Basic
     # ------------------------------------------------------------------
     if step_filter is None or step_filter == "train_basic":
         basic_cfg = cfg["train_basic"]
         if basic_cfg.get("enabled", True):
             checkpoint = basic_cfg.get("checkpoint", os.path.join(checkpoints_dir, "basic.pt"))
-            shards = basic_cfg.get("shards_dir", shards_dir)
+            train_dir = basic_cfg.get("train_dir", "Dataset/Train/train_clean")
+            val_dir = basic_cfg.get("val_dir", "Dataset/Train/val_clean")
 
             def _is_basic_ready():
                 return os.path.exists(checkpoint) and os.path.getsize(checkpoint) > 0
 
             def _do_basic():
-                run_training(cfg, "basic", shards, checkpoint, device, use_amp)
+                run_training(
+                    cfg, "basic", train_dir, val_dir, checkpoint, device, use_amp
+                )
 
             run_step(state, "train_basic", _is_basic_ready, _do_basic)
         else:
             logger.info("train_basic disabilitato.")
 
     # ------------------------------------------------------------------
-    # STEP 3: Train Time-Aware
+    # STEP 2: Train Time-Aware
     # ------------------------------------------------------------------
     if step_filter is None or step_filter == "train_time_aware":
         time_cfg = cfg["train_time_aware"]
@@ -722,20 +651,23 @@ def main(config_path: str = "Yaml/train_main.yaml") -> None:
             checkpoint = time_cfg.get(
                 "checkpoint", os.path.join(checkpoints_dir, "time_aware.pt")
             )
-            shards = time_cfg.get("shards_dir", shards_dir)
+            train_dir = time_cfg.get("train_dir", "Dataset/Train/train_clean")
+            val_dir = time_cfg.get("val_dir", "Dataset/Train/val_clean")
 
             def _is_time_ready():
                 return os.path.exists(checkpoint) and os.path.getsize(checkpoint) > 0
 
             def _do_time():
-                run_training(cfg, "time_aware", shards, checkpoint, device, use_amp)
+                run_training(
+                    cfg, "time_aware", train_dir, val_dir, checkpoint, device, use_amp
+                )
 
             run_step(state, "train_time_aware", _is_time_ready, _do_time)
         else:
             logger.info("train_time_aware disabilitato.")
 
     # ------------------------------------------------------------------
-    # STEP 4: Evaluation & Plots
+    # STEP 3: Evaluation & Plots
     # ------------------------------------------------------------------
     if step_filter is None or step_filter == "evaluate":
         eval_cfg = cfg["evaluate"]
@@ -754,7 +686,7 @@ def main(config_path: str = "Yaml/train_main.yaml") -> None:
 
     free_memory(verbose=True)
     logger.info("=" * 70)
-    logger.info("PIPELINE COMPLETATA.")
+    logger.info("PIPELINE TRAINING COMPLETATA.")
     logger.info("=" * 70)
 
 

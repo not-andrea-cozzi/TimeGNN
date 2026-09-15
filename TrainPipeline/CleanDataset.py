@@ -1,39 +1,29 @@
+# TrainPipeline/CleanDataset.py
 from __future__ import annotations
 
-import argparse
 import gc
+import json
 import logging
 import os
 import time
-from concurrent.futures import ProcessPoolExecutor
-from typing import List
+from typing import Any, Dict, List
 
 import torch
 from torch_geometric.data import Data
 
 from Common.progress import wrap_iter
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-)
-logger = logging.getLogger("step0_clean")
+logger = logging.getLogger("clean")
 
 KEEP_FIELDS = (
-    "event_ids",
-    "x",
-    "edge_index",
-    "edge_attr",
-    "time",
-    "y",
-    "legal_move_mask",
-    "position_mate_n",
-    "num_nodes",
+    "event_ids", "x", "edge_index", "edge_attr",
+    "time", "y", "legal_move_mask", "position_mate_n", "num_nodes",
 )
+SHARD_FILENAME_TEMPLATE = "shard_{:05d}.pt"
+MANIFEST_FILENAME = "manifest.json"
 
 
 def _clean_single(data: Data) -> Data:
-    """Ritorna un nuovo Data con solo i campi in KEEP_FIELDS."""
     cleaned = Data()
     for key in KEEP_FIELDS:
         if hasattr(data, key):
@@ -47,98 +37,96 @@ def _clean_chunk(chunk: List[Data]) -> List[Data]:
     return [_clean_single(d) for d in chunk]
 
 
-def _chunkify(items: List[Data], n_chunks: int) -> List[List[Data]]:
-    if n_chunks <= 1 or len(items) == 0:
-        return [items]
-    size = max(1, (len(items) + n_chunks - 1) // n_chunks)
-    return [items[i : i + size] for i in range(0, len(items), size)]
+def _read_manifest(in_dir: str) -> Dict[str, Any]:
+    manifest_path = os.path.join(in_dir, MANIFEST_FILENAME)
+    if not os.path.exists(manifest_path):
+        raise FileNotFoundError(f"Manifest non trovato: {manifest_path}")
+    with open(manifest_path, "r", encoding="utf-8") as f:
+        return json.load(f)
 
 
-def clean_file(in_path: str, out_path: str, workers: int = 0) -> int:
+def clean_sharded_directory(
+    in_dir: str,
+    out_dir: str,
+    target_shard_size: int = 8000,
+    workers: int = 0,
+) -> Dict[str, Any]:
     """
-    Carica in_path, pulisce ogni Data e salva in out_path.
-    Ritorna il numero di Data processati.
-
-    Se workers <= 0 (default), la pulizia avviene in SINGOLO processo,
-    senza ProcessPoolExecutor: questo evita la condivisione di memoria
-    tra processi e il conseguente errore
-    'unable to open shared memory object ... Too many open files'.
-
-    Se workers >= 1, usa il multiprocessing (richiede un limite di
-    file aperti adeguato: `ulimit -n 8192`).
+    Legge gli shard di input uno alla volta, pulisce ogni Data con `_clean_chunk`,
+    accumula in un buffer e riscrive in nuovi shard di `target_shard_size` nella
+    cartella di output. Sequenziale, shard-by-shard, RAM costante.
     """
-    basename = os.path.basename(in_path)
+    manifest_in = _read_manifest(in_dir)
+    num_input_shards = manifest_in["num_shards"]
 
-    # ------------------------------------------------------------------
-    # 1. Caricamento
-    # ------------------------------------------------------------------
-    logger.info(f"[{basename}] Caricamento...")
-    t0 = time.monotonic()
-    data_list: List[Data] = torch.load(in_path, weights_only=False)
+    os.makedirs(out_dir, exist_ok=True)
+
+    buffer: List[Data] = []
+    output_shard_idx = 0
+    total_cleaned = 0
+
     logger.info(
-        f"[{basename}] {len(data_list):,} Data caricati in "
-        f"{time.monotonic() - t0:.2f}s."
+        f"[{os.path.basename(in_dir)}] Input: {num_input_shards} shard, "
+        f"target_shard_size={target_shard_size}"
     )
 
-    # ------------------------------------------------------------------
-    # 2. Pulizia
-    # ------------------------------------------------------------------
-    t0 = time.monotonic()
-    cleaned: List[Data] = []
+    for shard_i in wrap_iter(
+        range(num_input_shards),
+        desc=f"[{os.path.basename(in_dir)}] Elaborazione shard",
+        unit="shard",
+    ):
+        in_path = os.path.join(in_dir, SHARD_FILENAME_TEMPLATE.format(shard_i))
+        if not os.path.exists(in_path):
+            raise FileNotFoundError(f"Shard di input non trovato: {in_path}")
 
-    if workers is None or workers <= 0:
-        # --- Singolo processo: nessuna shared memory, nessun fd aperto ---
-        logger.info(f"[{basename}] Pulizia in singolo processo (workers={workers}).")
-        chunk_size = 2000
-        total = len(data_list)
-        for i in wrap_iter(
-            range(0, total, chunk_size),
-            desc=f"[{basename}] Pulizia",
-            unit="chunk",
-            total=(total + chunk_size - 1) // chunk_size,
-        ):
-            chunk = data_list[i : i + chunk_size]
-            cleaned.extend(_clean_chunk(chunk))
-            del chunk
-            gc.collect()
-        # libera la lista originale per ridurre la RAM
+        data_list: List[Data] = torch.load(in_path, weights_only=False)
+        cleaned = _clean_chunk(data_list)
         del data_list
         gc.collect()
-    else:
-        # --- Multiprocessing (sconsigliato su dataset grandi) ---
-        logger.info(f"[{basename}] Pulizia con {workers} worker.")
-        chunks = _chunkify(data_list, workers)
-        with ProcessPoolExecutor(max_workers=workers) as pool:
-            for result in wrap_iter(
-                pool.map(_clean_chunk, chunks),
-                desc=f"[{basename}] Pulizia chunk",
-                unit="chunk",
-                total=len(chunks),
-            ):
-                cleaned.extend(result)
-        del data_list, chunks
+
+        buffer.extend(cleaned)
+        total_cleaned += len(cleaned)
+        del cleaned
         gc.collect()
 
+        while len(buffer) >= target_shard_size:
+            chunk = buffer[:target_shard_size]
+            del buffer[:target_shard_size]
+
+            out_path = os.path.join(
+                out_dir, SHARD_FILENAME_TEMPLATE.format(output_shard_idx)
+            )
+            tmp_path = out_path + ".tmp"
+            torch.save(chunk, tmp_path)
+            os.replace(tmp_path, out_path)
+            output_shard_idx += 1
+            del chunk
+            gc.collect()
+
+    if buffer:
+        out_path = os.path.join(
+            out_dir, SHARD_FILENAME_TEMPLATE.format(output_shard_idx)
+        )
+        tmp_path = out_path + ".tmp"
+        torch.save(buffer, tmp_path)
+        os.replace(tmp_path, out_path)
+        output_shard_idx += 1
+        del buffer
+        gc.collect()
+
+    manifest_out = {
+        "num_shards": output_shard_idx,
+        "shard_size": target_shard_size,
+        "total": total_cleaned,
+    }
+    manifest_path = os.path.join(out_dir, MANIFEST_FILENAME)
+    tmp_manifest = manifest_path + ".tmp"
+    with open(tmp_manifest, "w", encoding="utf-8") as f:
+        json.dump(manifest_out, f, indent=2)
+    os.replace(tmp_manifest, manifest_path)
+
     logger.info(
-        f"[{basename}] Pulizia completata in {time.monotonic() - t0:.2f}s "
-        f"({len(cleaned):,} Data, campi tenuti={KEEP_FIELDS})."
+        f"[{os.path.basename(in_dir)}] Completato: {output_shard_idx} shard "
+        f"({total_cleaned:,} Data) -> '{out_dir}'"
     )
-
-    # ------------------------------------------------------------------
-    # 3. Salvataggio atomico
-    # ------------------------------------------------------------------
-    os.makedirs(os.path.dirname(os.path.abspath(out_path)) or ".", exist_ok=True)
-    tmp_path = out_path + ".tmp"
-    torch.save(cleaned, tmp_path)
-    os.replace(tmp_path, out_path)
-    size_mb = os.path.getsize(out_path) / (1024 * 1024)
-    logger.info(f"[{basename}] Salvato '{out_path}' ({size_mb:.2f} MB).")
-
-    # Salva la lunghezza PRIMA di liberare la lista
-    n_cleaned = len(cleaned)
-    del cleaned
-    gc.collect()
-
-    return n_cleaned
-
-
+    return manifest_out

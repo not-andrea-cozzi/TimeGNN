@@ -7,7 +7,7 @@ pipeline:
   log_level: "INFO"
   log_file: "Dataset/train_pipeline.log"
   step: null               # valori: "clean", "shard", "train_basic", "train_time_aware", "evaluate"
-  no_amp: true
+  no_amp: false
 
 clean:
   enabled: true
