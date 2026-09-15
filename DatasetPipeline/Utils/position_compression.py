@@ -5,7 +5,8 @@ from typing import Dict, Optional
 import torch
 from torch_geometric.data import Data
 
-_COMPRESSIBLE_FLOAT_BINARY_FIELDS = ("x", "edge_attr")
+_COMPRESSIBLE_FLOAT_BINARY_FIELDS = ("edge_attr",)
+_MIXED_BINARY_PLUS_CONTINUOUS_FIELD = "x"
 _COMPRESSIBLE_LONG_SMALLINT_FIELD = "event_ids"
 _COMPRESSIBLE_CONSTANT_EDGE_FIELD = "time"
 
@@ -64,37 +65,6 @@ def _compress_time_per_edge_type(
     time_tensor: torch.Tensor,
     edge_attr: torch.Tensor,
 ) -> Dict[int, float]:
-    """Comprime `time` assumendo che sia costante ENTRO ciascun tipo di
-    arco (colonna di edge_attr), non necessariamente su tutta la board.
-
-    FIX: la versione precedente (_assert_constant_along_edges applicata
-    all'intero tensore time) assumeva un unico scalare per l'intera
-    board, coerente con build_position_data quando time e' scritto come
-    torch.full((E,), clock_seconds). Da quando
-    DatasetPipeline.Utils.time_edge_weighting.apply_edge_type_time_weighting
-    puo' scalare time per un fattore diverso a seconda del tipo di arco
-    (legal_move/attack/pin), time non e' piu' necessariamente costante
-    sull'intera board — ma resta costante DENTRO ciascun tipo di arco
-    (tutti gli archi 'legal_move' condividono lo stesso valore, idem per
-    'attack' e 'pin'). Questa funzione comprime rispettando quella
-    struttura piu' fine, invece di rifiutare la compressione.
-
-    Args:
-        time_tensor: shape [E].
-        edge_attr: shape [E, NUM_EDGE_TYPES], one-hot del tipo di arco
-            (da encode_edge_type_onehot in PositionGraphSchema.py).
-
-    Returns:
-        Dizionario {edge_type_id: valore_costante_per_quel_tipo}, con
-        una entry solo per i tipi di arco effettivamente presenti sulla
-        board (un tipo assente non compare, invece di essere forzato a
-        0.0, per non confondere "tipo assente" con "tempo zero").
-
-    Raises:
-        ValueError: se time non e' costante DENTRO uno stesso tipo di
-            arco. Stesso principio "nessun fallback silenzioso" delle
-            altre funzioni _assert_* del modulo.
-    """
     edge_type_ids = edge_attr.argmax(dim=1)
     time_by_type: Dict[int, float] = {}
 
@@ -117,47 +87,50 @@ def _compress_time_per_edge_type(
     return time_by_type
 
 
+def _compress_x_mixed(x: torch.Tensor) -> Data:
+    """Comprime `x` [64, NUM_EVENT_FEATURES] separando le colonne
+    strettamente binarie (occupancy: is_occupied_by_mover,
+    is_occupied_by_opponent) dall'ultima colonna continua (clock_norm,
+    aggiunta da PositionGraphSchema per portare il clock come node
+    feature esplicita). FIX: la versione precedente trattava l'intero
+    tensore x come binario e falliva non appena clock_norm (in [0,1]
+    ma non ristretto a {0,1}) compariva tra le colonne.
+
+    Assunzione: le prime N-1 colonne sono binarie, l'ultima e' continua.
+    Se x ha esattamente 2 colonne (schema legacy senza clock_norm),
+    si comprime tutto a bool come prima (nessuna colonna continua).
+    """
+    num_cols = x.shape[1] if x.dim() == 2 else 0
+    if num_cols <= 2:
+        _assert_strictly_binary(x, "x")
+        return {"x": x.to(torch.bool)}
+
+    binary_part = x[:, :-1]
+    continuous_part = x[:, -1:]
+    _assert_strictly_binary(binary_part, "x[:, :-1] (occupancy)")
+
+    return {
+        "x_binary": binary_part.to(torch.bool),
+        "x_continuous": continuous_part.to(torch.float32),
+    }
+
+
 def compress_position_data(data: Data, mate_n: Optional[int] = None) -> Data:
     """Ritorna una NUOVA Data con storage compatto, lossless, per lo shard
     su disco. Non modifica l'oggetto passato in input.
-
-    Args:
-        data: Data prodotto da PositionGraphSchema.build_position_data
-            (eventualmente post-processato da
-            DatasetPipeline.Utils.time_edge_weighting.apply_edge_type_time_weighting),
-            o comunque con gli stessi campi/shape/dtype attesi.
-        mate_n: opzionale, profondita' di matto della finestra di
-            provenienza. Se fornito, salvato come attributo uint8
-            aggiuntivo `mate_n` sul Data compresso (metadato puro, mai
-            letto dai modelli).
-
-    Returns:
-        Nuova Data con event_ids:uint8, x:bool, edge_attr:bool (se
-        presenti), time compresso in FORMA COMPATTA per-tipo-di-arco
-        (vedi _compress_time_per_edge_type: al posto dello scalare [1]
-        della versione precedente, un attributo `time_by_edge_type`
-        contenente al massimo NUM_EDGE_TYPES coppie (tipo, valore) —
-        vedi decompress_position_data per la ricostruzione),
-        legal_move_mask:bool invariato (se presente). Tutti gli altri
-        campi sono copiati invariati.
-
-    Raises:
-        ValueError: se un campo non rientra nel dominio atteso per la
-            compressione lossless (vedi _assert_* sopra). Nessun fallback
-            silenzioso: la pipeline deve fermarsi su un'assunzione violata.
     """
     compressed = Data()
     time_value = None
     edge_attr_value = None
 
-    # Prima passata: raccogli time/edge_attr grezzi (servono insieme per
-    # la compressione per-tipo-arco), copia tutto il resto invariato o
-    # con le regole esistenti.
     for key, value in data:
         if key == _COMPRESSIBLE_CONSTANT_EDGE_FIELD and torch.is_tensor(value):
             time_value = value
-            continue  # gestito dopo, richiede edge_attr
-        if key in _PASSTHROUGH_BOOL_FIELDS and torch.is_tensor(value):
+            continue
+        if key == _MIXED_BINARY_PLUS_CONTINUOUS_FIELD and torch.is_tensor(value):
+            for out_key, out_value in _compress_x_mixed(value).items():
+                compressed[out_key] = out_value
+        elif key in _PASSTHROUGH_BOOL_FIELDS and torch.is_tensor(value):
             compressed[key] = value.to(torch.bool)
         elif key == _COMPRESSIBLE_LONG_SMALLINT_FIELD and torch.is_tensor(value):
             _assert_fits_uint8(value, key)
@@ -172,9 +145,6 @@ def compress_position_data(data: Data, mate_n: Optional[int] = None) -> Data:
 
     if time_value is not None:
         if edge_attr_value is None:
-            # Nessun edge_attr disponibile (Data non scacchistico, schema
-            # diverso): ricade sul comportamento originale, un unico
-            # scalare per l'intera board.
             scalar_value = _assert_constant_along_edges(time_value, _COMPRESSIBLE_CONSTANT_EDGE_FIELD)
             compressed.time = torch.tensor([scalar_value], dtype=torch.float32)
         else:
@@ -197,22 +167,7 @@ def compress_position_data(data: Data, mate_n: Optional[int] = None) -> Data:
 
 
 def decompress_position_data(data: Data) -> Data:
-    """Inversa esatta di compress_position_data: ritorna una NUOVA Data
-    con gli stessi dtype/shape dell'originale passato a
-    PositionGraphSchema.build_position_data (long/float/float[E]/bool),
-    con `time` ricostruito per-arco a partire dalla forma compatta
-    per-tipo-arco scritta da compress_position_data.
-
-    Il numero di archi E e' letto da edge_index.shape[1]: se edge_index
-    manca o e' vuoto, `time` viene lasciato con shape [1] o [0] a seconda
-    del formato in cui era stato compresso (vedi rami sotto).
-
-    Idempotente su Data non compresse: se un campo e' gia' nel dtype
-    atteso (es. proviene da un builder futuro che scrive gia' float), il
-    cast e' un no-op equivalente. Gestisce ANCHE i Data compressi con il
-    vecchio formato a scalare singolo (attributo `time` shape [1]), per
-    retrocompatibilita' con shard scritti prima di questo fix.
-    """
+    """Inversa esatta di compress_position_data."""
     decompressed = Data()
     num_edges: Optional[int] = None
 
@@ -220,21 +175,25 @@ def decompress_position_data(data: Data) -> Data:
         num_edges = data.edge_index.shape[1]
 
     has_new_format_time = hasattr(data, "time_by_edge_type_ids") and hasattr(data, "time_by_edge_type_values")
+    has_mixed_x = hasattr(data, "x_binary") and hasattr(data, "x_continuous")
 
     for key, value in data:
         if key == "mate_n":
             continue
         if key in ("time_by_edge_type_ids", "time_by_edge_type_values"):
-            continue  # ricostruiti sotto in un unico attributo `time`
+            continue
+        if key in ("x_binary", "x_continuous"):
+            continue
         if key in _PASSTHROUGH_BOOL_FIELDS and torch.is_tensor(value):
             decompressed[key] = value.to(torch.bool)
         elif key == _COMPRESSIBLE_LONG_SMALLINT_FIELD and torch.is_tensor(value):
             decompressed[key] = value.to(torch.long)
+        elif key == _MIXED_BINARY_PLUS_CONTINUOUS_FIELD and torch.is_tensor(value):
+            # formato legacy: x gia' presente non compresso in parti
+            decompressed[key] = value.to(torch.float32)
         elif key in _COMPRESSIBLE_FLOAT_BINARY_FIELDS and torch.is_tensor(value):
             decompressed[key] = value.to(torch.float32)
         elif key == _COMPRESSIBLE_CONSTANT_EDGE_FIELD and torch.is_tensor(value):
-            # Vecchio formato (scalare singolo [1]): mantenuto per
-            # retrocompatibilita' con shard scritti prima di questo fix.
             if not has_new_format_time:
                 if num_edges is not None and num_edges > 0:
                     decompressed[key] = torch.full(
@@ -244,6 +203,11 @@ def decompress_position_data(data: Data) -> Data:
                     decompressed[key] = value.to(torch.float32)
         else:
             decompressed[key] = value
+
+    if has_mixed_x:
+        x_binary = data.x_binary.to(torch.float32)
+        x_continuous = data.x_continuous.to(torch.float32)
+        decompressed.x = torch.cat([x_binary, x_continuous], dim=1)
 
     if has_new_format_time:
         edge_attr = getattr(decompressed, "edge_attr", None)

@@ -16,15 +16,15 @@ engine:
 
 games_pipeline:
   sources:
-    - path: "RawData/lichess_db_standard_rated_2020-01.pgn.zst"
-      tag: "lichess_games_00"
-      skip_games: 0
-      max_games: 100000
-
-    #- path: "RawData/ficsgamesdb_2018_standard2000_movetimes_4339956.pgn"
-    #  tag: "games_2018_standard2000_01"
+    #- path: "RawData/lichess_db_standard_rated_2020-01.pgn.zst"
+    #  tag: "lichess_games_06"
     #  skip_games: 0
-    #  max_games: 50000
+    #  max_games: 100000
+
+    - path: "RawData/ficsgamesdb_2018_standard2000_movetimes_4339956.pgn"
+      tag: "games_2018_standard2000_02"
+      skip_games: 0
+      max_games: 50000
 
   split_train_ratio: 0.65
   split_val_ratio: 0.15

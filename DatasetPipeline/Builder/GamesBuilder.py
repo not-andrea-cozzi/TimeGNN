@@ -471,6 +471,19 @@ class GamesBuilder:
         return None
 
     def _worker(self, args: Tuple[int, str, str, str]) -> Tuple[int, str, bytes]:
+        """
+        FIX: l'intero corpo era gia' avvolto in un unico try/except Exception
+        che ritornava silenziosamente `records` parziali in caso di errore
+        a meta' partita — quello resta. La modifica qui e' aggiungere un
+        secondo livello di try/except attorno all'INIZIO della funzione
+        (parsing header/game), perche' un game_id o pgn_text corrotto in
+        ingresso poteva propagare un'eccezione NON catturata fuori dal
+        try esistente (che iniziava dopo il parsing), facendo fallire
+        imap_unordered lato padre con un'eccezione non gestita — questo e'
+        il candidato piu' probabile per il crash silenzioso osservato in
+        run(), dato che il padre logga solo "Errore durante l'analisi"
+        senza mai vedere il traceback originale del worker.
+        """
         global _engine
         cfg = self.config
         game_id, pgn_text, source_tag, resume_key = args
@@ -478,8 +491,15 @@ class GamesBuilder:
         empty_payload = encode_for_ipc([])
         if _engine is None: return game_id, resume_key, empty_payload
 
-        pgn_io = io.StringIO(pgn_text)
-        headers = chess.pgn.read_headers(pgn_io)
+        try:
+            pgn_io = io.StringIO(pgn_text)
+            headers = chess.pgn.read_headers(pgn_io)
+        except Exception as e:
+            logger.warning(
+                "[GamesBuilder] Worker: PGN illeggibile per game_id locale=%s (%s: %s), partita scartata.",
+                game_id, type(e).__name__, e,
+            )
+            return game_id, resume_key, empty_payload
 
         if headers is None or headers.get("Variant", "Standard").lower() not in ("standard", "normal"):
             return game_id, resume_key, empty_payload
@@ -642,10 +662,30 @@ class GamesBuilder:
                 records.append({"data": data, "debug": debug_entry})
                 node = next_node
 
-        except Exception:
-            pass
+        except Exception as e:
+            logger.warning(
+                "[GamesBuilder] Worker: eccezione durante l'analisi di game_id=%s (%s: %s); "
+                "partita troncata, %d posizioni gia' raccolte mantenute.",
+                full_game_id, type(e).__name__, e, len(records),
+                exc_info=True,
+            )
 
-        return game_id, resume_key, encode_for_ipc(records)
+        try:
+            payload = encode_for_ipc(records)
+        except Exception as e:
+            # FIX: se la serializzazione IPC stessa fallisce (es. un
+            # tensore corrotto/non serializzabile in uno dei record), non
+            # deve far esplodere l'intero worker/pool: si scarta la
+            # partita e si ritorna un payload vuoto, loggando il motivo.
+            logger.error(
+                "[GamesBuilder] Worker: impossibile serializzare i risultati per game_id=%s "
+                "(%s: %s); partita scartata (%d posizioni perse).",
+                full_game_id, type(e).__name__, e, len(records),
+                exc_info=True,
+            )
+            payload = empty_payload
+
+        return game_id, resume_key, payload
 
     def _open_pgn_text_stream(self, path: str, kind: str):
         if kind == "lichess":
@@ -760,6 +800,13 @@ class GamesBuilder:
         mate_n_counts: Dict[int, int] = defaultdict(int)
         source_counts: Dict[str, int] = defaultdict(int)
         clock_source_counts: Dict[str, int] = defaultdict(int)
+        # FIX: contatore di game "processati" (dal Pool) su cui e' fallita
+        # la gestione lato PADRE (decode payload, enqueue, ecc.), separato
+        # dagli errori lato worker (gia' gestiti dentro _worker). Prima
+        # un'eccezione qui abortiva l'intera run(); ora viene isolata per
+        # singolo game e la run prosegue, ma il conteggio resta visibile
+        # nel riepilogo finale cosi' non sparisce silenziosamente.
+        skipped_games_on_parent_error = 0
 
         pool = mp.Pool(
             processes=self._workers,
@@ -856,36 +903,80 @@ class GamesBuilder:
                         cfg.flush_every_seconds,
                     )
 
-                records: List[Dict[str, Any]] = decode_from_ipc(payload)
+                # FIX: tutto il corpo di gestione del singolo risultato e'
+                # ora avvolto in un try/except isolato. Prima, una singola
+                # eccezione qui dentro (es. decode_from_ipc corrotto,
+                # PositionQueueError da enqueue, KeyError su debug_entry)
+                # si propagava FUORI dal for loop, veniva presa dal blocco
+                # `except Exception:` esterno di run() e abortiva l'INTERA
+                # estrazione (100.000 game), con il pool ucciso a forza e
+                # il solo messaggio generico "Errore durante l'analisi"
+                # stampato — nessun traceback, nessuna indicazione di quale
+                # game avesse causato il problema. Ora l'errore e' isolato
+                # al singolo game: viene loggato con traceback completo e
+                # la run prosegue sul prossimo risultato.
+                try:
+                    records: List[Dict[str, Any]] = decode_from_ipc(payload)
+                except Exception:
+                    skipped_games_on_parent_error += 1
+                    logger.error(
+                        "[GamesBuilder] decode_from_ipc fallito per resume_key=%s "
+                        "(game processato #%d): payload scartato, run() continua.",
+                        resume_key, processed_games,
+                        exc_info=True,
+                    )
+                    continue
+
                 if not records:
                     continue
 
-                accepted_games += 1
+                try:
+                    accepted_games += 1
 
-                for rec in records:
-                    data = rec["data"]
-                    debug_entry = rec["debug"]
-                    group_key = debug_entry["mate_n_window"]
+                    for rec in records:
+                        data = rec["data"]
+                        debug_entry = rec["debug"]
+                        group_key = debug_entry["mate_n_window"]
 
-                    self._registry.enqueue(
-                        source_tag=debug_entry["source"],
-                        data=data,
-                        group_key=group_key,
+                        self._registry.enqueue(
+                            source_tag=debug_entry["source"],
+                            data=data,
+                            group_key=group_key,
+                        )
+                        enqueued_positions += 1
+
+                        source_counts[debug_entry["source"]] += 1
+                        clock_source_counts[debug_entry["clock_source"]] += 1
+                        mate_n_counts[debug_entry["mate_n"]] += 1
+
+                        if cfg.save_debug_jsonl:
+                            self._debug_records.append(debug_entry)
+                except Exception:
+                    skipped_games_on_parent_error += 1
+                    logger.error(
+                        "[GamesBuilder] Errore nell'enqueue dei record per resume_key=%s "
+                        "(game processato #%d): questo game viene scartato, run() continua.",
+                        resume_key, processed_games,
+                        exc_info=True,
                     )
-                    enqueued_positions += 1
-
-                    source_counts[debug_entry["source"]] += 1
-                    clock_source_counts[debug_entry["clock_source"]] += 1
-                    mate_n_counts[debug_entry["mate_n"]] += 1
-
-                    if cfg.save_debug_jsonl:
-                        self._debug_records.append(debug_entry)
+                    continue
 
         except KeyboardInterrupt:
             print("\n[WARNING] Interruzione richiesta: arresto forzato dei worker in corso...")
             _shutdown_pool(graceful_first=False)
             raise
         except Exception:
+            # FIX: prima si stampava solo un print() generico senza
+            # traceback, quindi la causa reale del crash restava invisibile
+            # nel log. Ora logger.exception() scrive lo stack trace
+            # completo (tipo eccezione, messaggio, file/riga) sia su
+            # console che nel log file, se configurato in logging.basicConfig
+            # a monte (vedi setup_logging in BuildGamesShard.py/DatasetMain.py).
+            logger.exception(
+                "[GamesBuilder] Errore FATALE e non recuperabile durante l'analisi "
+                "(fuori dal loop principale, non isolabile per singolo game): "
+                "arresto forzato dei worker in corso."
+            )
             print("\n[WARNING] Errore durante l'analisi: arresto forzato dei worker in corso...")
             _shutdown_pool(graceful_first=False)
             raise
@@ -901,6 +992,13 @@ class GamesBuilder:
         if self.config.save_debug_jsonl and self._debug_records_raw_path:
             self._persist_pending_debug_records()
 
+        if skipped_games_on_parent_error:
+            logger.warning(
+                "[GamesBuilder] %d game scartati per errori lato padre (decode/enqueue) "
+                "durante questa run: vedi i log ERROR sopra per i dettagli per singolo game.",
+                skipped_games_on_parent_error,
+            )
+
         return {
             "processed_games": processed_games,
             "accepted_games": accepted_games,
@@ -908,6 +1006,7 @@ class GamesBuilder:
             "mate_n_counts": dict(mate_n_counts),
             "source_counts": dict(source_counts),
             "clock_source_counts": dict(clock_source_counts),
+            "skipped_games_on_parent_error": skipped_games_on_parent_error,
         }
 
     def _persist_pending_debug_records(self) -> None:
@@ -996,4 +1095,4 @@ class GamesBuilder:
                 len(missing_game_ids),
             )
 
-        return self._debug_jsonl_paths
+        return self._debug_jsonl_path
