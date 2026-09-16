@@ -1,173 +1,127 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
-from typing import List, Optional
-
-import numpy as np
-import pandas as pd
 import torch
 import torch.nn as nn
-from torch.utils.data import DataLoader
-
-from ..data.encoding import (
-    encode_label_event,
-    encode_pad_event,
-    encode_pad_sequence,
-    event_transition_edge,
-    length_stratified_split,
-    node_time_list,
-    scale_time_differences_fast_fixed,
-)
-from ..data.pyg import CustomDataset, custom_collate_fn, prepare_data_core_2edges, prepare_data_y
-from ..models.gat_status_emb import DualGAT2EdgesModel
-from ..models.training import train_epoch, evaluate_epoch
-from ..train.early_stopping import EarlyStopping
-from .utils import resolve_config, build_sequence_table
+import torch.nn.functional as F
+from torch_geometric.nn import GATConv
 
 
-@dataclass
-class GATStatusEmbConfig:
-    """Configuration for the GAT status-embedding recipe."""
-    embedding_dims: int = 64
-    gat_hidden_dim_event: int = 32
-    gat_hidden_dim_embed: int = 128
-    gat_hidden_dim_concat: int = 256
-    num_heads: int = 4
-    num_layers: int = 1
-    dropout: float = 0.0
-    use_batch_norm: bool = False
-    activation: str = "elu"
-    edge_type_dim: int = 32
-    batch_size: int = 16
-    lr: float = 1e-3
-    num_epochs: int = 10
-    patience: int = 3
-    delta: float = 0.0
-    test_size: float = 0.2
+def _resolve_activation(name: str):
+    activations = {
+        "relu": F.relu,
+        "elu": F.elu,
+        "gelu": F.gelu,
+        "leaky_relu": F.leaky_relu,
+    }
+    key = name.lower()
+    if key not in activations:
+        raise ValueError(f"Unsupported activation '{name}'. Choose one of: {sorted(activations)}")
+    return activations[key]
 
 
-def train_gat_status_emb(
-    event: pd.DataFrame,
-    case_index: str,
-    core_event: str,
-    start_time_col: str,
-    status_col: str,
-    cat_col_event: List[str],
-    num_col_event: List[str],
-    seq_cols: List[str],
-    cat_col_seq: List[str],
-    num_col_seq: List[str],
-    config: Optional[GATStatusEmbConfig] = None,
-    device: Optional[str] = None,
-    **overrides,
-):
-    """Train the GAT model with edge-type embeddings.
+class DualGAT2EdgesModel(nn.Module):
+    """GAT model with time-diff and edge-type embeddings.
 
     Args:
-        event: Event log dataframe.
-        case_index: Column identifying sequences/cases.
-        core_event: Column with event labels.
-        start_time_col: Timestamp column.
-        status_col: Column used for transition edge types.
-        cat_col_event: Categorical event-level columns.
-        num_col_event: Numerical event-level columns.
-        seq_cols: Columns used to build sequence-level features.
-        cat_col_seq: Categorical sequence-level columns.
-        num_col_seq: Numerical sequence-level columns.
-        config: Optional configuration dataclass.
-        device: Torch device string.
-        **overrides: Config overrides (e.g., num_epochs=5).
-
-    Returns:
-        Dict with trained model and training history.
+        num_layers: Number of GAT layers per path.  Defaults to 1.
+        dropout: Dropout rate applied between layers (0 = no dropout).
+        use_batch_norm: Apply BatchNorm1d between hidden GAT layers.
+        activation: Hidden-layer activation (relu, elu, gelu, leaky_relu).
     """
-    cfg = resolve_config(config, GATStatusEmbConfig, overrides)
-    device = device or ("cuda" if torch.cuda.is_available() else "cpu")
+    def __init__(
+        self,
+        num_event_features: int,
+        num_embedding_features: int,
+        embedding_dims: int,
+        gat_hidden_dim_event: int,
+        gat_hidden_dim_embed: int,
+        gat_hidden_dim_concat: int,
+        output_dim: int,
+        num_heads: int,
+        num_edge_types: int,
+        edge_type_dim: int,
+        num_layers: int = 1,
+        dropout: float = 0.0,
+        use_batch_norm: bool = False,
+        activation: str = "elu",
+    ) -> None:
+        super().__init__()
+        self.dropout = dropout
+        self.use_batch_norm = use_batch_norm
+        self.activation = _resolve_activation(activation)
 
-    sequence = build_sequence_table(event, case_index, seq_cols)
-
-    core_encode, y_encode, core_size, output_size, _ = encode_label_event(
-        event, core_event, case_index
-    )
-    event_encode = encode_pad_event(
-        event, cat_col_event, num_col_event, case_index, cat_mask=True, num_mask=True, eos=False
-    )
-    sequence_encode = encode_pad_sequence(sequence, cat_col_seq, num_col_seq)
-
-    event_trans_edge, _, trans_size = event_transition_edge(event, sequence, status_col, case_index)
-    scaled_time_diffs = scale_time_differences_fast_fixed(event, sequence, start_time_col, case_index)
-
-    node_times = node_time_list(event, start_time_col, case_index)
-
-    max_num_events = event_encode.shape[1]
-    sequence_features_expanded = np.expand_dims(sequence_encode, axis=1)
-    sequence_features_expanded = np.repeat(sequence_features_expanded, max_num_events, axis=1)
-    combined_features = np.concatenate((event_encode, sequence_features_expanded), axis=2)
-
-    event_feature_list = prepare_data_core_2edges(
-        combined_features, core_encode, scaled_time_diffs, event_trans_edge, node_times
-    )
-    y_list = prepare_data_y(combined_features, y_encode)
-
-    train_indices, test_indices = length_stratified_split(
-        event_feature_list, test_size=cfg.test_size, n_bins=10
-    )
-
-    train_event_features = [event_feature_list[i] for i in train_indices]
-    test_event_features = [event_feature_list[i] for i in test_indices]
-    train_y = [y_list[i] for i in train_indices]
-    test_y = [y_list[i] for i in test_indices]
-
-    train_dataset = CustomDataset(train_event_features, train_y)
-    test_dataset = CustomDataset(test_event_features, test_y)
-
-    num_event_features = train_event_features[0].x.shape[1]
-    num_embedding_features = core_size
-
-    model = DualGAT2EdgesModel(
-        num_event_features=num_event_features,
-        num_embedding_features=num_embedding_features,
-        embedding_dims=cfg.embedding_dims,
-        gat_hidden_dim_event=cfg.gat_hidden_dim_event,
-        gat_hidden_dim_embed=cfg.gat_hidden_dim_embed,
-        gat_hidden_dim_concat=cfg.gat_hidden_dim_concat,
-        output_dim=output_size,
-        num_heads=cfg.num_heads,
-        num_edge_types=trans_size,
-        edge_type_dim=cfg.edge_type_dim,
-        num_layers=cfg.num_layers,
-        dropout=cfg.dropout,
-        use_batch_norm=cfg.use_batch_norm,
-        activation=cfg.activation,
-    ).to(device)
-
-    optimizer = torch.optim.Adam(model.parameters(), lr=cfg.lr)
-    criterion = nn.CrossEntropyLoss(ignore_index=-1)
-
-    train_loader = DataLoader(
-        train_dataset, batch_size=cfg.batch_size, shuffle=True, collate_fn=custom_collate_fn
-    )
-    test_loader = DataLoader(
-        test_dataset, batch_size=cfg.batch_size, shuffle=False, collate_fn=custom_collate_fn
-    )
-
-    early_stopping = EarlyStopping(patience=cfg.patience, delta=cfg.delta)
-    history = []
-    for epoch in range(cfg.num_epochs):
-        train_loss, train_acc = train_epoch(model, train_loader, optimizer, criterion, device)
-        test_loss, test_acc = evaluate_epoch(model, test_loader, criterion, device)
-
-        history.append(
-            {
-                "epoch": epoch + 1,
-                "train_loss": train_loss,
-                "train_acc": train_acc,
-                "test_loss": test_loss,
-                "test_acc": test_acc,
-            }
+        self.embedding = nn.Embedding(
+            num_embeddings=num_embedding_features, embedding_dim=embedding_dims
+        )
+        self.edge_type_emb = nn.Embedding(
+            num_embeddings=num_edge_types, embedding_dim=edge_type_dim
         )
 
-        if early_stopping(test_loss):
-            break
+        edge_attr_dim = 1 + edge_type_dim
 
-    return {"model": model, "history": history}
+        self.gat_embed = nn.ModuleList()
+        in_dim = embedding_dims
+        for _ in range(num_layers):
+            self.gat_embed.append(
+                GATConv(in_dim, gat_hidden_dim_embed, heads=num_heads, concat=True, edge_dim=edge_attr_dim)
+            )
+            in_dim = gat_hidden_dim_embed * num_heads
+        self.bn_embed = nn.ModuleList(
+            [nn.BatchNorm1d(gat_hidden_dim_embed * num_heads) for _ in range(num_layers)]
+        )
+
+        self.gat_event = nn.ModuleList()
+        in_dim = num_event_features
+        for _ in range(num_layers):
+            self.gat_event.append(
+                GATConv(in_dim, gat_hidden_dim_event, heads=num_heads, concat=True, edge_dim=edge_attr_dim)
+            )
+            in_dim = gat_hidden_dim_event * num_heads
+        self.bn_event = nn.ModuleList(
+            [nn.BatchNorm1d(gat_hidden_dim_event * num_heads) for _ in range(num_layers)]
+        )
+
+        concat_input_dim = (gat_hidden_dim_embed + gat_hidden_dim_event) * num_heads
+        self.gat_concat = nn.ModuleList()
+        in_dim = concat_input_dim
+        for _ in range(num_layers):
+            self.gat_concat.append(
+                GATConv(in_dim, gat_hidden_dim_concat, heads=num_heads, concat=True, edge_dim=edge_attr_dim)
+            )
+            in_dim = gat_hidden_dim_concat * num_heads
+        self.bn_concat = nn.ModuleList(
+            [nn.BatchNorm1d(gat_hidden_dim_concat * num_heads) for _ in range(num_layers)]
+        )
+
+        final_dim = gat_hidden_dim_concat * num_heads
+        self.fc = nn.Linear(final_dim, output_dim)
+
+    def _run_path(self, layers: nn.ModuleList, norms: nn.ModuleList, x, edge_index, edge_attr):
+        for i, layer in enumerate(layers):
+            x = layer(x, edge_index, edge_attr=edge_attr)
+            if i < len(layers) - 1:
+                if self.use_batch_norm:
+                    x = norms[i](x)
+                x = self.activation(x)
+                if self.dropout > 0:
+                    x = F.dropout(x, p=self.dropout, training=self.training)
+        return x
+
+    def forward(self, data_event):
+        """Forward pass for batched event graphs."""
+        edge_type = data_event.edge_type
+        edge_time = data_event.edge_time_diff
+
+        type_vec = self.edge_type_emb(edge_type)
+        edge_attr = torch.cat([edge_time, type_vec], dim=-1)
+
+        x_embed = self.embedding(data_event.event_ids.view(-1))
+        x_embed = self._run_path(self.gat_embed, self.bn_embed, x_embed, data_event.edge_index, edge_attr)
+
+        x_event = self._run_path(self.gat_event, self.bn_event, data_event.x, data_event.edge_index, edge_attr)
+
+        x = torch.cat([x_embed, x_event], dim=1)
+        x = self._run_path(self.gat_concat, self.bn_concat, x, data_event.edge_index, edge_attr)
+
+        out = self.fc(x)
+        return out

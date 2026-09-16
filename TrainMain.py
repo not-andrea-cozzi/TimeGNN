@@ -107,6 +107,49 @@ def atomic_save(obj: Any, path: str) -> None:
 
 
 # ----------------------------------------------------------------------
+# FIX #1 (bug 1 della review): TrainState.save() in
+# TrainPipeline/Training/State.py NON accetta un parametro `scheduler`
+# (firma: save(self, model, optimizer, scaler=None, checkpoint_path=None)).
+# Le chiamate a train_state.save(..., scheduler=scheduler) sollevavano
+# TypeError, silenziosamente inghiottito dal blocco try/except TypeError
+# gia' presente nel loop, con il risultato che lo stato dello scheduler
+# non veniva MAI salvato ne' MAI ripristinato (il ramo che leggeva
+# ckpt["scheduler_state_dict"] non trovava mai quella chiave).
+#
+# Fix scelto, contenuto in questo file (non tocco TrainPipeline/Training/
+# State.py senza permesso esplicito su quel file): salvo lo stato dello
+# scheduler in un file .pt separato, accanto al checkpoint principale,
+# con salvataggio atomico. save_scheduler_state()/load_scheduler_state()
+# sostituiscono il parametro scheduler= inesistente su TrainState.save().
+# ----------------------------------------------------------------------
+def _scheduler_state_path(checkpoint_path: str) -> str:
+    base, _ext = os.path.splitext(checkpoint_path)
+    return f"{base}_scheduler.pt"
+
+
+def save_scheduler_state(scheduler, checkpoint_path: str) -> None:
+    if scheduler is None:
+        return
+    path = _scheduler_state_path(checkpoint_path)
+    atomic_save(scheduler.state_dict(), path)
+
+
+def load_scheduler_state(scheduler, checkpoint_path: str) -> bool:
+    if scheduler is None:
+        return False
+    path = _scheduler_state_path(checkpoint_path)
+    if not os.path.exists(path):
+        return False
+    try:
+        state = torch.load(path, map_location="cpu", weights_only=False)
+        scheduler.load_state_dict(state)
+        return True
+    except Exception as e:
+        logger.warning(f"Impossibile ripristinare lo scheduler da {path}: {e}")
+        return False
+
+
+# ----------------------------------------------------------------------
 # Eccezioni e helper
 # ----------------------------------------------------------------------
 class PipelineConfigError(Exception):
@@ -436,15 +479,14 @@ def run_training(
             f"Checkpoint caricato: epoca {train_state.epoch}, "
             f"best_val_loss={train_state.best_val_loss:.4f}"
         )
-        # Ripristina lo stato dello scheduler, se disponibile
-        try:
-            ckpt = torch.load(resume_path, map_location=device, weights_only=False)
-            if isinstance(ckpt, dict) and "scheduler_state_dict" in ckpt:
-                scheduler.load_state_dict(ckpt["scheduler_state_dict"])
-                logger.info("Stato dello scheduler ripristinato dal checkpoint.")
-            del ckpt
-        except Exception as e:
-            logger.warning(f"Impossibile ripristinare lo scheduler: {e}")
+        # FIX (bug 1): lo stato dello scheduler NON e' mai stato dentro
+        # il checkpoint principale (TrainState.save non lo scrive: vedi
+        # nota sopra su save_scheduler_state). Lo ripristino dal file
+        # separato *_scheduler.pt, se presente.
+        if load_scheduler_state(scheduler, resume_path):
+            logger.info("Stato dello scheduler ripristinato dal file separato.")
+        else:
+            logger.info("Nessuno stato scheduler separato trovato: scheduler riparte da zero.")
 
     early_stopping = EarlyStopping(patience=section.get("patience", 5))
     epochs = section.get("epochs", 20)
@@ -520,31 +562,20 @@ def run_training(
                 "lr": current_lr,
             })
 
-            # Salvataggio atomico: last + best
-            # Nota: se TrainState.save non supporta 'atomic', questo wrapper
-            # salva comunque l'intero stato in modo sicuro.
-            try:
-                train_state.save(
-                    model, optimizer, scaler,
-                    checkpoint_path=last_path,
-                    scheduler=scheduler,
-                )
-            except TypeError:
-                # Fallback per versioni di TrainState che non accettano scheduler
-                train_state.save(model, optimizer, scaler, checkpoint_path=last_path)
+            # FIX (bug 1): TrainState.save() non accetta scheduler=...
+            # (TypeError, prima inghiottito da un except TypeError che
+            # mascherava il fatto che lo scheduler non veniva MAI salvato).
+            # Salvo il checkpoint principale con la firma reale di
+            # TrainState.save, poi salvo lo stato scheduler a parte.
+            train_state.save(model, optimizer, scaler, checkpoint_path=last_path)
+            save_scheduler_state(scheduler, last_path)
             logger.debug(f"Last checkpoint salvato: {last_path}")
 
             if val_loss < best_val_loss:
                 best_val_loss = val_loss
                 train_state.best_val_loss = best_val_loss
-                try:
-                    train_state.save(
-                        model, optimizer, scaler,
-                        checkpoint_path=best_path,
-                        scheduler=scheduler,
-                    )
-                except TypeError:
-                    train_state.save(model, optimizer, scaler, checkpoint_path=best_path)
+                train_state.save(model, optimizer, scaler, checkpoint_path=best_path)
+                save_scheduler_state(scheduler, best_path)
                 logger.info(
                     f"Nuovo best checkpoint: {best_path} (val_loss={best_val_loss:.4f})"
                 )
@@ -840,8 +871,16 @@ def main(config_path: str = "Yaml/train_main.yaml") -> None:
             train_dir = basic_cfg.get("train_dir", "Dataset/Train/train_clean")
             val_dir = basic_cfg.get("val_dir", "Dataset/Train/val_clean")
 
+            def _basic_best_path() -> str:
+                base_dir = os.path.dirname(checkpoint) or "."
+                base_name = os.path.basename(checkpoint)
+                if base_name.endswith(".pt"):
+                    base_name = base_name[:-3]
+                return os.path.join(base_dir, f"{base_name}_best.pt")
+
             def _is_basic_ready():
-                return os.path.exists(checkpoint) and os.path.getsize(checkpoint) > 0
+                p = _basic_best_path()
+                return os.path.exists(p) and os.path.getsize(p) > 0
 
             def _do_basic():
                 run_training(
@@ -865,8 +904,17 @@ def main(config_path: str = "Yaml/train_main.yaml") -> None:
             train_dir = time_cfg.get("train_dir", "Dataset/Train/train_clean")
             val_dir = time_cfg.get("val_dir", "Dataset/Train/val_clean")
 
+            # FIX (bug 3): stesso fix applicato sopra per il modello basic.
+            def _time_best_path() -> str:
+                base_dir = os.path.dirname(checkpoint) or "."
+                base_name = os.path.basename(checkpoint)
+                if base_name.endswith(".pt"):
+                    base_name = base_name[:-3]
+                return os.path.join(base_dir, f"{base_name}_best.pt")
+
             def _is_time_ready():
-                return os.path.exists(checkpoint) and os.path.getsize(checkpoint) > 0
+                p = _time_best_path()
+                return os.path.exists(p) and os.path.getsize(p) > 0
 
             def _do_time():
                 run_training(

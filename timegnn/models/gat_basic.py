@@ -31,6 +31,24 @@ def _resolve_activation(name: str):
 
 
 class DualGATModel(nn.Module):
+    """Dual-path GAT model using event embeddings and raw features.
+
+    Args:
+        num_layers: Number of GAT layers per path (embed, event) and for the
+            concat path.  Defaults to 1 for backward compatibility.
+        dropout: Dropout rate applied between layers (0 = no dropout).
+        use_batch_norm: Apply a normalization layer between hidden GAT
+            layers. Kept for backward compatibility: when norm_kind is
+            not explicitly set, use_batch_norm=True maps to "batch_norm"
+            (the original behaviour) and False maps to "none".
+        norm_kind: Explicit choice of normalization ("batch_norm",
+            "layer_norm", "graph_norm", "none"). Takes precedence over
+            use_batch_norm when provided. See timegnn.models.norm_layers
+            and TrainPipeline.Steps.TuningStep.recommend_norm_kind for
+            guidance (layer_norm/graph_norm are generally more stable
+            than batch_norm on small/variable-composition graph batches).
+        activation: Hidden-layer activation (relu, elu, gelu, leaky_relu).
+    """
     def __init__(
         self,
         num_event_features: int,
