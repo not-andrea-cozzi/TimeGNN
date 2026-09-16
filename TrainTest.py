@@ -12,8 +12,6 @@ from typing import List, Optional
 import torch
 from torch_geometric.data import Data
 
-# Riusa la pipeline di training reale, non la reimplementa: se
-# TrainMain.py viene modificato, questo test resta allineato.
 import TrainMain
 
 from DatasetPipeline.Model.ChessConstants import MOVE_VOCAB_SIZE
@@ -23,8 +21,6 @@ logger = logging.getLogger("train_main_test")
 SHARD_FILENAME_TEMPLATE = "shard_{:05d}.pt"
 MANIFEST_FILENAME = "manifest.json"
 
-# Modelli supportati dallo smoke test. Il valore passato a
-# TrainMain.run_training e' esattamente questa stringa (secondo argomento).
 SUPPORTED_MODELS = ("basic", "time_aware")
 
 
@@ -32,14 +28,6 @@ SUPPORTED_MODELS = ("basic", "time_aware")
 # Mini-state in-memory per il TuningStep
 # ----------------------------------------------------------------------
 class _MiniState:
-    """State minimale per lo smoke test: espone solo i tre metodi che
-    TuningStep.run_tuning_step usa (is_done / mark_done / mark_failed).
-
-    Non persiste nulla su disco: ogni run dello smoke test riparte da
-    zero (is_done ritorna sempre False), cosi' il tuning viene
-    effettivamente ricalcolato ad ogni invocazione.
-    """
-
     def __init__(self) -> None:
         self._done: dict = {}
 
@@ -57,9 +45,6 @@ class _MiniState:
 # Import robusto di run_tuning_step
 # ----------------------------------------------------------------------
 def _import_run_tuning_step():
-    """Importa run_tuning_step dal percorso canonico della pipeline.
-    Prova prima il percorso usato da TrainMain, poi un fallback diretto.
-    Solleva ImportError con messaggio chiaro se non lo trova."""
     candidates = (
         "TrainPipeline.Steps.TuningStep",
         "TrainPipeline.Steps.tuning_step",
@@ -72,7 +57,7 @@ def _import_run_tuning_step():
             fn = getattr(mod, "run_tuning_step", None)
             if fn is not None:
                 return fn
-        except Exception as e:  # noqa: BLE001
+        except Exception as e:
             last_err = e
             continue
     raise ImportError(
@@ -99,10 +84,6 @@ def _read_manifest(shard_dir: str) -> dict:
 
 
 def _collect_n_items(shard_dir: str, n_items: int, label: str) -> List[Data]:
-    """Legge shard in ordine (shard_00000.pt, shard_00001.pt, ...) finche'
-    non accumula almeno n_items elementi, poi tronca esattamente a
-    n_items. Non carica l'intero dataset: si ferma appena ha abbastanza.
-    """
     manifest = _read_manifest(shard_dir)
     num_shards = manifest["num_shards"]
     total_available = manifest["total"]
@@ -131,9 +112,6 @@ def _collect_n_items(shard_dir: str, n_items: int, label: str) -> List[Data]:
 
 
 def _write_single_shard_dataset(items: List[Data], out_dir: str) -> None:
-    """Scrive `items` come un UNICO shard + manifest.json, nel formato
-    atteso da ShardedGraphDataset (stesso formato di
-    TrainPipeline/Shard/Sharding.py e TrainPipeline/CleanDataset.py)."""
     if os.path.exists(out_dir):
         shutil.rmtree(out_dir)
     os.makedirs(out_dir, exist_ok=True)
@@ -163,8 +141,6 @@ def build_mini_dataset(
     n_train: int,
     n_val: int,
 ) -> tuple:
-    """Costruisce Dataset/_smoke_test/{train_mini,val_mini} a partire dagli
-    shard reali, e ritorna (train_mini_dir, val_mini_dir)."""
     train_items = _collect_n_items(train_dir, n_train, "train")
     val_items = _collect_n_items(val_dir, n_val, "val")
 
@@ -179,15 +155,11 @@ def build_mini_dataset(
 
 
 # ----------------------------------------------------------------------
-# Config smoke test per i due modelli
+# Config smoke test
 # ----------------------------------------------------------------------
-# Campi comuni a basic e time_aware. Tenuti in un unico punto per evitare
-# che le due config divergano silenziosamente (es. dropout o num_layers
-# diversi tra i due smoke test, che renderebbero i risultati non
-# confrontabili).
 _COMMON_SMOKE_FIELDS: dict = {
     "enabled": True,
-    "train_dir": None,  # sovrascritto dal chiamante di run_training
+    "train_dir": None,
     "val_dir": None,
     "num_workers": 0,
     "persistent_workers": False,
@@ -212,11 +184,6 @@ _COMMON_SMOKE_FIELDS: dict = {
 
 
 def build_basic_smoke_test_cfg(checkpoint_path: str, batch_size: int, epochs: int) -> dict:
-    """Config 'train_basic' minimale. Valori scelti per essere leggeri su
-    CPU: batch_size piccolo, hidden dims ridotte, niente BatchNorm
-    (rischioso con batch piccoli/ultimo batch da 1 elemento), niente
-    num_workers, niente compile.
-    """
     return {
         **_COMMON_SMOKE_FIELDS,
         "checkpoint": checkpoint_path,
@@ -231,16 +198,6 @@ def build_time_aware_smoke_test_cfg(
     epochs: int,
     lambda_decay: float = 0.1,
 ) -> dict:
-    """Config 'train_time_aware' minimale.
-
-    Identica a train_basic piu' lambda_decay, il parametro che controlla
-    il decay esponenziale dell'attenzione in TimeAwareGATConv:
-        decay = exp(-lambda_decay * time_diff)
-    Con lambda_decay=0.1 e time_diff in [0, qualche decina di secondi]
-    il decay resta in un range numerico ragionevole (exp(-1) ~ 0.37 a
-    time_diff=10), evitando saturazione a 0 o 1 che renderebbe
-    l'attenzione degenere proprio nel test che dovrebbe verificarla.
-    """
     return {
         **_COMMON_SMOKE_FIELDS,
         "checkpoint": checkpoint_path,
@@ -251,24 +208,10 @@ def build_time_aware_smoke_test_cfg(
 
 
 def build_tuning_cfg() -> dict:
-    """Sezione 'tuning' per lo smoke test.
-
-    move_vocab_size NON viene mai inferito dal dataset: e' una costante
-    architetturale del problema (MOVE_VOCAB_SIZE = 64*64*5 = 20480,
-    vedi DatasetPipeline/Model/PositionGraphSchema.py), non qualcosa che
-    dipende da quante mosse distinte compaiono nel mini-campione. Un
-    mini-dataset da poche centinaia di posizioni puo' tranquillamente non
-    contenere tutte le 20480 mosse possibili, ma il vocabolario resta
-    quello: class_weights e legal_move_mask devono avere sempre la stessa
-    dimensione (MOVE_VOCAB_SIZE), altrimenti sparse_legal_cross_entropy
-    solleva IndexError non appena una label supera la size del tensore
-    dei pesi.
-    """
     return {"enabled": True, "move_vocab_size": MOVE_VOCAB_SIZE}
 
 
 def _build_model_cfg(model_name: str, checkpoint_path: str, batch_size: int, epochs: int) -> dict:
-    """Dispatch tra le due config smoke test in base al modello scelto."""
     if model_name == "basic":
         return build_basic_smoke_test_cfg(checkpoint_path, batch_size, epochs)
     if model_name == "time_aware":
@@ -277,9 +220,6 @@ def _build_model_cfg(model_name: str, checkpoint_path: str, batch_size: int, epo
 
 
 def _cleanup_stale_checkpoints(checkpoint_dir: str, stem: str) -> None:
-    """Rimuove i checkpoint di un test precedente per lo stesso stem, cosi'
-    la run parte sempre da zero (niente resume accidentale tra run di
-    test diverse con parametri diversi, es. batch_size cambiato)."""
     for suffix in ("_last.pt", "_best.pt", "_last_scheduler.pt", "_best_scheduler.pt"):
         stale = os.path.join(checkpoint_dir, stem + suffix)
         if os.path.exists(stale):
@@ -293,25 +233,25 @@ def main() -> None:
     parser = argparse.ArgumentParser(
         description="Smoke-test: verifica che il training giri end-to-end su un piccolo sottoinsieme."
     )
-    parser.add_argument("--train-dir", default="Dataset/Train/train_clean", help="Cartella shardata di train reale.")
-    parser.add_argument("--val-dir", default="Dataset/Train/val_clean", help="Cartella shardata di val reale.")
-    parser.add_argument("--out-root", default="Dataset/_smoke_test", help="Dove scrivere mini-dataset e checkpoint di test.")
-    parser.add_argument("--n-train", type=int, default=10000, help="Numero di campioni di train da usare.")
-    parser.add_argument("--n-val", type=int, default=1000, help="Numero di campioni di val da usare.")
-    parser.add_argument("--batch-size", type=int, default=16, help="Batch size (piccolo, adatto a CPU).")
-    parser.add_argument("--epochs", type=int, default=5, help="Numero di epoche (default 1: solo verifica che giri).")
-    parser.add_argument("--keep-output", action="store_true", help="Non cancellare --out-root a fine test.")
+    parser.add_argument("--train-dir", default="Dataset/Train/train_clean")
+    parser.add_argument("--val-dir", default="Dataset/Train/val_clean")
+    parser.add_argument("--out-root", default="Dataset/_smoke_test")
+    parser.add_argument("--n-train", type=int, default=10000)
+    parser.add_argument("--n-val", type=int, default=1000)
+    parser.add_argument("--batch-size", type=int, default=16)
+    parser.add_argument("--epochs", type=int, default=10)
+    parser.add_argument("--keep-output", action="store_true")
     parser.add_argument(
         "--model",
         choices=SUPPORTED_MODELS,
         default="basic",
-        help="Modello da testare: 'basic' (DualGATModel) o 'time_aware' "
-             "(DualGATTimeAwareModel, con time decay sull'attenzione).",
     )
+    parser.add_argument("--no-tuning", action="store_true")
     parser.add_argument(
-        "--no-tuning",
-        action="store_true",
-        help="Disattiva lo step di tuning (utile per isolare problemi di training).",
+        "--device",
+        choices=("auto", "cpu", "cuda"),
+        default="auto",
+        help="Device. 'auto' usa CUDA se disponibile e compatibile, altrimenti CPU.",
     )
     args = parser.parse_args()
 
@@ -320,17 +260,45 @@ def main() -> None:
     logger.info(f"SMOKE TEST TRAINING [{args.model}] (solo verifica funzionamento, NON valuta qualita')")
     logger.info("=" * 70)
 
-    # Esecuzione forzata su CPU: nessuna diramazione device=cuda in questo
-    # script. Se in futuro serve testare anche su GPU, e' piu' sicuro
-    # farlo con un secondo script dedicato piuttosto che riintrodurre qui
-    # rami condizionali che nessuno esercita piu'.
-    device =  "cuda" if torch.cuda.is_available() else "cpu"
-    logger.info(f"Device: {device} (smoke test forzato su CPU).")
+    # --- Selezione device ---
+    if args.device == "cpu":
+        device = "cpu"
+    elif args.device == "cuda":
+        if not torch.cuda.is_available():
+            raise TrainMain.PipelineConfigError(
+                "--device cuda richiesto ma torch.cuda.is_available() == False. "
+                "Controlla driver NVIDIA e installazione PyTorch."
+            )
+        device = "cuda"
+    else:  # auto
+        device = "cuda" if torch.cuda.is_available() else "cpu"
 
-    # AMP disabilitato: autocast bf16/fp16 non ha senso su CPU per questo
-    # test (nessun beneficio, solo complessita' di debug in piu').
-    use_amp = True
-    logger.info(f"AMP: {use_amp} (disattivato, non applicabile su CPU).")
+    # Verifica che i kernel CUDA siano effettivamente eseguibili su questa GPU.
+    # Evita il crash 'no kernel image is available' a meta' training.
+    if device == "cuda":
+        try:
+            _probe = torch.zeros(1, device="cuda")
+            _ = _probe + 1
+            del _probe
+            torch.cuda.synchronize()
+        except Exception as e:
+            raise TrainMain.PipelineConfigError(
+                f"CUDA selezionato ma la GPU non e' utilizzabile con questa build "
+                f"di PyTorch ({torch.__version__}): {e}\n"
+                f"Reinstalla PyTorch con una build CUDA che supporti la tua GPU. "
+                f"Per Pascal (sm_61) usa: pip install torch==2.4.1 --index-url "
+                f"https://download.pytorch.org/whl/cu121"
+            ) from e
+
+        gpu_name = torch.cuda.get_device_name(0)
+        cc_major, cc_minor = torch.cuda.get_device_capability(0)
+        logger.info(f"Device: cuda ({gpu_name}, sm_{cc_major}{cc_minor}).")
+    else:
+        logger.info("Device: cpu.")
+
+    # AMP: su CPU non ha senso, su CUDA lo abilitiamo.
+    use_amp = (device == "cuda")
+    logger.info(f"AMP: {use_amp}.")
 
     if not os.path.isdir(args.train_dir):
         raise TrainMain.PipelineConfigError(
@@ -351,21 +319,15 @@ def main() -> None:
     checkpoint_dir = os.path.join(args.out_root, "checkpoints")
     os.makedirs(checkpoint_dir, exist_ok=True)
 
-    # Nome del checkpoint differenziato per modello: basic e time_aware
-    # possono coesistere in out_root senza che l'uno sovrascriva l'altro
-    # (utile se in futuro si aggiunge --model both).
     checkpoint_stem = f"smoke_{args.model}"
     checkpoint_path = os.path.join(checkpoint_dir, f"{checkpoint_stem}.pt")
 
     _cleanup_stale_checkpoints(checkpoint_dir, checkpoint_stem)
 
-    # Config del modello selezionato.
     model_cfg = _build_model_cfg(
         args.model, checkpoint_path, args.batch_size, args.epochs
     )
 
-    # La sezione "train_<model>" e' quella letta da run_training quando
-    # model_name == args.model. L'altra resta disabilitata esplicitamente.
     smoke_cfg = {
         "train_basic": (
             model_cfg if args.model == "basic" else {"enabled": False}
@@ -379,15 +341,8 @@ def main() -> None:
     }
 
     # ------------------------------------------------------------------
-    # Tuning step (class_weights + warmup schedule + norm raccomandata)
+    # Tuning step
     # ------------------------------------------------------------------
-    # TrainTest.py non passa da TrainMain.main(), che e' l'unico punto in
-    # cui run_tuning_step verrebbe chiamato normalmente: lo invochiamo
-    # qui esplicitamente, cosi' lo smoke test copre anche questo step.
-    #
-    # Il tuning e' identico per basic e time_aware (dipende dal dataset,
-    # non dall'architettura): viene calcolato una volta per run. Se in
-    # futuro serve --model both, il tuning va fattorizzato fuori dal loop.
     tuning_meta: dict = {}
     if not args.no_tuning:
         logger.info("-" * 70)
@@ -440,7 +395,7 @@ def main() -> None:
             val_mini_dir,
             checkpoint_path,
             device,
-            use_amp,
+            True,
             tuning_meta=tuning_meta,
         )
     except Exception:
