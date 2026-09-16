@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Tuple
+from typing import Optional, Tuple
 
 import torch
 import torch.nn.functional as F
@@ -85,34 +85,27 @@ def sparse_legal_cross_entropy(
     graph_logits: torch.Tensor,
     legal_move_mask: torch.Tensor,
     labels: torch.Tensor,
+    class_weights: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
-    """Drop-in replacement per:
-
-        masked = apply_legal_move_mask(graph_logits, legal_move_mask)
-        loss = F.cross_entropy(masked, labels)
-
-    ma operando su [B, K_max] invece di [B, MOVE_VOCAB_SIZE]. Risultato
-    numerico identico (a meno di riordino dei termini in floating point,
-    trascurabile) perche' softmax ignora comunque le colonne -inf in
-    entrambi i casi; la differenza e' solo quante colonne vengono
-    effettivamente processate da softmax/argmax/backward.
-    """
     packed_logits, target_local = pack_legal_logits(graph_logits, legal_move_mask, labels)
-    return F.cross_entropy(packed_logits, target_local)
+
+    if class_weights is None:
+        return F.cross_entropy(packed_logits, target_local)
+
+    if class_weights.device != packed_logits.device:
+        class_weights = class_weights.to(packed_logits.device)
+        
+    per_sample_weight = class_weights[labels]  # [B], indicizzato nel vocabolario originale
+    per_sample_loss = F.cross_entropy(packed_logits, target_local, reduction="none")  # [B]
+
+    weighted_sum = (per_sample_loss * per_sample_weight).sum()
+    weight_total = per_sample_weight.sum().clamp_min(1e-8)
+    return weighted_sum / weight_total
 
 
 def sparse_legal_argmax(
     graph_logits: torch.Tensor,
     legal_move_mask: torch.Tensor,
 ) -> torch.Tensor:
-    """Argmax ristretto alle mosse legali, restituito come indice nel
-    vocabolario ORIGINALE (non locale), cosi' e' direttamente comparabile
-    a `labels` per il calcolo dell'accuracy senza ulteriore mapping.
-
-    Equivalente a:
-        masked = apply_legal_move_mask(graph_logits, legal_move_mask)
-        pred = masked.argmax(dim=1)
-    ma senza costruire il tensore full-size mascherato.
-    """
     masked = graph_logits.masked_fill(~legal_move_mask, float("-inf"))
     return masked.argmax(dim=1)

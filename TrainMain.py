@@ -33,6 +33,11 @@ from DatasetPipeline.Utils.position_pooling import pool_node_logits
 from Common.sparse_legal_moves import sparse_legal_argmax
 
 # ----------------------------------------------------------------------
+# STEP 0: tuning (class_weights + warmup schedule + norm consigliata)
+# ----------------------------------------------------------------------
+from TrainPipeline.Steps.TuningStep import run_tuning_step, build_warmup_cosine_lambda
+
+# ----------------------------------------------------------------------
 # Costanti
 # ----------------------------------------------------------------------
 from DatasetPipeline.Model.ChessConstants import (
@@ -238,7 +243,24 @@ def run_training(
     checkpoint_base: str,
     device: str,
     use_amp: bool,
+    tuning_meta: Optional[Dict[str, Any]] = None,
 ) -> None:
+    """
+    Args:
+        tuning_meta: output di run_tuning_step (STEP 0), oppure {} se lo
+            step e' disabilitato da config. Quando presente e non vuoto,
+            applica:
+              - class_weights nella loss (letti da tuning_meta["class_weights_path"])
+              - warmup lineare + cosine decay per i primi warmup_steps
+                step, poi passa a ReduceLROnPlateau come gia' avveniva
+              - norm_kind consigliato ("layer_norm"/"graph_norm") al
+                posto di BatchNorm1d, SOLO per model_type == "basic":
+                DualGATTimeAwareModel non espone ancora il parametro
+                norm_kind (il suo __init__ non e' stato modificato,
+                mancava dal contesto disponibile) — per "time_aware" si
+                usa quindi sempre use_batch_norm come da config originale,
+                e norm_kind viene ignorato con un log esplicito.
+    """
     section = cfg["train_basic"] if model_type == "basic" else cfg["train_time_aware"]
     logger.info(f"Avvio training {model_type} con configurazione: {section}")
 
@@ -246,15 +268,35 @@ def run_training(
     _require_sharded_dir(train_dir, "train")
     _require_sharded_dir(val_dir, "val")
 
+    tuning_meta = tuning_meta or {}
+
     # 1. Modello e dati ----------------------------------------------------
     if model_type == "basic":
         model_class = DualGATModel
         edge_dim = NUM_EDGE_TYPES
         extra_kwargs: Dict[str, Any] = {}
+
+        norm_kind = tuning_meta.get("recommended_norm")
+        if norm_kind is not None:
+            logger.info(f"[tuning] norm_kind consigliato applicato al modello basic: '{norm_kind}'.")
+            extra_kwargs["norm_kind"] = norm_kind
     else:
         model_class = DualGATTimeAwareModel
         edge_dim = TIME_EDGE_DIM
         extra_kwargs = {"lambda_decay": float(section.get("lambda_decay", 0.01))}
+
+        if tuning_meta.get("recommended_norm") is not None:
+            # TODO: DualGATTimeAwareModel non e' stato ancora esteso con
+            # un parametro norm_kind (il file sorgente non era disponibile
+            # al momento di questa modifica). Una volta esteso con lo
+            # stesso pattern di DualGATModel/norm_layers.make_norm_layer,
+            # rimuovere questo warning e passare norm_kind=... qui come
+            # sopra per il ramo "basic".
+            logger.warning(
+                "[tuning] norm_kind consigliato disponibile ma DualGATTimeAwareModel "
+                "non supporta ancora questo parametro: si usa use_batch_norm da config "
+                "(nessun cambiamento per il modello time_aware)."
+            )
 
     train_ds = ShardedGraphDataset(train_dir, shuffle=True, seed=section.get("seed", 42))
     val_ds = ShardedGraphDataset(val_dir, shuffle=False, seed=section.get("seed", 42))
@@ -305,7 +347,7 @@ def run_training(
         weight_decay=float(section.get("weight_decay", 1e-5)),  # <-- default più robusto
     )
 
-    # Learning Rate Scheduler
+    # Learning Rate Scheduler (plateau, usato DOPO l'eventuale warmup)
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
         optimizer,
         mode="min",
@@ -314,10 +356,60 @@ def run_training(
         min_lr=float(section.get("min_lr", 1e-6)),
     )
 
+    # ------------------------------------------------------------------
+    # STEP 0 (tuning) — warmup+cosine LambdaLR per i primi warmup_steps
+    # step di training, poi si passa a ReduceLROnPlateau sopra. Il
+    # warmup_scheduler viene ricreato ad ogni chiamata di run_training
+    # (non persistito nel checkpoint): e' un dettaglio dei soli primi
+    # step della prima epoca, riprendere un training da checkpoint dopo
+    # il warmup non lo riattiva (comportamento voluto: il warmup serve
+    # solo a stabilizzare l'inizializzazione casuale dei pesi).
+    # ------------------------------------------------------------------
+    warmup_steps = tuning_meta.get("warmup_steps")
+    warmup_scheduler = None
+    if warmup_steps:
+        steps_per_epoch = len(train_loader)
+        total_epochs = section.get("epochs", 20)
+        total_steps = max(steps_per_epoch * total_epochs, warmup_steps + 1)
+        min_lr_ratio = tuning_meta.get("min_lr_ratio", 0.1)
+
+        lr_lambda = build_warmup_cosine_lambda(warmup_steps, total_steps, min_lr_ratio=min_lr_ratio)
+        warmup_scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
+        logger.info(
+            f"[tuning] Warmup+cosine attivo per i primi {warmup_steps} step "
+            f"(su {total_steps} step totali stimati, min_lr_ratio={min_lr_ratio})."
+        )
+
+    # ------------------------------------------------------------------
+    # STEP 0 (tuning) — class_weights per correggere lo squilibrio delle
+    # 20480 classi di MOVE_VOCAB_SIZE. Passati a train_epoch/evaluate_epoch
+    # tramite l'argomento class_weights (vedi TrainPipeline/Training/Loop.py):
+    # se il Loop non e' stato ancora esteso per accettarlo, si passa
+    # comunque None per non rompere la firma esistente e si logga.
+    # ------------------------------------------------------------------
+    class_weights = None
+    class_weights_path = tuning_meta.get("class_weights_path")
+    if class_weights_path and os.path.exists(class_weights_path):
+        payload = torch.load(class_weights_path, weights_only=False)
+        class_weights = payload["weights"].to(device)
+        logger.info(
+            f"[tuning] class_weights caricati da {class_weights_path} "
+            f"(scheme={payload.get('scheme', 'unknown')})."
+        )
+
     # criterion non usato internamente da train_epoch/evaluate_epoch
     # (usano sparse_legal_cross_entropy), mantenuto per compatibilità di firma.
     criterion = nn.CrossEntropyLoss()
-    scaler = torch.amp.GradScaler("cuda", enabled=use_amp) if device == "cuda" else None
+    scaler = None
+    amp_dtype = tuning_meta.get("hw_settings", {}).get("amp_dtype")
+    if use_amp and device == "cuda" and amp_dtype != "bfloat16":
+        # GradScaler serve solo con fp16 (range esponente ridotto): su
+        # bf16 (atteso su RTX 5070, vedi TuningStep.configure_for_rtx_5070)
+        # non e' necessario e si evita l'uso della classe deprecata
+        # torch.cuda.amp.GradScaler in favore di torch.amp.GradScaler.
+        scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
+    elif use_amp and device == "cuda":
+        logger.info("[tuning] bf16 attivo: GradScaler non necessario, nessuno scaler istanziato.")
 
     # 2. Checkpoint --------------------------------------------------------
     base_dir = os.path.dirname(checkpoint_base) or "."
@@ -378,6 +470,8 @@ def run_training(
                 use_amp=use_amp,
                 total_items=len(train_ds),
                 epoch_label=f"Epoch {epoch+1}/{epochs} [train]",
+                class_weights=class_weights,
+                warmup_scheduler=warmup_scheduler,
             )
 
             val_loss, val_top1, val_top3 = evaluate_epoch(
@@ -388,11 +482,16 @@ def run_training(
                 use_amp=use_amp,
                 total_items=len(val_ds),
                 epoch_label=f"Epoch {epoch+1}/{epochs} [val]",
+                class_weights=class_weights,
             )
 
             elapsed = time.monotonic() - t0
 
-            # Scheduler step
+            # Scheduler a plateau: attivo sempre (anche durante il warmup,
+            # ReduceLROnPlateau aggiorna solo il suo stato interno finche'
+            # non decide di ridurre il LR; il LR effettivo durante il
+            # warmup e' comunque dominato da warmup_scheduler che viene
+            # steppato per batch dentro train_epoch).
             scheduler.step(val_loss)
             current_lr = optimizer.param_groups[0]["lr"]
 
@@ -653,7 +752,7 @@ def main(config_path: str = "Yaml/train_main.yaml") -> None:
     log_config(cfg, "Configurazione pipeline")
 
     logger.info("=" * 70)
-    logger.info("AVVIO PIPELINE TRAINING TIMEGNN (solo training/eval)")
+    logger.info("AVVIO PIPELINE TRAINING TIMEGNN (tuning -> training -> eval)")
     logger.info("=" * 70)
 
     apply_memory_limit(pipe_cfg.get("max_ram_gb", None))
@@ -672,7 +771,7 @@ def main(config_path: str = "Yaml/train_main.yaml") -> None:
         logger.warning(f"Impossibile impostare sharing strategy '{sharing}': {e}")
 
     step_filter = pipe_cfg.get("step")
-    valid_steps = ["train_basic", "train_time_aware", "evaluate"]
+    valid_steps = ["tuning", "train_basic", "train_time_aware", "evaluate"]
     if step_filter is not None and step_filter not in valid_steps:
         raise PipelineConfigError(
             f"'pipeline.step' non valido: {step_filter}. Validi: {valid_steps}"
@@ -699,6 +798,39 @@ def main(config_path: str = "Yaml/train_main.yaml") -> None:
     logger.info(f"Device: {device}, AMP: {use_amp}")
 
     # ------------------------------------------------------------------
+    # STEP 0: Tuning (class_weights + warmup schedule + norm consigliata)
+    # Eseguito sempre prima di train_basic/train_time_aware, a meno che
+    # pipeline.step filtri esplicitamente per uno step diverso da "tuning"
+    # e "tuning" non sia None/"tuning" — comunque, se lo step richiesto e'
+    # train_basic/train_time_aware, il tuning va eseguito prima per
+    # produrre class_weights/warmup_steps di cui quello step ha bisogno.
+    # ------------------------------------------------------------------
+    tuning_meta: Dict[str, Any] = {}
+    needs_tuning = step_filter in (None, "tuning", "train_basic", "train_time_aware")
+    if needs_tuning:
+        basic_cfg_for_tuning = cfg.get("train_basic", {})
+        train_dir_for_tuning = basic_cfg_for_tuning.get("train_dir", "Dataset/Train/train_clean")
+        steps_per_epoch_hint = None
+        if os.path.exists(os.path.join(train_dir_for_tuning, "manifest.json")):
+            try:
+                tmp_ds = ShardedGraphDataset(train_dir_for_tuning, shuffle=False)
+                steps_per_epoch_hint = max(
+                    1, len(tmp_ds) // int(basic_cfg_for_tuning.get("batch_size", 128))
+                )
+                del tmp_ds
+            except Exception as e:
+                logger.warning(f"[tuning] Impossibile stimare steps_per_epoch: {e}")
+
+        tuning_meta = run_tuning_step(
+            cfg,
+            state,
+            dataset_dir,
+            train_dir_for_tuning,
+            steps_per_epoch=steps_per_epoch_hint,
+            total_planned_epochs=basic_cfg_for_tuning.get("epochs", 20),
+        )
+
+    # ------------------------------------------------------------------
     # STEP 1: Train Basic
     # ------------------------------------------------------------------
     if step_filter is None or step_filter == "train_basic":
@@ -713,7 +845,8 @@ def main(config_path: str = "Yaml/train_main.yaml") -> None:
 
             def _do_basic():
                 run_training(
-                    cfg, "basic", train_dir, val_dir, checkpoint, device, use_amp
+                    cfg, "basic", train_dir, val_dir, checkpoint, device, use_amp,
+                    tuning_meta=tuning_meta,
                 )
 
             run_step(state, "train_basic", _is_basic_ready, _do_basic)
@@ -737,7 +870,8 @@ def main(config_path: str = "Yaml/train_main.yaml") -> None:
 
             def _do_time():
                 run_training(
-                    cfg, "time_aware", train_dir, val_dir, checkpoint, device, use_amp
+                    cfg, "time_aware", train_dir, val_dir, checkpoint, device, use_amp,
+                    tuning_meta=tuning_meta,
                 )
 
             run_step(state, "train_time_aware", _is_time_ready, _do_time)

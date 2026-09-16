@@ -7,6 +7,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch_geometric.nn import GATConv
 
+from .norm_layers import GraphAwareNormList, make_norm_layer
+
 
 def _to_list(val: Union[int, List[int]], length: int) -> List[int]:
     """Expand a scalar to a list of the given length."""
@@ -29,15 +31,6 @@ def _resolve_activation(name: str):
 
 
 class DualGATModel(nn.Module):
-    """Dual-path GAT model using event embeddings and raw features.
-
-    Args:
-        num_layers: Number of GAT layers per path (embed, event) and for the
-            concat path.  Defaults to 1 for backward compatibility.
-        dropout: Dropout rate applied between layers (0 = no dropout).
-        use_batch_norm: Apply BatchNorm1d between hidden GAT layers.
-        activation: Hidden-layer activation (relu, elu, gelu, leaky_relu).
-    """
     def __init__(
         self,
         num_event_features: int,
@@ -53,11 +46,16 @@ class DualGATModel(nn.Module):
         dropout: float = 0.0,
         use_batch_norm: bool = False,
         activation: str = "elu",
+        norm_kind: Optional[str] = None,
     ) -> None:
         super().__init__()
         self.dropout = dropout
-        self.use_batch_norm = use_batch_norm
         self.activation = _resolve_activation(activation)
+
+        if norm_kind is None:
+            norm_kind = "batch_norm" if use_batch_norm else "none"
+        self.norm_kind = norm_kind
+        self.use_norm = norm_kind != "none"
 
         self.embedding = nn.Embedding(
             num_embeddings=num_embedding_features, embedding_dim=embedding_dims
@@ -72,7 +70,7 @@ class DualGATModel(nn.Module):
             )
             in_dim = gat_hidden_dim_embed * num_heads
         self.bn_embed = nn.ModuleList(
-            [nn.BatchNorm1d(gat_hidden_dim_embed * num_heads) for _ in range(num_layers)]
+            [make_norm_layer(norm_kind, gat_hidden_dim_embed * num_heads) for _ in range(num_layers)]
         )
 
         # --- event path ---
@@ -84,7 +82,7 @@ class DualGATModel(nn.Module):
             )
             in_dim = gat_hidden_dim_event * num_heads
         self.bn_event = nn.ModuleList(
-            [nn.BatchNorm1d(gat_hidden_dim_event * num_heads) for _ in range(num_layers)]
+            [make_norm_layer(norm_kind, gat_hidden_dim_event * num_heads) for _ in range(num_layers)]
         )
 
         # --- concat path ---
@@ -97,17 +95,27 @@ class DualGATModel(nn.Module):
             )
             in_dim = gat_hidden_dim_concat * num_heads
         self.bn_concat = nn.ModuleList(
-            [nn.BatchNorm1d(gat_hidden_dim_concat * num_heads) for _ in range(num_layers)]
+            [make_norm_layer(norm_kind, gat_hidden_dim_concat * num_heads) for _ in range(num_layers)]
         )
 
         final_dim = gat_hidden_dim_concat * num_heads
         self.fc = nn.Linear(final_dim, output_dim)
 
+    def _set_batch_index(self, batch_index: torch.Tensor) -> None:
+        """Propaga data.batch ai layer GraphAwareNormList (no-op per gli
+        altri norm_kind, che non richiedono l'indice di grafo)."""
+        if self.norm_kind != "graph_norm":
+            return
+        for module_list in (self.bn_embed, self.bn_event, self.bn_concat):
+            for norm in module_list:
+                if isinstance(norm, GraphAwareNormList):
+                    norm.set_batch_index(batch_index)
+
     def _run_path(self, layers: nn.ModuleList, norms: nn.ModuleList, x, edge_index, edge_attr):
         for i, layer in enumerate(layers):
             x = layer(x, edge_index, edge_attr=edge_attr)
             if i < len(layers) - 1:
-                if self.use_batch_norm:
+                if self.use_norm:
                     x = norms[i](x)
                 x = self.activation(x)
                 if self.dropout > 0:
@@ -117,6 +125,9 @@ class DualGATModel(nn.Module):
     def forward(self, data_event):
         """Forward pass for batched event graphs."""
         edge_attr = data_event.edge_attr
+
+        if self.norm_kind == "graph_norm" and hasattr(data_event, "batch") and data_event.batch is not None:
+            self._set_batch_index(data_event.batch)
 
         x_embed = self.embedding(data_event.event_ids.view(-1))
         x_embed = self._run_path(self.gat_embed, self.bn_embed, x_embed, data_event.edge_index, edge_attr)

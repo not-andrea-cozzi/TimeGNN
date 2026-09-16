@@ -53,7 +53,7 @@ class TrainState:
         self,
         model: nn.Module,
         optimizer: Optimizer,
-        scaler: Optional[torch.cuda.amp.GradScaler] = None,
+        scaler: Optional[torch.amp.GradScaler] = None,
         map_location: Optional[str] = None,
         checkpoint_path: Optional[str] = None,
     ) -> bool:
@@ -111,7 +111,7 @@ class TrainState:
         self,
         model: nn.Module,
         optimizer: Optimizer,
-        scaler: Optional[torch.cuda.amp.GradScaler] = None,
+        scaler: Optional[torch.amp.GradScaler] = None,
         checkpoint_path: Optional[str] = None,
     ) -> None:
         """
