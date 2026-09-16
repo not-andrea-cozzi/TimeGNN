@@ -7,7 +7,7 @@ pipeline:
   force_recompute: false   # SEMPRE FALSE
   log_level: "INFO"
   log_file: "Dataset/pipeline.log"
-  step: "finalize_splits"  # "time_stats", "games_pipeline", "puzzle_pipeline", "finalize_splits", "clean", "all"
+  step: "clean"  # "time_stats", "games_pipeline", "puzzle_pipeline", "finalize_splits", "clean", "all"
   use_existing_games: true
 
 engine:
@@ -94,9 +94,9 @@ puzzle_pipeline:
   dedupe_positions: true
 
 splits:
-  train_ratio: 0.75
+  train_ratio: 0.80
   val_ratio: 0.10
-  test_ratio: 0.15
+  test_ratio: 0.10
 
 # -----------------------------------------------------------------------------
 # STEP 0 della pipeline di training (clean + reshard shard-by-shard)
@@ -112,5 +112,5 @@ clean:
   output_dir_train: "Dataset/Train/train_clean"
   output_dir_val:   "Dataset/Train/val_clean"
   output_dir_test:  "Dataset/Train/test_clean"
-  target_shard_size: 5900
+  target_shard_size: 15000
   workers: 0

@@ -6,23 +6,8 @@ pipeline:
   force_recompute: false
   log_level: "INFO"
   log_file: "Dataset/train_pipeline.log"
-  step: null               # valori: "clean", "shard", "train_basic", "train_time_aware", "evaluate"
+  step: null               # valori: "train_basic", "train_time_aware", "evaluate"
   no_amp: false
-
-clean:
-  enabled: true
-  input_train: "Dataset/Train/train.pt"
-  input_val: "Dataset/Train/val.pt"
-  input_test: "Dataset/Train/test.pt"
-  output_train: "Dataset/Train/train_clean.pt"
-  output_val: "Dataset/Train/val_clean.pt"
-  output_test: "Dataset/Test/test_clean.pt"
-  workers: 0
-
-shard:
-  train_clean: "Dataset/Train/train_clean.pt"
-  val_clean: "Dataset/Train/val_clean.pt"
-  shard_size: 5900
 
 train_basic:
   enabled: true
@@ -31,6 +16,7 @@ train_basic:
   epochs: 50
   batch_size: 128
   num_workers: 1
+  prefetch_factor: 4
   lr: 1.0e-3
   seed: 42
   patience: 5
@@ -48,10 +34,11 @@ train_basic:
 train_time_aware:
   enabled: true
   shards_dir: "Dataset/Train/shards"
-  checkpoint: "Dataset/Train/checkpoints/time_aware"   # <-- corretto
+  checkpoint: "Dataset/Train/checkpoints/time_aware"
   epochs: 50
   batch_size: 128
   num_workers: 1
+  prefetch_factor: 4
   lr: 1.0e-3
   seed: 42
   patience: 5
@@ -75,5 +62,6 @@ evaluate:
   max_n: 10
   batch_size: 128
   num_workers: 2
-  model_basic_checkpoint: "Dataset/Train/checkpoints/basic_best.pt"        # <-- corretto
-  model_time_aware_checkpoint: "Dataset/Train/checkpoints/time_aware_best.pt"  # <-- corretto
+  prefetch_factor: 4
+  model_basic_checkpoint: "Dataset/Train/checkpoints/basic_best.pt"
+  model_time_aware_checkpoint: "Dataset/Train/checkpoints/time_aware_best.pt"

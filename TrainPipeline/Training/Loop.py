@@ -48,14 +48,7 @@ def train_epoch(
     total_items: Optional[int] = None,
     epoch_label: Optional[str] = None,
 ) -> Tuple[float, float]:
-    """
-    NOTA: `criterion` e' mantenuto nella firma per compatibilita' con i
-    chiamanti esistenti (TrainMain.py costruisce nn.CrossEntropyLoss()
-    fuori dal loop e lo passa qui), ma NON viene piu' usato per la loss
-    di training: sparse_legal_cross_entropy la sostituisce internamente.
-    Se in futuro criterion smette di essere costruito a monte, questo
-    parametro puo' diventare Optional senza rompere nulla qui dentro.
-    """
+    
     model.train()
     total_loss = 0.0
     correct = 0
@@ -68,8 +61,8 @@ def train_epoch(
         stats = LiveStats(pbar, refresh_every=10)
 
         for batch_event, labels in loader:
-            batch_event = batch_event.to(device)
-            labels = labels.to(device)
+            batch_event = batch_event.to(device, non_blocking=True)
+            labels = labels.to(device, non_blocking=True)
 
             optimizer.zero_grad(set_to_none=True)
 
@@ -148,6 +141,10 @@ def evaluate_epoch(
     NOTA su `criterion`: stessa considerazione di train_epoch, non piu'
     usato per calcolare la loss (sparse_legal_cross_entropy la sostituisce),
     mantenuto in firma per compatibilita' con i chiamanti esistenti.
+
+    FIX: stesso non_blocking=True di train_epoch, stesse condizioni di
+    sicurezza (richiede pin_memory=True lato DataLoader per avere effetto
+    reale; altrimenti e' un no-op).
     """
     model.eval()
     total_loss = 0.0
@@ -161,8 +158,8 @@ def evaluate_epoch(
         stats = LiveStats(pbar, refresh_every=10)
 
         for batch_event, labels in loader:
-            batch_event = batch_event.to(device)
-            labels = labels.to(device)
+            batch_event = batch_event.to(device, non_blocking=True)
+            labels = labels.to(device, non_blocking=True)
 
             with torch.autocast(device_type="cuda" if amp_enabled else "cpu", enabled=amp_enabled):
                 node_logits = model(batch_event)

@@ -22,18 +22,18 @@ def predict(model, loader, device):
             output = model(event_data)
             output = output.view(-1, output.size(-1))
             labels = labels.view(-1)
-
             mask = labels != -1
+            output = output[mask]
             labels = labels[mask]
 
             preds = output.argmax(dim=1)
-            all_preds.append(preds.cpu())
-            all_labels.append(labels.cpu())
-            all_outputs.append(output.cpu())
+            all_preds.append(preds)
+            all_labels.append(labels)
+            all_outputs.append(output)
 
-    all_preds = torch.cat(all_preds)
-    all_labels = torch.cat(all_labels)
-    all_outputs = torch.cat(all_outputs)
+    all_preds = torch.cat(all_preds).cpu()
+    all_labels = torch.cat(all_labels).cpu()
+    all_outputs = torch.cat(all_outputs).cpu()
     return all_preds, all_labels, all_outputs
 
 

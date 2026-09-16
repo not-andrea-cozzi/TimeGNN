@@ -11,8 +11,8 @@ def train_epoch(model, loader, optimizer, criterion, device):
     per-node logits.  Labels are expected to be padded with -1.
     """
     model.train()
-    total_loss = 0.0
-    correct = 0
+    total_loss = torch.zeros((), device=device)
+    correct = torch.zeros((), device=device)
     total_tokens = 0
 
     for event_data, labels in loader:
@@ -26,19 +26,21 @@ def train_epoch(model, loader, optimizer, criterion, device):
         labels = labels.view(-1)
 
         mask = labels != -1
+        output = output[mask]
         labels = labels[mask]
 
         loss = criterion(output, labels)
         loss.backward()
         optimizer.step()
 
-        total_loss += loss.item() * labels.size(0)
+        batch_n = labels.size(0)
+        total_loss += loss.detach() * batch_n
         pred = output.argmax(dim=1)
-        correct += pred.eq(labels).sum().item()
-        total_tokens += labels.size(0)
+        correct += pred.eq(labels).sum()
+        total_tokens += batch_n
 
-    accuracy = correct / total_tokens if total_tokens else 0.0
-    avg_loss = total_loss / total_tokens if total_tokens else 0.0
+    accuracy = (correct / total_tokens).item() if total_tokens else 0.0
+    avg_loss = (total_loss / total_tokens).item() if total_tokens else 0.0
     return avg_loss, accuracy
 
 
@@ -49,8 +51,8 @@ def evaluate_epoch(model, loader, criterion, device):
         Tuple of (loss, accuracy).
     """
     model.eval()
-    total_loss = 0.0
-    correct = 0
+    total_loss = torch.zeros((), device=device)
+    correct = torch.zeros((), device=device)
     total_tokens = 0
 
     with torch.no_grad():
@@ -64,15 +66,18 @@ def evaluate_epoch(model, loader, criterion, device):
             labels = labels.view(-1)
 
             mask = labels != -1
+            output = output[mask]
             labels = labels[mask]
 
             loss = criterion(output, labels)
-            total_loss += loss.item() * labels.size(0)
 
+            batch_n = labels.size(0)
+            # PERF: stessa ragione di train_epoch, vedi commento sopra.
+            total_loss += loss.detach() * batch_n
             pred = output.argmax(dim=1)
-            correct += pred.eq(labels).sum().item()
-            total_tokens += labels.size(0)
+            correct += pred.eq(labels).sum()
+            total_tokens += batch_n
 
-    accuracy = correct / total_tokens if total_tokens else 0.0
-    avg_loss = total_loss / total_tokens if total_tokens else 0.0
+    accuracy = (correct / total_tokens).item() if total_tokens else 0.0
+    avg_loss = (total_loss / total_tokens).item() if total_tokens else 0.0
     return avg_loss, accuracy

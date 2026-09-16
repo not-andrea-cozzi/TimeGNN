@@ -21,8 +21,8 @@ games_pipeline:
     #  skip_games: 0
     #  max_games: 100000
 
-    - path: "RawData/ficsgamesdb_2018_standard2000_movetimes_4339956.pgn"
-      tag: "games_2018_standard2000_02"
+    - path: "RawData/ficsgamesdb_2023_chess_movetimes_4339907.pgn"
+      tag: "games_2023_01"
       skip_games: 0
       max_games: 50000
 

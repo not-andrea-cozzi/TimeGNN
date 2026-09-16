@@ -197,15 +197,7 @@ def build_dataloader(
     shuffle: bool,
     device: str = "cpu",
 ) -> DataLoader:
-    """
-    Costruisce un DataLoader con parametri sicuri rispetto alla RAM
-    ed efficienti su GPU.
 
-    - num_workers: da config (default 0)
-    - persistent_workers: solo se num_workers > 0
-    - prefetch_factor: default 4 se num_workers > 0, altrimenti None
-    - pin_memory: default True se device == 'cuda'
-    """
     num_workers = int(section.get("num_workers", 0))
     persistent = bool(section.get("persistent_workers", False)) and num_workers > 0
     prefetch = int(section.get("prefetch_factor", 4)) if num_workers > 0 else None
@@ -278,6 +270,7 @@ def run_training(
         f"Train: {len(train_ds):,} samples in {len(train_loader)} batches | "
         f"Val: {len(val_ds):,} samples in {len(val_loader)} batches | "
         f"num_workers={section.get('num_workers', 0)} | "
+        f"prefetch_factor={section.get('prefetch_factor', 4) if section.get('num_workers', 0) > 0 else 'n/a'} | "
         f"pin_memory={train_loader.pin_memory}"
     )
 

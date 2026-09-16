@@ -2,10 +2,34 @@ from __future__ import annotations
 
 from typing import List, Optional, Tuple
 
+import numpy as np
 import torch
 from torch.utils.data import Dataset
 from torch_geometric.data import Batch, Data
 from torch.nn.utils.rnn import pad_sequence
+
+
+def _chain_edge_index(num_events: int) -> torch.Tensor:
+    """Build a [2, num_events-1] linear-chain edge_index (j -> j+1) using
+    vectorized torch.arange instead of a Python list comprehension + .t().
+    """
+    if num_events <= 1:
+        return torch.empty((2, 0), dtype=torch.long)
+    src = torch.arange(0, num_events - 1, dtype=torch.long)
+    dst = torch.arange(1, num_events, dtype=torch.long)
+    return torch.stack([src, dst], dim=0)
+
+
+def _to_float_tensor_batch(array_like) -> torch.Tensor:
+    arr = np.asarray(array_like)
+    return torch.from_numpy(arr).float()
+
+
+def _to_long_tensor_batch(array_like) -> torch.Tensor:
+    """Same idea as _to_float_tensor_batch but for long/int tensors
+    (core_encode / event id columns)."""
+    arr = np.asarray(array_like)
+    return torch.from_numpy(arr).long()
 
 
 def prepare_data_core_2edges(
@@ -18,15 +42,17 @@ def prepare_data_core_2edges(
     """Build PyG Data objects with edge types and time diffs."""
     data_list_event = []
 
-    for i in range(len(event_encode)):
-        node_features = torch.tensor(event_encode[i], dtype=torch.float)
-        node_core = torch.tensor(core_encode[i], dtype=torch.long)
-        time = None if node_times is None else torch.tensor(node_times[i], dtype=torch.float)
-        num_events = (node_core[:, 0] != -1).sum()
+    node_features_all = _to_float_tensor_batch(event_encode)
+    node_core_all = _to_long_tensor_batch(core_encode)
+    time_all = None if node_times is None else _to_float_tensor_batch(node_times)
 
-        edge_index = torch.tensor(
-            [[j, j + 1] for j in range(num_events - 1)], dtype=torch.long
-        ).t().contiguous()
+    for i in range(len(event_encode)):
+        node_features = node_features_all[i]
+        node_core = node_core_all[i]
+        time = None if time_all is None else time_all[i]
+        num_events = int((node_core[:, 0] != -1).sum())
+
+        edge_index = _chain_edge_index(num_events)
 
         time_diffs = scaled_time_diffs[i][: num_events - 1]
         edge_types = edge_types_encoded[i][: num_events - 1]
@@ -55,10 +81,14 @@ def prepare_data_core_2edges(
 def prepare_data_y(event_encode, y_encode):
     """Prepare per-node labels aligned with event sequences."""
     data_list = []
+
+    node_features_all = _to_float_tensor_batch(event_encode)
+    labels_all = _to_long_tensor_batch(y_encode)
+
     for i in range(len(event_encode)):
-        node_features = torch.tensor(event_encode[i], dtype=torch.float)
-        labels = torch.tensor(y_encode[i], dtype=torch.long)
-        num_events = (node_features[:, 0] != -1).sum()
+        node_features = node_features_all[i]
+        labels = labels_all[i]
+        num_events = int((node_features[:, 0] != -1).sum())
         data_list.append(labels[:num_events])
     return data_list
 
@@ -70,14 +100,17 @@ def prepare_data_core_timedif(
     node_times: Optional[list] = None,
 ):
     data_list_event = []
-    for i in range(len(event_encode)):
-        node_features = torch.tensor(event_encode[i], dtype=torch.float)
-        node_core = torch.tensor(core_encode[i], dtype=torch.long)
-        num_events = (node_core[:, 0] != -1).sum()
 
-        edge_index = torch.tensor(
-            [[j, j + 1] for j in range(num_events - 1)], dtype=torch.long
-        ).t().contiguous()
+    node_features_all = _to_float_tensor_batch(event_encode)
+    node_core_all = _to_long_tensor_batch(core_encode)
+    time_all = None if node_times is None else _to_float_tensor_batch(node_times)
+
+    for i in range(len(event_encode)):
+        node_features = node_features_all[i]
+        node_core = node_core_all[i]
+        num_events = int((node_core[:, 0] != -1).sum())
+
+        edge_index = _chain_edge_index(num_events)
         edge_attr = torch.tensor(
             scaled_time_diffs[i][: num_events - 1], dtype=torch.float
         ).view(-1, 1)
@@ -90,8 +123,8 @@ def prepare_data_core_timedif(
             event_ids=event_ids,
         )
         graph_data.num_nodes = num_events
-        if node_times is not None:
-            graph_data.time = torch.tensor(node_times[i], dtype=torch.float)
+        if time_all is not None:
+            graph_data.time = time_all[i]
         data_list_event.append(graph_data)
     return data_list_event
 
@@ -99,15 +132,18 @@ def prepare_data_core_timedif(
 def prepare_data_core(event_encode, core_encode, node_times):
     """Build PyG Data objects without explicit edge attributes."""
     data_list_event = []
-    for i in range(len(event_encode)):
-        node_features = torch.tensor(event_encode[i], dtype=torch.float)
-        node_core = torch.tensor(core_encode[i], dtype=torch.long)
-        time = torch.tensor(node_times[i], dtype=torch.float)
-        num_events = (node_core[:, 0] != -1).sum()
 
-        edge_index = torch.tensor(
-            [[j, j + 1] for j in range(num_events - 1)], dtype=torch.long
-        ).t().contiguous()
+    node_features_all = _to_float_tensor_batch(event_encode)
+    node_core_all = _to_long_tensor_batch(core_encode)
+    time_all = _to_float_tensor_batch(node_times)
+
+    for i in range(len(event_encode)):
+        node_features = node_features_all[i]
+        node_core = node_core_all[i]
+        time = time_all[i]
+        num_events = int((node_core[:, 0] != -1).sum())
+
+        edge_index = _chain_edge_index(num_events)
         event_ids = node_core[:num_events]
 
         graph_data = Data(
@@ -124,14 +160,16 @@ def prepare_data_core(event_encode, core_encode, node_times):
 def prepare_data_prefix(event_encode, core_encode, scaled_time_diffs):
     """Build PyG Data objects for prefix-based GCN models."""
     data_list_event = []
-    for i in range(len(event_encode)):
-        node_features = torch.tensor(event_encode[i], dtype=torch.float)
-        node_core = torch.tensor(core_encode[i], dtype=torch.long)
-        num_events = (node_core[:, 0] != -1).sum()
 
-        edge_index = torch.tensor(
-            [[j, j + 1] for j in range(num_events - 1)], dtype=torch.long
-        ).t().contiguous()
+    node_features_all = _to_float_tensor_batch(event_encode)
+    node_core_all = _to_long_tensor_batch(core_encode)
+
+    for i in range(len(event_encode)):
+        node_features = node_features_all[i]
+        node_core = node_core_all[i]
+        num_events = int((node_core[:, 0] != -1).sum())
+
+        edge_index = _chain_edge_index(num_events)
         edge_attr = torch.tensor(
             scaled_time_diffs[i][: num_events - 1], dtype=torch.float
         ).view(-1, 1)
