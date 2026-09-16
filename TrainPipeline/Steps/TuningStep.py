@@ -151,7 +151,36 @@ def estimate_warmup_steps(steps_per_epoch: int, warmup_epochs_equivalent: float 
 # Normalizzazione raccomandata: GraphNorm/LayerNorm al posto di BatchNorm1d
 # ---------------------------------------------------------------------------
 def recommend_norm_kind(batch_size: int) -> str:
+    """Raccomanda un norm_kind per i modelli timegnn in base alla dimensione
+    del batch usata in training.
+
+    Nota importante su `batch_size`: nei DataLoader PyG rappresenta il numero
+    di GRAFI per batch, non di nodi. La normalizzazione problematica è
+    BatchNorm1d applicata sui nodi concatenati di tutti i grafi del batch: la
+    sua statistica dipende dalla composizione (quanti nodi per grafo)
+    del batch, che cambia ad ogni iterazione. Sotto la soglia di 32 grafi
+    la varianza inter-batch è tipicamente troppo alta e LayerNorm (per-nodo,
+    indipendente dal batch) è più stabile; sopra, GraphNorm (per-grafo via
+    scatter su data.batch) sfrutta meglio la struttura del grafo.
+
+    I valori restituiti ("layer_norm", "graph_norm") sono quelli accettati
+    da timegnn.models.norm_layers.make_norm_layer; "batch_norm" e "none"
+    restano disponibili per retrocompatibilità ma non vengono raccomandati.
+    """
     return "layer_norm" if batch_size < 32 else "graph_norm"
+
+
+def _resolve_batch_size_for_norm(cfg: Dict[str, Any]) -> int:
+    """Estrae il batch_size effettivo dai config dei training step.
+
+    Guarda prima in train_basic, poi in train_time_aware; il fallback 16
+    riflette il default reale di GATBasicConfig/GATTimeDecayConfig (vedi
+    docstring di timegnn.models.norm_layers), non un valore arbitrario.
+    """
+    train_basic = cfg.get("train_basic", {}) or {}
+    train_time_aware = cfg.get("train_time_aware", {}) or {}
+    batch_size = train_basic.get("batch_size") or train_time_aware.get("batch_size")
+    return int(batch_size) if batch_size is not None else 16
 
 
 # ---------------------------------------------------------------------------
@@ -194,8 +223,22 @@ def run_tuning_step(
         total_planned_epochs: epoche pianificate, per total_steps (coseno).
 
     Returns:
-        Dict con: hw_settings, class_weights_path, warmup_steps (o None),
-        recommended_norm, config usata.
+        Dict con:
+            - hw_settings: settings hardware (device, amp_dtype, ...).
+            - class_weights_path: path del file .pt con i pesi di classe.
+            - warmup_steps: int se steps_per_epoch e' noto, altrimenti None.
+            - total_steps: int se SIA steps_per_epoch SIA total_planned_epochs
+              sono noti, altrimenti None. Quando None, il chiamante NON puo'
+              usare build_warmup_cosine_lambda (che richiede total_steps >
+              warmup_steps) e deve ricadere su uno schedule alternativo
+              (es. LR costante o cosine senza warmup).
+            - recommended_norm: "layer_norm" o "graph_norm", da passare come
+              norm_kind al costruttore dei modelli. NOTA: passarlo
+              esplicitamente e' necessario perche' altrimenti un config
+              legacy con use_batch_norm=True resterebbe attivo (il mapping
+              retrocompatibile in DualGATModel usa use_batch_norm solo
+              quando norm_kind e' None).
+            - class_weight_scheme, move_vocab_size: eco della config usata.
     """
     tuning_cfg = TuningStepConfig(**{**TuningStepConfig().__dict__, **(cfg.get("tuning", {}) or {})})
 
@@ -244,14 +287,29 @@ def run_tuning_step(
         state.mark_failed("tuning", str(e))
         raise
 
-    warmup_steps = None
-    total_steps = None
+    warmup_steps: Optional[int] = None
+    total_steps: Optional[int] = None
     if steps_per_epoch is not None:
         warmup_steps = estimate_warmup_steps(steps_per_epoch, tuning_cfg.warmup_epochs_equivalent)
         if total_planned_epochs is not None:
             total_steps = steps_per_epoch * total_planned_epochs
+        else:
+            logger.info(
+                "[tuning] total_planned_epochs non fornito: total_steps resta None, "
+                "il chiamante dovra' usare uno schedule LR senza coseno."
+            )
+    elif total_planned_epochs is not None:
+        logger.info(
+            "[tuning] steps_per_epoch non fornito: warmup_steps e total_steps restano None. "
+            "Il chiamante puo' calcolare warmup_steps con estimate_warmup_steps(len(loader), ...)."
+        )
 
-    recommended_norm = recommend_norm_kind(batch_size=cfg.get("train_basic", {}).get("batch_size", 128))
+    batch_size_for_norm = _resolve_batch_size_for_norm(cfg)
+    recommended_norm = recommend_norm_kind(batch_size=batch_size_for_norm)
+    logger.info(
+        f"[tuning] norm raccomandata: {recommended_norm} "
+        f"(batch_size={batch_size_for_norm} grafi/batch)."
+    )
 
     meta: Dict[str, Any] = {
         "hw_settings": hw_settings,
@@ -259,6 +317,7 @@ def run_tuning_step(
         "total_steps": total_steps,
         "min_lr_ratio": tuning_cfg.min_lr_ratio,
         "recommended_norm": recommended_norm,
+        "batch_size_for_norm": batch_size_for_norm,
         "class_weight_scheme": tuning_cfg.class_weight_scheme,
         "move_vocab_size": tuning_cfg.move_vocab_size,
     }

@@ -107,7 +107,7 @@ class PrefixGCNClassifier(nn.Module):
         d = self.embedding(data.event_ids.squeeze(-1))
         d = self._run_path(self.gcn_embed, self.bn_embed, d, data.edge_index, data.edge_attr)
 
-        f = data.x.clone()
+        f = data.x
         f[f == -1] = 0
         f = self._run_path(self.gcn_event, self.bn_event, f, data.edge_index, data.edge_attr)
 

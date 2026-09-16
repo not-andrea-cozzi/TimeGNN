@@ -18,7 +18,7 @@ MOVE_VOCAB_SIZE = 64 * 64 * NUM_PROMOTION_SLOTS  # 20480: (from*64+to)*5 + promo
 
 # event_ids: 0 = casella vuota, 1..12 = piece_type*2+color+1
 EVENT_ID_EMPTY = 0
-NUM_EVENT_ID_CATEGORIES = 13  # 0 (vuoto) + 12 (6 piece_type x 2 colori)
+NUM_EVENT_ID_CATEGORIES = 15  # SE NO CRASHA, LASCIARE 15
 
 EDGE_LEGAL_MOVE = 0
 EDGE_ATTACK = 1

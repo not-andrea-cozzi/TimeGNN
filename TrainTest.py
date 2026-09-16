@@ -1,14 +1,13 @@
 from __future__ import annotations
 
 import argparse
-import glob
 import json
 import logging
 import os
 import shutil
 import sys
 import time
-from typing import List, Optional
+from typing import List
 
 import torch
 from torch_geometric.data import Data
@@ -21,6 +20,61 @@ logger = logging.getLogger("train_main_test")
 
 SHARD_FILENAME_TEMPLATE = "shard_{:05d}.pt"
 MANIFEST_FILENAME = "manifest.json"
+
+
+# ----------------------------------------------------------------------
+# Mini-state in-memory per il TuningStep
+# ----------------------------------------------------------------------
+class _MiniState:
+    """State minimale per lo smoke test: espone solo i tre metodi che
+    TuningStep.run_tuning_step usa (is_done / mark_done / mark_failed).
+
+    Non persiste nulla su disco: ogni run dello smoke test riparte da
+    zero (is_done ritorna sempre False), cosi' il tuning viene
+    effettivamente ricalcolato ad ogni invocazione.
+    """
+
+    def __init__(self) -> None:
+        self._done: dict = {}
+
+    def is_done(self, step: str, skip: bool = False) -> bool:
+        return (not skip) and step in self._done
+
+    def mark_done(self, step: str, **kwargs) -> None:
+        self._done[step] = kwargs
+
+    def mark_failed(self, step: str, reason: str) -> None:
+        logger.error(f"[tuning] step '{step}' fallito: {reason}")
+
+
+# ----------------------------------------------------------------------
+# Import robusto di run_tuning_step
+# ----------------------------------------------------------------------
+def _import_run_tuning_step():
+    """Importa run_tuning_step dal percorso canonico della pipeline.
+    Prova prima il percorso usato da TrainMain, poi un fallback diretto.
+    Solleva ImportError con messaggio chiaro se non lo trova."""
+    candidates = (
+        "TrainPipeline.Steps.TuningStep",
+        "TrainPipeline.Steps.tuning_step",
+        "TrainPipeline.TuningStep",
+    )
+    last_err: Exception | None = None
+    for mod_path in candidates:
+        try:
+            mod = __import__(mod_path, fromlist=["run_tuning_step"])
+            fn = getattr(mod, "run_tuning_step", None)
+            if fn is not None:
+                return fn
+        except Exception as e:  # noqa: BLE001
+            last_err = e
+            continue
+    raise ImportError(
+        "Impossibile importare run_tuning_step da TrainPipeline.Steps.TuningStep. "
+        "Verifica il percorso del modulo con: "
+        "  grep -rn 'def run_tuning_step' TrainPipeline/"
+        f" Ultimo errore: {last_err}"
+    )
 
 
 # ----------------------------------------------------------------------
@@ -90,7 +144,10 @@ def _write_single_shard_dataset(items: List[Data], out_dir: str) -> None:
         json.dump(manifest, f, indent=2)
     os.replace(tmp_manifest, manifest_path)
 
-    logger.info(f"Mini-shard scritto: {shard_path} ({len(items)} campioni) -> manifest in {manifest_path}")
+    logger.info(
+        f"Mini-shard scritto: {shard_path} ({len(items)} campioni) "
+        f"-> manifest in {manifest_path}"
+    )
 
 
 def build_mini_dataset(
@@ -122,6 +179,7 @@ def build_smoke_test_cfg(
     checkpoint_path: str,
     batch_size: int,
     epochs: int,
+    move_vocab_size: int | None = None,
 ) -> dict:
     """Sezione 'train_basic' minimale. Valori scelti per essere leggeri
     su una GPU da 2GB (MX330): batch_size piccolo, hidden dims ridotte,
@@ -129,7 +187,7 @@ def build_smoke_test_cfg(
     elemento), niente num_workers (evita overhead di processi extra per
     un test da pochi secondi), niente compile.
     """
-    return {
+    cfg = {
         "enabled": True,
         "checkpoint": checkpoint_path,
         "train_dir": None,  # sovrascritto dal chiamante di run_training
@@ -156,8 +214,63 @@ def build_smoke_test_cfg(
         "compile": False,
         "memory_cleanup_threshold_gb": 1.5,
     }
+    return cfg
 
 
+def build_tuning_cfg(
+    move_vocab_size: int | None = None,
+) -> dict:
+    """Sezione 'tuning' per lo smoke test.
+
+    enabled=True attiva lo step. move_vocab_size viene allineato al
+    vocabolario reale del dataset se noto (evita di allocare un tensore
+    di class_weights da 20480 elementi quando il dataset ne ha ~15).
+    """
+    cfg: dict = {"enabled": True}
+    if move_vocab_size is not None:
+        cfg["move_vocab_size"] = int(move_vocab_size)
+    return cfg
+
+
+def _infer_move_vocab_size(train_dir: str) -> int | None:
+    """Legge il vocabolario delle mosse dal manifest, se presente.
+    Cerca chiavi comuni: move_vocab_size, num_event_id_categories,
+    vocab_size. Ritorna None se non trova nulla (in quel caso il
+    TuningStep usa il suo default)."""
+    try:
+        manifest = _read_manifest(train_dir)
+    except FileNotFoundError:
+        return None
+    for key in ("move_vocab_size", "num_event_id_categories", "vocab_size"):
+        if key in manifest and isinstance(manifest[key], int):
+            return int(manifest[key])
+    return None
+
+
+def _infer_move_vocab_size_from_data(train_dir: str) -> int | None:
+    """Fallback: scansiona il primo shard e calcola max(event_ids)+1."""
+    manifest = _read_manifest(train_dir)
+    if manifest.get("num_shards", 0) == 0:
+        return None
+    shard_path = os.path.join(train_dir, SHARD_FILENAME_TEMPLATE.format(0))
+    if not os.path.exists(shard_path):
+        return None
+    try:
+        items = torch.load(shard_path, weights_only=False)
+    except Exception:
+        return None
+    max_id = -1
+    for d in items:
+        ids = getattr(d, "event_ids", None)
+        if ids is None or not torch.is_tensor(ids) or ids.numel() == 0:
+            continue
+        max_id = max(max_id, int(ids.max()))
+    return (max_id + 1) if max_id >= 0 else None
+
+
+# ----------------------------------------------------------------------
+# Main
+# ----------------------------------------------------------------------
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="Smoke-test: verifica che il training giri end-to-end su un piccolo sottoinsieme."
@@ -170,6 +283,18 @@ def main() -> None:
     parser.add_argument("--batch-size", type=int, default=8, help="Batch size (piccolo per MX330/2GB).")
     parser.add_argument("--epochs", type=int, default=1, help="Numero di epoche (default 1: solo verifica che giri).")
     parser.add_argument("--keep-output", action="store_true", help="Non cancellare --out-root a fine test.")
+    parser.add_argument(
+        "--no-tuning",
+        action="store_true",
+        help="Disattiva lo step di tuning (utile per isolare problemi di training).",
+    )
+    parser.add_argument(
+        "--move-vocab-size",
+        type=int,
+        default=None,
+        help="Vocabolario mosse per il tuning. Se omesso, viene inferito dal "
+             "manifest o dal primo shard del mini-train.",
+    )
     args = parser.parse_args()
 
     TrainMain.setup_logging("INFO")
@@ -177,7 +302,7 @@ def main() -> None:
     logger.info("SMOKE TEST TRAINING (solo verifica funzionamento, NON valuta qualita')")
     logger.info("=" * 70)
 
-    device = "cuda" if torch.cuda.is_available() else "cpu"
+    device = "cpu"
     if device == "cuda":
         gpu_name = torch.cuda.get_device_name(0)
         total_mem_gb = torch.cuda.get_device_properties(0).total_memory / 1024**3
@@ -206,6 +331,24 @@ def main() -> None:
     )
     logger.info(f"Mini-dataset pronto in {time.monotonic() - t0:.2f}s.")
 
+    # ------------------------------------------------------------------
+    # Inferenza move_vocab_size per il tuning
+    # ------------------------------------------------------------------
+    if args.move_vocab_size is not None:
+        move_vocab_size = int(args.move_vocab_size)
+        logger.info(f"[tuning] move_vocab_size forzato da CLI: {move_vocab_size}")
+    else:
+        move_vocab_size = _infer_move_vocab_size(args.train_dir)
+        if move_vocab_size is None:
+            move_vocab_size = _infer_move_vocab_size_from_data(train_mini_dir)
+            if move_vocab_size is not None:
+                logger.info(
+                    f"[tuning] move_vocab_size inferito dal primo shard: "
+                    f"{move_vocab_size} (max(event_ids)+1)"
+                )
+        else:
+            logger.info(f"[tuning] move_vocab_size letto dal manifest: {move_vocab_size}")
+
     checkpoint_dir = os.path.join(args.out_root, "checkpoints")
     os.makedirs(checkpoint_dir, exist_ok=True)
     checkpoint_path = os.path.join(checkpoint_dir, "smoke_basic.pt")
@@ -213,13 +356,20 @@ def main() -> None:
     # Rimuove eventuali checkpoint di un test precedente, cosi' questa
     # run parte sempre da zero (niente resume accidentale tra run di test
     # diverse con parametri diversi, es. batch_size cambiato).
-    for pattern in ("smoke_basic_last.pt", "smoke_basic_best.pt", "smoke_basic_last_scheduler.pt", "smoke_basic_best_scheduler.pt"):
+    for pattern in (
+        "smoke_basic_last.pt",
+        "smoke_basic_best.pt",
+        "smoke_basic_last_scheduler.pt",
+        "smoke_basic_best_scheduler.pt",
+    ):
         stale = os.path.join(checkpoint_dir, pattern)
         if os.path.exists(stale):
             os.remove(stale)
 
     smoke_cfg = {
-        "train_basic": build_smoke_test_cfg(checkpoint_path, args.batch_size, args.epochs),
+        "train_basic": build_smoke_test_cfg(
+            checkpoint_path, args.batch_size, args.epochs, move_vocab_size=move_vocab_size
+        ),
         # train_time_aware presente solo perche' validate_config lo
         # richiede se in futuro questo script venisse esteso; qui non
         # viene mai eseguito (run_training e' chiamato direttamente sotto,
@@ -227,11 +377,60 @@ def main() -> None:
         "train_time_aware": {"enabled": False},
         "evaluate": {"enabled": False},
         "pipeline": {},
+        "tuning": {"enabled": False} if args.no_tuning else build_tuning_cfg(move_vocab_size),
     }
 
+    # ------------------------------------------------------------------
+    # Tuning step (class_weights + warmup schedule + norm raccomandata)
+    # ------------------------------------------------------------------
+    # TrainTest.py non passa da TrainMain.main(), che e' l'unico punto in
+    # cui run_tuning_step verrebbe chiamato normalmente: lo invochiamo
+    # qui esplicitamente, cosi' lo smoke test copre anche questo step.
+    #
+    # I metadati del tuning vengono scritti in args.out_root/Tuning, non
+    # in Dataset/ reale: out_root viene comunque rimosso a fine test se
+    # --keep-output non e' passato.
+    tuning_meta: dict = {}
+    if not args.no_tuning:
+        logger.info("-" * 70)
+        logger.info("Esecuzione tuning step (class_weights + warmup + norm)...")
+        logger.info("-" * 70)
+
+        try:
+            run_tuning_step = _import_run_tuning_step()
+        except ImportError as e:
+            logger.error(f"Impossibile importare run_tuning_step: {e}")
+            raise
+
+        t_tuning_0 = time.monotonic()
+        try:
+            tuning_meta = run_tuning_step(
+                cfg=smoke_cfg,
+                state=_MiniState(),
+                dataset_dir=args.out_root,
+                train_dir=train_mini_dir,
+                steps_per_epoch=None,
+                total_planned_epochs=None,
+            )
+        except Exception:
+            logger.error(
+                "TUNING STEP FALLITO: run_tuning_step ha sollevato un'eccezione. "
+                "Vedi traceback sopra/sotto per la causa.",
+                exc_info=True,
+            )
+            raise
+
+        logger.info(
+            f"Tuning completato in {time.monotonic() - t_tuning_0:.2f}s: {tuning_meta}"
+        )
+    else:
+        logger.info("Tuning disattivato (--no-tuning): salto run_tuning_step.")
+
     logger.info("-" * 70)
-    logger.info(f"Avvio run_training('basic', ...) su {args.n_train} train / {args.n_val} val, "
-                f"batch_size={args.batch_size}, epochs={args.epochs}, device={device}.")
+    logger.info(
+        f"Avvio run_training('basic', ...) su {args.n_train} train / {args.n_val} val, "
+        f"batch_size={args.batch_size}, epochs={args.epochs}, device={device}."
+    )
     logger.info("-" * 70)
 
     t0 = time.monotonic()
@@ -244,7 +443,7 @@ def main() -> None:
             checkpoint_path,
             device,
             use_amp,
-            tuning_meta={},
+            tuning_meta=tuning_meta,
         )
     except Exception:
         logger.error(
@@ -269,7 +468,10 @@ def main() -> None:
             logger.warning(f"Checkpoint {label} atteso ma non trovato: {p}")
 
     if not args.keep_output:
-        logger.info(f"Rimozione output di test in '{args.out_root}' (usa --keep-output per conservarli).")
+        logger.info(
+            f"Rimozione output di test in '{args.out_root}' "
+            f"(usa --keep-output per conservarli)."
+        )
         shutil.rmtree(args.out_root, ignore_errors=True)
     else:
         logger.info(f"Output di test conservati in '{args.out_root}' (--keep-output).")
