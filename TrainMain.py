@@ -297,12 +297,9 @@ def run_training(
               - warmup lineare + cosine decay per i primi warmup_steps
                 step, poi passa a ReduceLROnPlateau come gia' avveniva
               - norm_kind consigliato ("layer_norm"/"graph_norm") al
-                posto di BatchNorm1d, SOLO per model_type == "basic":
-                DualGATTimeAwareModel non espone ancora il parametro
-                norm_kind (il suo __init__ non e' stato modificato,
-                mancava dal contesto disponibile) — per "time_aware" si
-                usa quindi sempre use_batch_norm come da config originale,
-                e norm_kind viene ignorato con un log esplicito.
+                posto di BatchNorm1d, sia per model_type == "basic" che
+                "time_aware" (entrambi i modelli espongono ora lo stesso
+                parametro norm_kind, vedi gat_basic.py e gat_time_decay.py).
     """
     section = cfg["train_basic"] if model_type == "basic" else cfg["train_time_aware"]
     logger.info(f"Avvio training {model_type} con configurazione: {section}")
@@ -316,30 +313,25 @@ def run_training(
     # 1. Modello e dati ----------------------------------------------------
     if model_type == "basic":
         model_class = DualGATModel
-        edge_dim = NUM_EDGE_TYPES
-        extra_kwargs: Dict[str, Any] = {}
+        extra_kwargs: Dict[str, Any] = {"edge_dim": NUM_EDGE_TYPES}
 
         norm_kind = tuning_meta.get("recommended_norm")
         if norm_kind is not None:
             logger.info(f"[tuning] norm_kind consigliato applicato al modello basic: '{norm_kind}'.")
             extra_kwargs["norm_kind"] = norm_kind
     else:
+        # DualGATTimeAwareModel accetta ora norm_kind, allineato a
+        # DualGATModel (vedi gat_time_decay.py, stesso pattern di
+        # gat_basic.py/norm_layers.py). edge_dim non va passato: il
+        # modello time-aware usa internamente edge_dim=1 fisso
+        # (edge_attr = data_event.time, uno scalare per arco).
         model_class = DualGATTimeAwareModel
-        edge_dim = TIME_EDGE_DIM
         extra_kwargs = {"lambda_decay": float(section.get("lambda_decay", 0.01))}
 
-        if tuning_meta.get("recommended_norm") is not None:
-            # TODO: DualGATTimeAwareModel non e' stato ancora esteso con
-            # un parametro norm_kind (il file sorgente non era disponibile
-            # al momento di questa modifica). Una volta esteso con lo
-            # stesso pattern di DualGATModel/norm_layers.make_norm_layer,
-            # rimuovere questo warning e passare norm_kind=... qui come
-            # sopra per il ramo "basic".
-            logger.warning(
-                "[tuning] norm_kind consigliato disponibile ma DualGATTimeAwareModel "
-                "non supporta ancora questo parametro: si usa use_batch_norm da config "
-                "(nessun cambiamento per il modello time_aware)."
-            )
+        norm_kind = tuning_meta.get("recommended_norm")
+        if norm_kind is not None:
+            logger.info(f"[tuning] norm_kind consigliato applicato al modello time_aware: '{norm_kind}'.")
+            extra_kwargs["norm_kind"] = norm_kind
 
     train_ds = ShardedGraphDataset(train_dir, shuffle=True, seed=section.get("seed", 42))
     val_ds = ShardedGraphDataset(val_dir, shuffle=False, seed=section.get("seed", 42))
@@ -368,7 +360,6 @@ def run_training(
         gat_hidden_dim_concat=section.get("gat_hidden_dim_concat", 128),
         output_dim=MOVE_VOCAB_SIZE,
         num_heads=section.get("num_heads", 4),
-        edge_dim=edge_dim,
         num_layers=section.get("num_layers", 1),
         dropout=section.get("dropout", 0.2),          # <-- default più robusto
         use_batch_norm=section.get("use_batch_norm", False),
@@ -634,7 +625,10 @@ def evaluate_models(cfg: Dict[str, Any], device: str, use_amp: bool) -> None:
         f"pin_memory={test_loader.pin_memory}"
     )
 
-    def load_model(checkpoint_path, model_class, edge_dim, extra_kwargs):
+    def load_model(checkpoint_path, model_class, extra_kwargs):
+        # extra_kwargs porta edge_dim (solo per DualGATModel) e/o
+        # lambda_decay (solo per DualGATTimeAwareModel): nessun parametro
+        # comune tra i due costruttori viene forzato qui.
         logger.debug(f"Caricamento modello da {checkpoint_path}")
         model = model_class(
             num_event_features=NUM_EVENT_FEATURES,
@@ -645,7 +639,6 @@ def evaluate_models(cfg: Dict[str, Any], device: str, use_amp: bool) -> None:
             gat_hidden_dim_concat=cfg["train_basic"].get("gat_hidden_dim_concat", 128),
             output_dim=MOVE_VOCAB_SIZE,
             num_heads=cfg["train_basic"].get("num_heads", 4),
-            edge_dim=edge_dim,
             num_layers=cfg["train_basic"].get("num_layers", 1),
             dropout=cfg["train_basic"].get("dropout", 0.0),
             use_batch_norm=cfg["train_basic"].get("use_batch_norm", False),
@@ -669,14 +662,13 @@ def evaluate_models(cfg: Dict[str, Any], device: str, use_amp: bool) -> None:
         return model
 
     model_basic = load_model(
-        eval_cfg["model_basic_checkpoint"], DualGATModel, NUM_EDGE_TYPES, {}
+        eval_cfg["model_basic_checkpoint"], DualGATModel, {"edge_dim": NUM_EDGE_TYPES}
     )
     model_basic.eval()
 
     model_time = load_model(
         eval_cfg["model_time_aware_checkpoint"],
         DualGATTimeAwareModel,
-        TIME_EDGE_DIM,
         {"lambda_decay": cfg["train_time_aware"].get("lambda_decay", 0.01)},
     )
     model_time.eval()

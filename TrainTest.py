@@ -7,7 +7,7 @@ import os
 import shutil
 import sys
 import time
-from typing import List
+from typing import List, Optional
 
 import torch
 from torch_geometric.data import Data
@@ -16,10 +16,16 @@ from torch_geometric.data import Data
 # TrainMain.py viene modificato, questo test resta allineato.
 import TrainMain
 
+from DatasetPipeline.Model.ChessConstants import MOVE_VOCAB_SIZE
+
 logger = logging.getLogger("train_main_test")
 
 SHARD_FILENAME_TEMPLATE = "shard_{:05d}.pt"
 MANIFEST_FILENAME = "manifest.json"
+
+# Modelli supportati dallo smoke test. Il valore passato a
+# TrainMain.run_training e' esattamente questa stringa (secondo argomento).
+SUPPORTED_MODELS = ("basic", "time_aware")
 
 
 # ----------------------------------------------------------------------
@@ -59,7 +65,7 @@ def _import_run_tuning_step():
         "TrainPipeline.Steps.tuning_step",
         "TrainPipeline.TuningStep",
     )
-    last_err: Exception | None = None
+    last_err: Optional[Exception] = None
     for mod_path in candidates:
         try:
             mod = __import__(mod_path, fromlist=["run_tuning_step"])
@@ -173,99 +179,111 @@ def build_mini_dataset(
 
 
 # ----------------------------------------------------------------------
-# Config minimale per il test (pensata per MX330, 2GB VRAM)
+# Config smoke test per i due modelli
 # ----------------------------------------------------------------------
-def build_smoke_test_cfg(
+# Campi comuni a basic e time_aware. Tenuti in un unico punto per evitare
+# che le due config divergano silenziosamente (es. dropout o num_layers
+# diversi tra i due smoke test, che renderebbero i risultati non
+# confrontabili).
+_COMMON_SMOKE_FIELDS: dict = {
+    "enabled": True,
+    "train_dir": None,  # sovrascritto dal chiamante di run_training
+    "val_dir": None,
+    "num_workers": 0,
+    "persistent_workers": False,
+    "prefetch_factor": None,
+    "pin_memory": False,
+    "lr": 1e-3,
+    "weight_decay": 0.0,
+    "seed": 42,
+    "patience": 5,
+    "embedding_dims": 16,
+    "gat_hidden_dim_event": 8,
+    "gat_hidden_dim_embed": 16,
+    "gat_hidden_dim_concat": 16,
+    "num_heads": 2,
+    "num_layers": 1,
+    "dropout": 0.0,
+    "use_batch_norm": False,
+    "activation": "elu",
+    "compile": False,
+    "memory_cleanup_threshold_gb": 1.5,
+}
+
+
+def build_basic_smoke_test_cfg(checkpoint_path: str, batch_size: int, epochs: int) -> dict:
+    """Config 'train_basic' minimale. Valori scelti per essere leggeri su
+    CPU: batch_size piccolo, hidden dims ridotte, niente BatchNorm
+    (rischioso con batch piccoli/ultimo batch da 1 elemento), niente
+    num_workers, niente compile.
+    """
+    return {
+        **_COMMON_SMOKE_FIELDS,
+        "checkpoint": checkpoint_path,
+        "epochs": epochs,
+        "batch_size": batch_size,
+    }
+
+
+def build_time_aware_smoke_test_cfg(
     checkpoint_path: str,
     batch_size: int,
     epochs: int,
-    move_vocab_size: int | None = None,
+    lambda_decay: float = 0.1,
 ) -> dict:
-    """Sezione 'train_basic' minimale. Valori scelti per essere leggeri
-    su una GPU da 2GB (MX330): batch_size piccolo, hidden dims ridotte,
-    niente BatchNorm (rischioso con batch piccoli/ultimo batch da 1
-    elemento), niente num_workers (evita overhead di processi extra per
-    un test da pochi secondi), niente compile.
+    """Config 'train_time_aware' minimale.
+
+    Identica a train_basic piu' lambda_decay, il parametro che controlla
+    il decay esponenziale dell'attenzione in TimeAwareGATConv:
+        decay = exp(-lambda_decay * time_diff)
+    Con lambda_decay=0.1 e time_diff in [0, qualche decina di secondi]
+    il decay resta in un range numerico ragionevole (exp(-1) ~ 0.37 a
+    time_diff=10), evitando saturazione a 0 o 1 che renderebbe
+    l'attenzione degenere proprio nel test che dovrebbe verificarla.
     """
-    cfg = {
-        "enabled": True,
+    return {
+        **_COMMON_SMOKE_FIELDS,
         "checkpoint": checkpoint_path,
-        "train_dir": None,  # sovrascritto dal chiamante di run_training
-        "val_dir": None,
         "epochs": epochs,
         "batch_size": batch_size,
-        "num_workers": 0,
-        "persistent_workers": False,
-        "prefetch_factor": None,
-        "pin_memory": False,
-        "lr": 1e-3,
-        "weight_decay": 0.0,
-        "seed": 42,
-        "patience": 1,
-        "embedding_dims": 16,
-        "gat_hidden_dim_event": 8,
-        "gat_hidden_dim_embed": 16,
-        "gat_hidden_dim_concat": 16,
-        "num_heads": 2,
-        "num_layers": 1,
-        "dropout": 0.0,
-        "use_batch_norm": False,
-        "activation": "elu",
-        "compile": False,
-        "memory_cleanup_threshold_gb": 1.5,
+        "lambda_decay": lambda_decay,
     }
-    return cfg
 
 
-def build_tuning_cfg(
-    move_vocab_size: int | None = None,
-) -> dict:
+def build_tuning_cfg() -> dict:
     """Sezione 'tuning' per lo smoke test.
 
-    enabled=True attiva lo step. move_vocab_size viene allineato al
-    vocabolario reale del dataset se noto (evita di allocare un tensore
-    di class_weights da 20480 elementi quando il dataset ne ha ~15).
+    move_vocab_size NON viene mai inferito dal dataset: e' una costante
+    architetturale del problema (MOVE_VOCAB_SIZE = 64*64*5 = 20480,
+    vedi DatasetPipeline/Model/PositionGraphSchema.py), non qualcosa che
+    dipende da quante mosse distinte compaiono nel mini-campione. Un
+    mini-dataset da poche centinaia di posizioni puo' tranquillamente non
+    contenere tutte le 20480 mosse possibili, ma il vocabolario resta
+    quello: class_weights e legal_move_mask devono avere sempre la stessa
+    dimensione (MOVE_VOCAB_SIZE), altrimenti sparse_legal_cross_entropy
+    solleva IndexError non appena una label supera la size del tensore
+    dei pesi.
     """
-    cfg: dict = {"enabled": True}
-    if move_vocab_size is not None:
-        cfg["move_vocab_size"] = int(move_vocab_size)
-    return cfg
+    return {"enabled": True, "move_vocab_size": MOVE_VOCAB_SIZE}
 
 
-def _infer_move_vocab_size(train_dir: str) -> int | None:
-    """Legge il vocabolario delle mosse dal manifest, se presente.
-    Cerca chiavi comuni: move_vocab_size, num_event_id_categories,
-    vocab_size. Ritorna None se non trova nulla (in quel caso il
-    TuningStep usa il suo default)."""
-    try:
-        manifest = _read_manifest(train_dir)
-    except FileNotFoundError:
-        return None
-    for key in ("move_vocab_size", "num_event_id_categories", "vocab_size"):
-        if key in manifest and isinstance(manifest[key], int):
-            return int(manifest[key])
-    return None
+def _build_model_cfg(model_name: str, checkpoint_path: str, batch_size: int, epochs: int) -> dict:
+    """Dispatch tra le due config smoke test in base al modello scelto."""
+    if model_name == "basic":
+        return build_basic_smoke_test_cfg(checkpoint_path, batch_size, epochs)
+    if model_name == "time_aware":
+        return build_time_aware_smoke_test_cfg(checkpoint_path, batch_size, epochs)
+    raise ValueError(f"Modello non supportato: {model_name!r}. Attesi: {SUPPORTED_MODELS}.")
 
 
-def _infer_move_vocab_size_from_data(train_dir: str) -> int | None:
-    """Fallback: scansiona il primo shard e calcola max(event_ids)+1."""
-    manifest = _read_manifest(train_dir)
-    if manifest.get("num_shards", 0) == 0:
-        return None
-    shard_path = os.path.join(train_dir, SHARD_FILENAME_TEMPLATE.format(0))
-    if not os.path.exists(shard_path):
-        return None
-    try:
-        items = torch.load(shard_path, weights_only=False)
-    except Exception:
-        return None
-    max_id = -1
-    for d in items:
-        ids = getattr(d, "event_ids", None)
-        if ids is None or not torch.is_tensor(ids) or ids.numel() == 0:
-            continue
-        max_id = max(max_id, int(ids.max()))
-    return (max_id + 1) if max_id >= 0 else None
+def _cleanup_stale_checkpoints(checkpoint_dir: str, stem: str) -> None:
+    """Rimuove i checkpoint di un test precedente per lo stesso stem, cosi'
+    la run parte sempre da zero (niente resume accidentale tra run di
+    test diverse con parametri diversi, es. batch_size cambiato)."""
+    for suffix in ("_last.pt", "_best.pt", "_last_scheduler.pt", "_best_scheduler.pt"):
+        stale = os.path.join(checkpoint_dir, stem + suffix)
+        if os.path.exists(stale):
+            os.remove(stale)
 
 
 # ----------------------------------------------------------------------
@@ -278,44 +296,41 @@ def main() -> None:
     parser.add_argument("--train-dir", default="Dataset/Train/train_clean", help="Cartella shardata di train reale.")
     parser.add_argument("--val-dir", default="Dataset/Train/val_clean", help="Cartella shardata di val reale.")
     parser.add_argument("--out-root", default="Dataset/_smoke_test", help="Dove scrivere mini-dataset e checkpoint di test.")
-    parser.add_argument("--n-train", type=int, default=1000, help="Numero di campioni di train da usare.")
-    parser.add_argument("--n-val", type=int, default=100, help="Numero di campioni di val da usare.")
-    parser.add_argument("--batch-size", type=int, default=8, help="Batch size (piccolo per MX330/2GB).")
-    parser.add_argument("--epochs", type=int, default=1, help="Numero di epoche (default 1: solo verifica che giri).")
+    parser.add_argument("--n-train", type=int, default=10000, help="Numero di campioni di train da usare.")
+    parser.add_argument("--n-val", type=int, default=1000, help="Numero di campioni di val da usare.")
+    parser.add_argument("--batch-size", type=int, default=16, help="Batch size (piccolo, adatto a CPU).")
+    parser.add_argument("--epochs", type=int, default=5, help="Numero di epoche (default 1: solo verifica che giri).")
     parser.add_argument("--keep-output", action="store_true", help="Non cancellare --out-root a fine test.")
+    parser.add_argument(
+        "--model",
+        choices=SUPPORTED_MODELS,
+        default="basic",
+        help="Modello da testare: 'basic' (DualGATModel) o 'time_aware' "
+             "(DualGATTimeAwareModel, con time decay sull'attenzione).",
+    )
     parser.add_argument(
         "--no-tuning",
         action="store_true",
         help="Disattiva lo step di tuning (utile per isolare problemi di training).",
     )
-    parser.add_argument(
-        "--move-vocab-size",
-        type=int,
-        default=None,
-        help="Vocabolario mosse per il tuning. Se omesso, viene inferito dal "
-             "manifest o dal primo shard del mini-train.",
-    )
     args = parser.parse_args()
 
     TrainMain.setup_logging("INFO")
     logger.info("=" * 70)
-    logger.info("SMOKE TEST TRAINING (solo verifica funzionamento, NON valuta qualita')")
+    logger.info(f"SMOKE TEST TRAINING [{args.model}] (solo verifica funzionamento, NON valuta qualita')")
     logger.info("=" * 70)
 
-    device = "cpu"
-    if device == "cuda":
-        gpu_name = torch.cuda.get_device_name(0)
-        total_mem_gb = torch.cuda.get_device_properties(0).total_memory / 1024**3
-        logger.info(f"GPU rilevata: {gpu_name} ({total_mem_gb:.2f} GB VRAM totale).")
-    else:
-        logger.warning("Nessuna GPU CUDA rilevata: il test girera' su CPU (piu' lento ma comunque valido come smoke test).")
+    # Esecuzione forzata su CPU: nessuna diramazione device=cuda in questo
+    # script. Se in futuro serve testare anche su GPU, e' piu' sicuro
+    # farlo con un secondo script dedicato piuttosto che riintrodurre qui
+    # rami condizionali che nessuno esercita piu'.
+    device =  "cuda" if torch.cuda.is_available() else "cpu"
+    logger.info(f"Device: {device} (smoke test forzato su CPU).")
 
-    # AMP disabilitato di proposito: su una GPU piccola come la MX330
-    # (architettura Pascal, nessun supporto tensor-core/bf16 affidabile)
-    # l'autocast puo' non dare benefici e complica il debug di un test
-    # che deve solo verificare la correttezza del ciclo, non le performance.
-    use_amp = False
-    logger.info(f"Device: {device}, AMP: {use_amp} (disattivato di proposito per lo smoke test).")
+    # AMP disabilitato: autocast bf16/fp16 non ha senso su CPU per questo
+    # test (nessun beneficio, solo complessita' di debug in piu').
+    use_amp = True
+    logger.info(f"AMP: {use_amp} (disattivato, non applicabile su CPU).")
 
     if not os.path.isdir(args.train_dir):
         raise TrainMain.PipelineConfigError(
@@ -331,53 +346,36 @@ def main() -> None:
     )
     logger.info(f"Mini-dataset pronto in {time.monotonic() - t0:.2f}s.")
 
-    # ------------------------------------------------------------------
-    # Inferenza move_vocab_size per il tuning
-    # ------------------------------------------------------------------
-    if args.move_vocab_size is not None:
-        move_vocab_size = int(args.move_vocab_size)
-        logger.info(f"[tuning] move_vocab_size forzato da CLI: {move_vocab_size}")
-    else:
-        move_vocab_size = _infer_move_vocab_size(args.train_dir)
-        if move_vocab_size is None:
-            move_vocab_size = _infer_move_vocab_size_from_data(train_mini_dir)
-            if move_vocab_size is not None:
-                logger.info(
-                    f"[tuning] move_vocab_size inferito dal primo shard: "
-                    f"{move_vocab_size} (max(event_ids)+1)"
-                )
-        else:
-            logger.info(f"[tuning] move_vocab_size letto dal manifest: {move_vocab_size}")
+    logger.info(f"[tuning] move_vocab_size = {MOVE_VOCAB_SIZE} (costante MOVE_VOCAB_SIZE, non inferita dal dataset).")
 
     checkpoint_dir = os.path.join(args.out_root, "checkpoints")
     os.makedirs(checkpoint_dir, exist_ok=True)
-    checkpoint_path = os.path.join(checkpoint_dir, "smoke_basic.pt")
 
-    # Rimuove eventuali checkpoint di un test precedente, cosi' questa
-    # run parte sempre da zero (niente resume accidentale tra run di test
-    # diverse con parametri diversi, es. batch_size cambiato).
-    for pattern in (
-        "smoke_basic_last.pt",
-        "smoke_basic_best.pt",
-        "smoke_basic_last_scheduler.pt",
-        "smoke_basic_best_scheduler.pt",
-    ):
-        stale = os.path.join(checkpoint_dir, pattern)
-        if os.path.exists(stale):
-            os.remove(stale)
+    # Nome del checkpoint differenziato per modello: basic e time_aware
+    # possono coesistere in out_root senza che l'uno sovrascriva l'altro
+    # (utile se in futuro si aggiunge --model both).
+    checkpoint_stem = f"smoke_{args.model}"
+    checkpoint_path = os.path.join(checkpoint_dir, f"{checkpoint_stem}.pt")
 
+    _cleanup_stale_checkpoints(checkpoint_dir, checkpoint_stem)
+
+    # Config del modello selezionato.
+    model_cfg = _build_model_cfg(
+        args.model, checkpoint_path, args.batch_size, args.epochs
+    )
+
+    # La sezione "train_<model>" e' quella letta da run_training quando
+    # model_name == args.model. L'altra resta disabilitata esplicitamente.
     smoke_cfg = {
-        "train_basic": build_smoke_test_cfg(
-            checkpoint_path, args.batch_size, args.epochs, move_vocab_size=move_vocab_size
+        "train_basic": (
+            model_cfg if args.model == "basic" else {"enabled": False}
         ),
-        # train_time_aware presente solo perche' validate_config lo
-        # richiede se in futuro questo script venisse esteso; qui non
-        # viene mai eseguito (run_training e' chiamato direttamente sotto,
-        # non passando da TrainMain.main()).
-        "train_time_aware": {"enabled": False},
+        "train_time_aware": (
+            model_cfg if args.model == "time_aware" else {"enabled": False}
+        ),
         "evaluate": {"enabled": False},
         "pipeline": {},
-        "tuning": {"enabled": False} if args.no_tuning else build_tuning_cfg(move_vocab_size),
+        "tuning": {"enabled": False} if args.no_tuning else build_tuning_cfg(),
     }
 
     # ------------------------------------------------------------------
@@ -387,9 +385,9 @@ def main() -> None:
     # cui run_tuning_step verrebbe chiamato normalmente: lo invochiamo
     # qui esplicitamente, cosi' lo smoke test copre anche questo step.
     #
-    # I metadati del tuning vengono scritti in args.out_root/Tuning, non
-    # in Dataset/ reale: out_root viene comunque rimosso a fine test se
-    # --keep-output non e' passato.
+    # Il tuning e' identico per basic e time_aware (dipende dal dataset,
+    # non dall'architettura): viene calcolato una volta per run. Se in
+    # futuro serve --model both, il tuning va fattorizzato fuori dal loop.
     tuning_meta: dict = {}
     if not args.no_tuning:
         logger.info("-" * 70)
@@ -428,7 +426,7 @@ def main() -> None:
 
     logger.info("-" * 70)
     logger.info(
-        f"Avvio run_training('basic', ...) su {args.n_train} train / {args.n_val} val, "
+        f"Avvio run_training('{args.model}', ...) su {args.n_train} train / {args.n_val} val, "
         f"batch_size={args.batch_size}, epochs={args.epochs}, device={device}."
     )
     logger.info("-" * 70)
@@ -437,7 +435,7 @@ def main() -> None:
     try:
         TrainMain.run_training(
             smoke_cfg,
-            "basic",
+            args.model,
             train_mini_dir,
             val_mini_dir,
             checkpoint_path,
@@ -455,11 +453,11 @@ def main() -> None:
 
     elapsed = time.monotonic() - t0
     logger.info("=" * 70)
-    logger.info(f"SMOKE TEST OK: run_training completata senza eccezioni in {elapsed:.2f}s.")
+    logger.info(f"SMOKE TEST OK: run_training('{args.model}') completata senza eccezioni in {elapsed:.2f}s.")
     logger.info("=" * 70)
 
-    best_path = os.path.join(checkpoint_dir, "smoke_basic_best.pt")
-    last_path = os.path.join(checkpoint_dir, "smoke_basic_last.pt")
+    best_path = os.path.join(checkpoint_dir, f"{checkpoint_stem}_best.pt")
+    last_path = os.path.join(checkpoint_dir, f"{checkpoint_stem}_last.pt")
     for p, label in ((last_path, "last"), (best_path, "best")):
         if os.path.exists(p):
             size_mb = os.path.getsize(p) / 1024**2
