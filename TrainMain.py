@@ -498,7 +498,7 @@ def evaluate_models(cfg: Dict[str, Any], device: str, use_amp: bool) -> None:
     _require_sharded_dir(test_dir, "test")
 
     dataset_dir = cfg["pipeline"].get("dataset_dir", "Dataset")
-    tuning_meta_path = os.path.join(dataset_dir, "Tuning", "tuning_meta.json")
+    tuning_meta_path = os.path.join("Models", "Tuning", "tuning_meta.json")
     if os.path.exists(tuning_meta_path):
         with open(tuning_meta_path, "r", encoding="utf-8") as f:
             recommended_norm = json.load(f)["recommended_norm"]

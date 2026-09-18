@@ -11,9 +11,9 @@ pipeline:
 
 train_basic:
   enabled: true
-  train_dir: "Dataset/Train/shards/train"
-  val_dir: "Dataset/Train/shards/val"
-  checkpoint: "Dataset/Train/checkpoints/basic"
+  train_dir: "Dataset/Train/train_clean"
+  val_dir: "Dataset/Train/val_clean"
+  checkpoint: "Dataset/Model/checkpoints/basic"
   epochs: 50
   batch_size: 128
   num_workers: 2
@@ -65,10 +65,10 @@ train_time_aware:
 evaluate:
   enabled: true
   test_dir: "Dataset/Train/test_clean"
-  model_basic_checkpoint: "Dataset/Train/checkpoints/basic_best.pt"
-  model_time_aware_checkpoint: "Dataset/Train/checkpoints/time_aware_best.pt"
-  plots_dir: "Dataset/Test/plots"
-  out_dir: "Dataset/Test/metrics"
+  model_basic_checkpoint: "Models/basic_best.pt"
+  model_time_aware_checkpoint: "Models/time_aware_best.pt"
+  plots_dir: "Dataset/Test_330/plots"
+  out_dir: "Dataset/Test_330/metrics"
   max_n: 5
   batch_size: 128
   num_workers: 2
