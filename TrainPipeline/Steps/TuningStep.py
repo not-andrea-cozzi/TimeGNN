@@ -167,7 +167,8 @@ def recommend_norm_kind(batch_size: int) -> str:
     da timegnn.models.norm_layers.make_norm_layer; "batch_norm" e "none"
     restano disponibili per retrocompatibilità ma non vengono raccomandati.
     """
-    return "layer_norm" if batch_size < 32 else "graph_norm"
+    #return "layer_norm" if batch_size < 32 else "graph_norm" --> con graph_norm il modello è stato addestrato
+    return "graph_norm"
 
 
 def _resolve_batch_size_for_norm(cfg: Dict[str, Any]) -> int:

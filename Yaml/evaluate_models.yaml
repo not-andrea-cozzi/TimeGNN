@@ -1,22 +1,15 @@
-# Configurazione per la valutazione standalone dei modelli
 evaluation:
-  # Percorso del dataset di test (file .pt contenente una lista di campioni)
-  test_data: "Dataset/Test/test_clean.pt"
-  
-  # Checkpoint dei modelli addestrati
-  checkpoint_basic: "Dataset/Train/checkpoints/basic.pt"
-  checkpoint_time: "Dataset/Train/checkpoints/time_aware.pt"
-  
-  # Directory di output per plot e CSV
+  test_dir: "Dataset/Train/test_clean"      # cartella shardata, non più un file .pt
+  checkpoint_basic: "Dataset/Train/checkpoints/basic_best.pt"
+  checkpoint_time: "Dataset/Train/checkpoints/time_aware_best.pt"
   plots_dir: "Dataset/Test/plots"
   metrics_dir: "Dataset/Test/metrics"
-  
-  # Parametri di valutazione
-  max_n: 10                     # Profondità massima di matto da considerare
-  batch_size: 64
-  num_workers: 2                # Su Windows usare 0 se dà problemi
-  device: "auto"                # "auto", "cuda" o "cpu"
-  use_amp: false                # Usare mixed precision durante l'inferenza (solo se device=cuda)
+  max_n: 5
+  batch_size: 128
+  num_workers: 2
+  prefetch_factor: 4
+  seed: 42
+  use_amp: true
 
 model_params:
   embedding_dims: 64
@@ -24,13 +17,9 @@ model_params:
   gat_hidden_dim_embed: 128
   gat_hidden_dim_concat: 128
   num_heads: 4
-  num_layers: 1
+  num_layers: 3
   dropout: 0.0
   use_batch_norm: false
   activation: "elu"
-  lambda_decay: 0.01            # solo per time-aware
-
-# Logging
-logging:
-  log_level: "INFO"
-  log_file: "Dataset/Test/evaluation.log"
+  norm_kind: "layer_norm"   # deve combaciare col norm_kind usato in training
+  lambda_decay: 0.01

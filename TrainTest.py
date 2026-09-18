@@ -161,20 +161,21 @@ _COMMON_SMOKE_FIELDS: dict = {
     "enabled": True,
     "train_dir": None,
     "val_dir": None,
-    "num_workers": 0,
+    "num_workers": 2,
     "persistent_workers": False,
     "prefetch_factor": None,
     "pin_memory": False,
     "lr": 1e-3,
     "weight_decay": 0.0,
     "seed": 42,
-    "patience": 5,
+    "patience": 10,
     "embedding_dims": 16,
     "gat_hidden_dim_event": 8,
     "gat_hidden_dim_embed": 16,
     "gat_hidden_dim_concat": 16,
     "num_heads": 2,
     "num_layers": 1,
+    "prefetch_factor": 1,
     "dropout": 0.0,
     "use_batch_norm": False,
     "activation": "elu",
@@ -236,7 +237,7 @@ def main() -> None:
     parser.add_argument("--train-dir", default="Dataset/Train/train_clean")
     parser.add_argument("--val-dir", default="Dataset/Train/val_clean")
     parser.add_argument("--out-root", default="Dataset/_smoke_test")
-    parser.add_argument("--n-train", type=int, default=10000)
+    parser.add_argument("--n-train", type=int, default=100000)
     parser.add_argument("--n-val", type=int, default=1000)
     parser.add_argument("--batch-size", type=int, default=16)
     parser.add_argument("--epochs", type=int, default=10)

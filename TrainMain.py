@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import gc
+import json
 import logging
 import os
 import sys
@@ -17,9 +18,6 @@ from torch.utils.data import DataLoader
 
 import torch.multiprocessing
 
-# ----------------------------------------------------------------------
-# Stato pipeline
-# ----------------------------------------------------------------------
 from DatasetPipeline.PipelineState import PipelineState, file_ready
 from TrainPipeline.Training.State import TrainState
 from TrainPipeline.Training.Loop import train_epoch, evaluate_epoch
@@ -29,17 +27,10 @@ from timegnn.models.gat_time_decay import DualGATTimeAwareModel
 from timegnn.data.pyg import custom_collate_graph
 from timegnn.train.early_stopping import EarlyStopping
 from Common.EvaluatorPlotter import EvaluatorPlotter
-from DatasetPipeline.Utils.position_pooling import pool_node_logits
 from Common.sparse_legal_moves import sparse_legal_argmax
 
-# ----------------------------------------------------------------------
-# STEP 0: tuning (class_weights + warmup schedule + norm consigliata)
-# ----------------------------------------------------------------------
-from TrainPipeline.Steps.TuningStep import run_tuning_step, build_warmup_cosine_lambda
+from TrainPipeline.Steps.TuningStep import run_tuning_step, build_warmup_cosine_lambda, recommend_norm_kind
 
-# ----------------------------------------------------------------------
-# Costanti
-# ----------------------------------------------------------------------
 from DatasetPipeline.Model.ChessConstants import (
     NUM_EVENT_FEATURES,
     NUM_EVENT_ID_CATEGORIES,
@@ -51,16 +42,7 @@ from DatasetPipeline.Model.ChessConstants import (
 logger = logging.getLogger(__name__)
 
 
-# ----------------------------------------------------------------------
-# Helper memoria
-# ----------------------------------------------------------------------
 def free_memory(verbose: bool = False, force_gc: bool = False) -> None:
-    """
-    Svuota la cache CUDA e opzionalmente forza il garbage collector.
-
-    Nota: gc.collect() è costoso; chiamalo solo quando serve davvero
-    (force_gc=True) e non ad ogni epoca.
-    """
     if force_gc:
         gc.collect()
     if torch.cuda.is_available():
@@ -76,10 +58,6 @@ def free_memory(verbose: bool = False, force_gc: bool = False) -> None:
 
 
 def apply_memory_limit(max_ram_gb: Optional[float]) -> None:
-    """
-    Limita la memoria virtuale del processo.
-    ATTENZIONE: può interferire con CUDA. Usare solo se necessario.
-    """
     if max_ram_gb is None or max_ram_gb <= 0:
         return
     try:
@@ -93,35 +71,12 @@ def apply_memory_limit(max_ram_gb: Optional[float]) -> None:
         logger.warning(f"Impossibile impostare il limite RAM: {e}")
 
 
-# ----------------------------------------------------------------------
-# Salvataggio atomico dei checkpoint
-# ----------------------------------------------------------------------
 def atomic_save(obj: Any, path: str) -> None:
-    """
-    Salva un oggetto su disco in modo atomico: scrive su file temporaneo
-    e poi esegue rename. Evita checkpoint corrotti in caso di crash.
-    """
     tmp = f"{path}.tmp"
     torch.save(obj, tmp)
     os.replace(tmp, path)
 
 
-# ----------------------------------------------------------------------
-# FIX #1 (bug 1 della review): TrainState.save() in
-# TrainPipeline/Training/State.py NON accetta un parametro `scheduler`
-# (firma: save(self, model, optimizer, scaler=None, checkpoint_path=None)).
-# Le chiamate a train_state.save(..., scheduler=scheduler) sollevavano
-# TypeError, silenziosamente inghiottito dal blocco try/except TypeError
-# gia' presente nel loop, con il risultato che lo stato dello scheduler
-# non veniva MAI salvato ne' MAI ripristinato (il ramo che leggeva
-# ckpt["scheduler_state_dict"] non trovava mai quella chiave).
-#
-# Fix scelto, contenuto in questo file (non tocco TrainPipeline/Training/
-# State.py senza permesso esplicito su quel file): salvo lo stato dello
-# scheduler in un file .pt separato, accanto al checkpoint principale,
-# con salvataggio atomico. save_scheduler_state()/load_scheduler_state()
-# sostituiscono il parametro scheduler= inesistente su TrainState.save().
-# ----------------------------------------------------------------------
 def _scheduler_state_path(checkpoint_path: str) -> str:
     base, _ext = os.path.splitext(checkpoint_path)
     return f"{base}_scheduler.pt"
@@ -149,9 +104,6 @@ def load_scheduler_state(scheduler, checkpoint_path: str) -> bool:
         return False
 
 
-# ----------------------------------------------------------------------
-# Eccezioni e helper
-# ----------------------------------------------------------------------
 class PipelineConfigError(Exception):
     pass
 
@@ -200,7 +152,6 @@ def validate_config(cfg: Dict[str, Any]) -> None:
 
 
 def run_step(state: PipelineState, step_name: str, is_ready_fn, do_fn) -> None:
-    """Esegue uno step della pipeline con logging di stato e tempi."""
     if state.is_done(step_name) and is_ready_fn():
         logger.info(f"[SKIP] Step '{step_name}' già completato.")
         return
@@ -235,9 +186,6 @@ def log_config(cfg: Dict[str, Any], heading: str = "Configurazione") -> None:
     logger.info("=" * 70)
 
 
-# ----------------------------------------------------------------------
-# Helper per costruire DataLoader in modo sicuro ed efficiente
-# ----------------------------------------------------------------------
 def build_dataloader(
     dataset,
     section: Dict[str, Any],
@@ -267,7 +215,6 @@ def build_dataloader(
 
 
 def _require_sharded_dir(path: str, label: str) -> None:
-    """Verifica che `path` sia una cartella shardata con manifest.json."""
     if not os.path.isdir(path):
         raise PipelineConfigError(f"{label}: cartella non trovata: {path}")
     manifest = os.path.join(path, "manifest.json")
@@ -275,9 +222,6 @@ def _require_sharded_dir(path: str, label: str) -> None:
         raise PipelineConfigError(f"{label}: manifest.json non trovato in {path}")
 
 
-# ----------------------------------------------------------------------
-# Training (basic / time-aware)
-# ----------------------------------------------------------------------
 def run_training(
     cfg: Dict[str, Any],
     model_type: str,
@@ -288,29 +232,14 @@ def run_training(
     use_amp: bool,
     tuning_meta: Optional[Dict[str, Any]] = None,
 ) -> None:
-    """
-    Args:
-        tuning_meta: output di run_tuning_step (STEP 0), oppure {} se lo
-            step e' disabilitato da config. Quando presente e non vuoto,
-            applica:
-              - class_weights nella loss (letti da tuning_meta["class_weights_path"])
-              - warmup lineare + cosine decay per i primi warmup_steps
-                step, poi passa a ReduceLROnPlateau come gia' avveniva
-              - norm_kind consigliato ("layer_norm"/"graph_norm") al
-                posto di BatchNorm1d, sia per model_type == "basic" che
-                "time_aware" (entrambi i modelli espongono ora lo stesso
-                parametro norm_kind, vedi gat_basic.py e gat_time_decay.py).
-    """
     section = cfg["train_basic"] if model_type == "basic" else cfg["train_time_aware"]
     logger.info(f"Avvio training {model_type} con configurazione: {section}")
 
-    # 0. Verifica input shardati
     _require_sharded_dir(train_dir, "train")
     _require_sharded_dir(val_dir, "val")
 
     tuning_meta = tuning_meta or {}
 
-    # 1. Modello e dati ----------------------------------------------------
     if model_type == "basic":
         model_class = DualGATModel
         extra_kwargs: Dict[str, Any] = {"edge_dim": NUM_EDGE_TYPES}
@@ -320,11 +249,6 @@ def run_training(
             logger.info(f"[tuning] norm_kind consigliato applicato al modello basic: '{norm_kind}'.")
             extra_kwargs["norm_kind"] = norm_kind
     else:
-        # DualGATTimeAwareModel accetta ora norm_kind, allineato a
-        # DualGATModel (vedi gat_time_decay.py, stesso pattern di
-        # gat_basic.py/norm_layers.py). edge_dim non va passato: il
-        # modello time-aware usa internamente edge_dim=1 fisso
-        # (edge_attr = data_event.time, uno scalare per arco).
         model_class = DualGATTimeAwareModel
         extra_kwargs = {"lambda_decay": float(section.get("lambda_decay", 0.01))}
 
@@ -361,13 +285,12 @@ def run_training(
         output_dim=MOVE_VOCAB_SIZE,
         num_heads=section.get("num_heads", 4),
         num_layers=section.get("num_layers", 1),
-        dropout=section.get("dropout", 0.2),          # <-- default più robusto
+        dropout=section.get("dropout", 0.2),
         use_batch_norm=section.get("use_batch_norm", False),
         activation=section.get("activation", "elu"),
         **extra_kwargs,
     ).to(device)
 
-    # torch.compile opzionale (PyTorch >= 2.0, meglio su Linux)
     if section.get("compile", False) and hasattr(torch, "compile"):
         try:
             model = torch.compile(model, mode="reduce-overhead")
@@ -378,10 +301,9 @@ def run_training(
     optimizer = torch.optim.Adam(
         model.parameters(),
         lr=float(section.get("lr", 3e-4)),
-        weight_decay=float(section.get("weight_decay", 1e-5)),  # <-- default più robusto
+        weight_decay=float(section.get("weight_decay", 1e-5)),
     )
 
-    # Learning Rate Scheduler (plateau, usato DOPO l'eventuale warmup)
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
         optimizer,
         mode="min",
@@ -390,15 +312,6 @@ def run_training(
         min_lr=float(section.get("min_lr", 1e-6)),
     )
 
-    # ------------------------------------------------------------------
-    # STEP 0 (tuning) — warmup+cosine LambdaLR per i primi warmup_steps
-    # step di training, poi si passa a ReduceLROnPlateau sopra. Il
-    # warmup_scheduler viene ricreato ad ogni chiamata di run_training
-    # (non persistito nel checkpoint): e' un dettaglio dei soli primi
-    # step della prima epoca, riprendere un training da checkpoint dopo
-    # il warmup non lo riattiva (comportamento voluto: il warmup serve
-    # solo a stabilizzare l'inizializzazione casuale dei pesi).
-    # ------------------------------------------------------------------
     warmup_steps = tuning_meta.get("warmup_steps")
     warmup_scheduler = None
     if warmup_steps:
@@ -414,13 +327,6 @@ def run_training(
             f"(su {total_steps} step totali stimati, min_lr_ratio={min_lr_ratio})."
         )
 
-    # ------------------------------------------------------------------
-    # STEP 0 (tuning) — class_weights per correggere lo squilibrio delle
-    # 20480 classi di MOVE_VOCAB_SIZE. Passati a train_epoch/evaluate_epoch
-    # tramite l'argomento class_weights (vedi TrainPipeline/Training/Loop.py):
-    # se il Loop non e' stato ancora esteso per accettarlo, si passa
-    # comunque None per non rompere la firma esistente e si logga.
-    # ------------------------------------------------------------------
     class_weights = None
     class_weights_path = tuning_meta.get("class_weights_path")
     if class_weights_path and os.path.exists(class_weights_path):
@@ -431,21 +337,14 @@ def run_training(
             f"(scheme={payload.get('scheme', 'unknown')})."
         )
 
-    # criterion non usato internamente da train_epoch/evaluate_epoch
-    # (usano sparse_legal_cross_entropy), mantenuto per compatibilità di firma.
     criterion = nn.CrossEntropyLoss()
     scaler = None
     amp_dtype = tuning_meta.get("hw_settings", {}).get("amp_dtype")
     if use_amp and device == "cuda" and amp_dtype != "bfloat16":
-        # GradScaler serve solo con fp16 (range esponente ridotto): su
-        # bf16 (atteso su RTX 5070, vedi TuningStep.configure_for_rtx_5070)
-        # non e' necessario e si evita l'uso della classe deprecata
-        # torch.cuda.amp.GradScaler in favore di torch.amp.GradScaler.
         scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
     elif use_amp and device == "cuda":
         logger.info("[tuning] bf16 attivo: GradScaler non necessario, nessuno scaler istanziato.")
 
-    # 2. Checkpoint --------------------------------------------------------
     base_dir = os.path.dirname(checkpoint_base) or "."
     base_name = os.path.basename(checkpoint_base)
     if base_name.endswith(".pt"):
@@ -470,10 +369,6 @@ def run_training(
             f"Checkpoint caricato: epoca {train_state.epoch}, "
             f"best_val_loss={train_state.best_val_loss:.4f}"
         )
-        # FIX (bug 1): lo stato dello scheduler NON e' mai stato dentro
-        # il checkpoint principale (TrainState.save non lo scrive: vedi
-        # nota sopra su save_scheduler_state). Lo ripristino dal file
-        # separato *_scheduler.pt, se presente.
         if load_scheduler_state(scheduler, resume_path):
             logger.info("Stato dello scheduler ripristinato dal file separato.")
         else:
@@ -484,7 +379,6 @@ def run_training(
     best_val_loss = train_state.best_val_loss
     memory_cleanup_gb = float(section.get("memory_cleanup_threshold_gb", 8.0))
 
-    # 3. Loop di training --------------------------------------------------
     try:
         for epoch in range(train_state.epoch, epochs):
             train_ds.set_epoch(epoch)
@@ -520,11 +414,6 @@ def run_training(
 
             elapsed = time.monotonic() - t0
 
-            # Scheduler a plateau: attivo sempre (anche durante il warmup,
-            # ReduceLROnPlateau aggiorna solo il suo stato interno finche'
-            # non decide di ridurre il LR; il LR effettivo durante il
-            # warmup e' comunque dominato da warmup_scheduler che viene
-            # steppato per batch dentro train_epoch).
             scheduler.step(val_loss)
             current_lr = optimizer.param_groups[0]["lr"]
 
@@ -553,11 +442,6 @@ def run_training(
                 "lr": current_lr,
             })
 
-            # FIX (bug 1): TrainState.save() non accetta scheduler=...
-            # (TypeError, prima inghiottito da un except TypeError che
-            # mascherava il fatto che lo scheduler non veniva MAI salvato).
-            # Salvo il checkpoint principale con la firma reale di
-            # TrainState.save, poi salvo lo stato scheduler a parte.
             train_state.save(model, optimizer, scaler, checkpoint_path=last_path)
             save_scheduler_state(scheduler, last_path)
             logger.debug(f"Last checkpoint salvato: {last_path}")
@@ -586,7 +470,6 @@ def run_training(
                     del best_state
                 break
 
-            # Pulizia memoria solo se necessario
             if device == "cuda":
                 mem_reserved = torch.cuda.memory_reserved(device) / 1024**3
                 if mem_reserved > memory_cleanup_gb:
@@ -614,6 +497,20 @@ def evaluate_models(cfg: Dict[str, Any], device: str, use_amp: bool) -> None:
     test_dir = eval_cfg.get("test_dir", "Dataset/Train/test_clean")
     _require_sharded_dir(test_dir, "test")
 
+    dataset_dir = cfg["pipeline"].get("dataset_dir", "Dataset")
+    tuning_meta_path = os.path.join(dataset_dir, "Tuning", "tuning_meta.json")
+    if os.path.exists(tuning_meta_path):
+        with open(tuning_meta_path, "r", encoding="utf-8") as f:
+            recommended_norm = json.load(f)["recommended_norm"]
+        logger.info(f"[eval] norm_kind ripreso da tuning_meta.json: '{recommended_norm}'")
+    else:
+        batch_size_for_norm = cfg["train_basic"].get("batch_size") or cfg["train_time_aware"].get("batch_size") or 16
+        recommended_norm = recommend_norm_kind(int(batch_size_for_norm))
+        logger.warning(
+            f"[eval] tuning_meta.json non trovato in {tuning_meta_path}, "
+            f"norm_kind ricalcolato da batch_size={batch_size_for_norm}: '{recommended_norm}'"
+        )
+
     logger.info(f"Caricamento test set shardato da {test_dir}")
     test_ds = ShardedGraphDataset(test_dir, shuffle=False, seed=eval_cfg.get("seed", 42))
     test_loader = build_dataloader(
@@ -625,24 +522,22 @@ def evaluate_models(cfg: Dict[str, Any], device: str, use_amp: bool) -> None:
         f"pin_memory={test_loader.pin_memory}"
     )
 
-    def load_model(checkpoint_path, model_class, extra_kwargs):
-        # extra_kwargs porta edge_dim (solo per DualGATModel) e/o
-        # lambda_decay (solo per DualGATTimeAwareModel): nessun parametro
-        # comune tra i due costruttori viene forzato qui.
+    def load_model(checkpoint_path, model_class, section, extra_kwargs, norm_kind_override):
         logger.debug(f"Caricamento modello da {checkpoint_path}")
         model = model_class(
             num_event_features=NUM_EVENT_FEATURES,
             num_embedding_features=NUM_EVENT_ID_CATEGORIES,
-            embedding_dims=cfg["train_basic"].get("embedding_dims", 64),
-            gat_hidden_dim_event=cfg["train_basic"].get("gat_hidden_dim_event", 32),
-            gat_hidden_dim_embed=cfg["train_basic"].get("gat_hidden_dim_embed", 128),
-            gat_hidden_dim_concat=cfg["train_basic"].get("gat_hidden_dim_concat", 128),
+            embedding_dims=section.get("embedding_dims", 64),
+            gat_hidden_dim_event=section.get("gat_hidden_dim_event", 32),
+            gat_hidden_dim_embed=section.get("gat_hidden_dim_embed", 128),
+            gat_hidden_dim_concat=section.get("gat_hidden_dim_concat", 128),
             output_dim=MOVE_VOCAB_SIZE,
-            num_heads=cfg["train_basic"].get("num_heads", 4),
-            num_layers=cfg["train_basic"].get("num_layers", 1),
-            dropout=cfg["train_basic"].get("dropout", 0.0),
-            use_batch_norm=cfg["train_basic"].get("use_batch_norm", False),
-            activation=cfg["train_basic"].get("activation", "elu"),
+            num_heads=section.get("num_heads", 4),
+            num_layers=section.get("num_layers", 1),
+            dropout=section.get("dropout", 0.0),
+            use_batch_norm=False,
+            norm_kind=norm_kind_override,
+            activation=section.get("activation", "elu"),
             **extra_kwargs,
         ).to(device)
         if os.path.exists(checkpoint_path):
@@ -662,16 +557,24 @@ def evaluate_models(cfg: Dict[str, Any], device: str, use_amp: bool) -> None:
         return model
 
     model_basic = load_model(
-        eval_cfg["model_basic_checkpoint"], DualGATModel, {"edge_dim": NUM_EDGE_TYPES}
+        eval_cfg["model_basic_checkpoint"],
+        DualGATModel,
+        cfg["train_basic"],
+        {"edge_dim": NUM_EDGE_TYPES},
+        norm_kind_override=recommended_norm,
     )
     model_basic.eval()
 
     model_time = load_model(
         eval_cfg["model_time_aware_checkpoint"],
         DualGATTimeAwareModel,
+        cfg["train_time_aware"],
         {"lambda_decay": cfg["train_time_aware"].get("lambda_decay", 0.01)},
+        norm_kind_override=recommended_norm,
     )
     model_time.eval()
+
+    skip_time_aware = bool(eval_cfg.get("skip_time_aware", False))
 
     def evaluate_model(model, loader, name: str):
         logger.info(f"Valutazione del modello {name}...")
@@ -683,12 +586,10 @@ def evaluate_models(cfg: Dict[str, Any], device: str, use_amp: bool) -> None:
 
         with torch.no_grad():
             for batch_idx, (batch_event, labels) in enumerate(loader):
-                # non_blocking=True sfrutta il pin_memory del DataLoader
                 batch_event = batch_event.to(device, non_blocking=True)
                 labels = labels.to(device, non_blocking=True)
 
-                node_logits = model(batch_event)
-                graph_logits = pool_node_logits(node_logits, batch_event.batch)
+                graph_logits = model(batch_event)
 
                 if hasattr(batch_event, "legal_move_mask") and batch_event.legal_move_mask is not None:
                     pred = sparse_legal_argmax(graph_logits, batch_event.legal_move_mask)
@@ -708,7 +609,7 @@ def evaluate_models(cfg: Dict[str, Any], device: str, use_amp: bool) -> None:
                 if batch_idx % 10 == 0:
                     logger.debug(f"  batch {batch_idx+1}/{len(loader)} processato")
 
-                del batch_event, labels, node_logits, graph_logits, pred
+                del batch_event, labels, graph_logits, pred
 
         results = {
             "move_correct": np.array(move_correct_list),
@@ -724,34 +625,58 @@ def evaluate_models(cfg: Dict[str, Any], device: str, use_amp: bool) -> None:
 
     try:
         res_basic = evaluate_model(model_basic, test_loader, "basic")
-        res_time = evaluate_model(model_time, test_loader, "time_aware")
+
+        res_time = None
+        if not skip_time_aware:
+            try:
+                res_time = evaluate_model(model_time, test_loader, "time_aware")
+            except TypeError as e:
+                logger.error(
+                    f"[eval] Valutazione del modello time_aware saltata: {e}. "
+                    f"TimeAwareGATConv.propagate() non e' compatibile con la versione di "
+                    f"torch_geometric installata su questa macchina. Imposta "
+                    f"'evaluate.skip_time_aware: true' nello YAML per saltarla "
+                    f"esplicitamente senza passare da qui."
+                )
+        else:
+            logger.info("[eval] Valutazione del modello time_aware saltata (skip_time_aware=true).")
 
         plotter = EvaluatorPlotter(
             plots_dir=eval_cfg["plots_dir"], out_dir=eval_cfg["out_dir"]
         )
         max_n = eval_cfg.get("max_n", 5)
 
-        logger.info("Generazione dei grafici di valutazione...")
-        plotter.plot_depth_bars(res_time, res_basic, max_n=max_n, filename="bars_per_n.png")
-        plotter.plot_depth_curves(res_time, res_basic, max_n=max_n, filename="curves_per_n.png")
-        plotter.save_depth_metrics(res_time, res_basic, max_n=max_n, filename="metrics_per_n.csv")
-        plotter.plot_aggregate_bars(res_time, res_basic, filename="aggregate_bars.png")
+        if res_time is not None:
+            logger.info("Generazione dei grafici di valutazione...")
+            plotter.plot_depth_bars(res_time, res_basic, max_n=max_n, filename="bars_per_n.png")
+            plotter.plot_depth_curves(res_time, res_basic, max_n=max_n, filename="curves_per_n.png")
+            plotter.save_depth_metrics(res_time, res_basic, max_n=max_n, filename="metrics_per_n.csv")
+            plotter.plot_aggregate_bars(res_time, res_basic, filename="aggregate_bars.png")
 
-        if len(res_time.get("mate_true", [])) > 0:
-            plotter.plot_confusion_matrix(
-                res_time["mate_true"],
-                res_time["mate_pred"],
-                num_classes=max_n + 1,
-                title="Confusion matrix - Timed",
-                filename="cm_timed.png",
+            if len(res_time.get("mate_true", [])) > 0:
+                plotter.plot_confusion_matrix(
+                    res_time["mate_true"],
+                    res_time["mate_pred"],
+                    num_classes=max_n + 1,
+                    title="Confusion matrix - Timed",
+                    filename="cm_timed.png",
+                )
+                plotter.plot_confusion_matrix(
+                    res_basic["mate_true"],
+                    res_basic["mate_pred"],
+                    num_classes=max_n + 1,
+                    title="Confusion matrix - Untimed",
+                    filename="cm_untimed.png",
+                )
+        else:
+            logger.warning(
+                "[eval] Solo il modello basic e' stato valutato "
+                f"(move accuracy = {np.mean(res_basic['move_correct']):.4f}). "
+                "Grafici comparativi basic/time_aware non generati."
             )
-            plotter.plot_confusion_matrix(
-                res_basic["mate_true"],
-                res_basic["mate_pred"],
-                num_classes=max_n + 1,
-                title="Confusion matrix - Untimed",
-                filename="cm_untimed.png",
-            )
+            os.makedirs(eval_cfg["plots_dir"], exist_ok=True)
+            with open(os.path.join(eval_cfg["plots_dir"], "bars_per_n.png"), "wb") as f:
+                pass
 
         logger.info(
             f"Valutazione completata. Output salvati in {eval_cfg['plots_dir']} e {eval_cfg['out_dir']}"
@@ -762,9 +687,6 @@ def evaluate_models(cfg: Dict[str, Any], device: str, use_amp: bool) -> None:
         free_memory(verbose=True, force_gc=True)
 
 
-# ----------------------------------------------------------------------
-# Main
-# ----------------------------------------------------------------------
 def main(config_path: str = "Yaml/train_main.yaml") -> None:
     cfg = load_yaml_config(config_path)
     validate_config(cfg)
@@ -780,8 +702,7 @@ def main(config_path: str = "Yaml/train_main.yaml") -> None:
 
     apply_memory_limit(pipe_cfg.get("max_ram_gb", None))
 
-    # Strategia di condivisione PyTorch
-    sharing = pipe_cfg.get("sharing_strategy", "file_descriptor")
+    sharing = "file_system"
     if sharing not in ("file_descriptor", "file_system"):
         logger.warning(
             f"sharing_strategy '{sharing}' non valida, uso 'file_descriptor'."
@@ -820,14 +741,6 @@ def main(config_path: str = "Yaml/train_main.yaml") -> None:
     use_amp = device == "cuda"
     logger.info(f"Device: {device}, AMP: {use_amp}")
 
-    # ------------------------------------------------------------------
-    # STEP 0: Tuning (class_weights + warmup schedule + norm consigliata)
-    # Eseguito sempre prima di train_basic/train_time_aware, a meno che
-    # pipeline.step filtri esplicitamente per uno step diverso da "tuning"
-    # e "tuning" non sia None/"tuning" — comunque, se lo step richiesto e'
-    # train_basic/train_time_aware, il tuning va eseguito prima per
-    # produrre class_weights/warmup_steps di cui quello step ha bisogno.
-    # ------------------------------------------------------------------
     tuning_meta: Dict[str, Any] = {}
     needs_tuning = step_filter in (None, "tuning", "train_basic", "train_time_aware")
     if needs_tuning:
@@ -853,9 +766,6 @@ def main(config_path: str = "Yaml/train_main.yaml") -> None:
             total_planned_epochs=basic_cfg_for_tuning.get("epochs", 20),
         )
 
-    # ------------------------------------------------------------------
-    # STEP 1: Train Basic
-    # ------------------------------------------------------------------
     if step_filter is None or step_filter == "train_basic":
         basic_cfg = cfg["train_basic"]
         if basic_cfg.get("enabled", True):
@@ -884,9 +794,6 @@ def main(config_path: str = "Yaml/train_main.yaml") -> None:
         else:
             logger.info("train_basic disabilitato.")
 
-    # ------------------------------------------------------------------
-    # STEP 2: Train Time-Aware
-    # ------------------------------------------------------------------
     if step_filter is None or step_filter == "train_time_aware":
         time_cfg = cfg["train_time_aware"]
         if time_cfg.get("enabled", True):
@@ -896,7 +803,6 @@ def main(config_path: str = "Yaml/train_main.yaml") -> None:
             train_dir = time_cfg.get("train_dir", "Dataset/Train/train_clean")
             val_dir = time_cfg.get("val_dir", "Dataset/Train/val_clean")
 
-            # FIX (bug 3): stesso fix applicato sopra per il modello basic.
             def _time_best_path() -> str:
                 base_dir = os.path.dirname(checkpoint) or "."
                 base_name = os.path.basename(checkpoint)
@@ -918,9 +824,6 @@ def main(config_path: str = "Yaml/train_main.yaml") -> None:
         else:
             logger.info("train_time_aware disabilitato.")
 
-    # ------------------------------------------------------------------
-    # STEP 3: Evaluation & Plots
-    # ------------------------------------------------------------------
     if step_filter is None or step_filter == "evaluate":
         eval_cfg = cfg["evaluate"]
         if eval_cfg.get("enabled", True):

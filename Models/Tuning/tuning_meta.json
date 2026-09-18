@@ -1,0 +1,16 @@
+{
+  "hw_settings": {
+    "device": "cuda",
+    "amp_dtype": "bfloat16",
+    "tf32_enabled": true,
+    "cudnn_benchmark": true,
+    "gpu_name": "NVIDIA GeForce RTX 5070"
+  },
+  "warmup_steps": 2168,
+  "total_steps": 216800,
+  "min_lr_ratio": 0.1,
+  "recommended_norm": "graph_norm",
+  "batch_size_for_norm": 128,
+  "class_weight_scheme": "inverse_sqrt_freq",
+  "move_vocab_size": 20480
+}

@@ -5,7 +5,7 @@ from typing import Optional
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch_geometric.nn import GATConv
+from torch_geometric.nn import GATConv, MessagePassing, global_mean_pool
 from torch_geometric.utils import softmax as pyg_softmax
 
 from .norm_layers import GraphAwareNormList, make_norm_layer
@@ -93,6 +93,7 @@ class TimeAwareGATConv(GATConv):
         self.att = nn.Parameter(torch.Tensor(heads, 2 * out_channels))
         nn.init.xavier_uniform_(self.att)
         self._decay = None
+        self._edge_attr_current = None
 
     def edge_attention(self, x_i, x_j, edge_attr):
         """Compute time-decayed, softmax-normalized attention logits.
@@ -139,10 +140,26 @@ class TimeAwareGATConv(GATConv):
 
         return alpha
 
-    def message(self, x_j, x_i, edge_attr, index, ptr, size_i):
+    def message(self, x_j, x_i, index, ptr, size_i):
         """Message passing con attenzione time-decayed e softmax-normalizzata
-        per nodo destinazione (stesso contratto di GATConv standard)."""
-        alpha = self.edge_attention(x_i, x_j, edge_attr)
+        per nodo destinazione (stesso contratto di GATConv standard).
+
+        edge_attr NON e' un parametro di questa firma: viene letto da
+        self._edge_attr_current, impostato da forward() subito prima di
+        chiamare propagate(). Necessario perche' questo layer chiama
+        MessagePassing.propagate() (vedi forward()) invece di
+        GATConv.propagate(): quest'ultimo, nelle versioni recenti di
+        torch_geometric, calcola l'attenzione fuori da message() tramite
+        un meccanismo edge_updater()/edge_update() interno a GATConv la
+        cui firma esatta (es. se richiede 'alpha' come argomento
+        posizionale di propagate()) cambia da versione a versione ed e'
+        pensata per il message() standard di GATConv, non per uno
+        overridden con logica custom come questo. Bypassare del tutto
+        quel meccanismo, chiamando MessagePassing.propagate() invece di
+        GATConv.propagate(), elimina la dipendenza da un contratto
+        interno instabile.
+        """
+        alpha = self.edge_attention(x_i, x_j, self._edge_attr_current)
         alpha = pyg_softmax(alpha, index, ptr, size_i)
         if self.dropout > 0 and self.training:
             alpha = F.dropout(alpha, p=self.dropout, training=True)
@@ -168,7 +185,23 @@ class TimeAwareGATConv(GATConv):
             self._alpha = torch.zeros(0, h, device=x.device, dtype=x.dtype)
             self._decay = torch.zeros(0, 1)
         else:
-            out = self.propagate(edge_index, x=x, edge_attr=edge_attr, size=None)
+            # edge_attr passato fuori banda (vedi docstring di message()).
+            self._edge_attr_current = edge_attr
+            try:
+                # MessagePassing.propagate() esplicito (non
+                # self.propagate(), che in GATConv puo' essere
+                # specializzato/JIT-compilato per il contratto
+                # message(x_j, alpha) + edge_updater() della classe
+                # base, con firma variabile tra versioni di PyG). Il
+                # propagate() generico di MessagePassing fa sempre
+                # dispatch a self.message() (qui overridden) con la sua
+                # introspezione standard basata sui parametri dichiarati
+                # in message(), che non include 'alpha' ne' 'edge_attr':
+                # e' quindi stabile rispetto a come GATConv implementa
+                # internamente la propria variante con edge_updater.
+                out = MessagePassing.propagate(self, edge_index, x=x, size=None)
+            finally:
+                self._edge_attr_current = None
 
         if self.concat:
             out = out.view(-1, h * c)
@@ -197,6 +230,13 @@ class DualGATTimeAwareModel(nn.Module):
             than batch_norm on small/variable-composition graph batches
             (see TrainPipeline.Steps.TuningStep.recommend_norm_kind).
         activation: Hidden-layer activation (relu, elu, gelu, leaky_relu).
+        pool_before_head: se True (default), il modello applica
+            global_mean_pool per-grafo PRIMA di self.fc, restituendo
+            [B, output_dim] invece di [N_nodes, output_dim]. Stessa
+            convenzione di DualGATModel in gat_basic.py.
+            IMPORTANTE: con pool_before_head=True il chiamante (Loop.py,
+            EvaluateModels.py) NON deve richiamare pool_node_logits /
+            global_mean_pool sull'output di forward().
     """
     def __init__(
         self,
@@ -214,6 +254,7 @@ class DualGATTimeAwareModel(nn.Module):
         use_batch_norm: bool = False,
         activation: str = "elu",
         norm_kind: Optional[str] = None,
+        pool_before_head: bool = True,
     ) -> None:
         super().__init__()
         if num_layers < 1:
@@ -225,6 +266,7 @@ class DualGATTimeAwareModel(nn.Module):
 
         self.dropout = dropout
         self.activation = _resolve_activation(activation)
+        self.pool_before_head = pool_before_head
 
         if norm_kind is None:
             norm_kind = "batch_norm" if use_batch_norm else "none"
@@ -342,7 +384,12 @@ class DualGATTimeAwareModel(nn.Module):
         return x, attn_last
 
     def forward(self, data_event, return_attention: bool = False):
-        """Forward pass for batched event graphs with optional attention."""
+        """Forward pass for batched event graphs with optional attention.
+
+        Con pool_before_head=True (default) l'output e' pooled per-grafo
+        PRIMA di self.fc: [B, output_dim]. Il chiamante non deve pooled-are
+        di nuovo il risultato.
+        """
         edge_attr = getattr(data_event, "time", None)
         edge_index = data_event.edge_index
 
@@ -381,7 +428,18 @@ class DualGATTimeAwareModel(nn.Module):
             return_attention=return_attention,
         )
 
-        out = self.fc(x)
+        # NOTA: il pooling avviene qui, su x (feature per-nodo, dimensione
+        # gat_hidden_dim_concat*num_heads), PRIMA di self.fc. self.fc e'
+        # lineare e global_mean_pool e' una media: pool-poi-fc e
+        # fc-poi-pool sono matematicamente equivalenti, ma pool-poi-fc
+        # applica la Linear(*, output_dim) a B righe invece che a
+        # N_nodes_totali righe (molto piu' efficiente quando output_dim
+        # e' grande, es. MOVE_VOCAB_SIZE=20480).
+        if self.pool_before_head:
+            x_pooled = global_mean_pool(x, data_event.batch)
+            out = self.fc(x_pooled)
+        else:
+            out = self.fc(x)
 
         if return_attention:
             return out, {
@@ -405,7 +463,16 @@ class DualGATTimeAwareModel(nn.Module):
 
 
 def evaluate_epoch(model, loader, criterion, device, return_attention: bool = False):
-    """Evaluate the time-decay GAT model for one epoch."""
+    """Evaluate the time-decay GAT model for one epoch.
+
+    NOTA: questa funzione e' legacy/non usata dalla pipeline attiva
+    (TrainMain.py importa evaluate_epoch da TrainPipeline.Training.Loop,
+    non da questo modulo). E' pensata per un formato a sequenza
+    (output/labels con shape [*, seq_len, ...] e mask labels != -1), non
+    per lo schema sparse_legal_cross_entropy usato dal training corrente.
+    Lasciata qui solo come riferimento; non richiede modifiche per il
+    fix del pooling perche' non chiama pool_node_logits.
+    """
     model.eval()
     total_loss = 0.0
     correct = 0

@@ -6,16 +6,17 @@ pipeline:
   force_recompute: false
   log_level: "INFO"
   log_file: "Dataset/train_pipeline.log"
-  step: null               # valori: "train_basic", "train_time_aware", "evaluate"
+  step: "evaluate"               # valori: "train_basic", "train_time_aware", "evaluate"
   no_amp: false
 
 train_basic:
   enabled: true
-  shards_dir: "Dataset/Train/shards"
+  train_dir: "Dataset/Train/shards/train"
+  val_dir: "Dataset/Train/shards/val"
   checkpoint: "Dataset/Train/checkpoints/basic"
   epochs: 50
   batch_size: 128
-  num_workers: 1
+  num_workers: 2
   prefetch_factor: 4
   lr: 1.0e-3
   seed: 42
@@ -25,21 +26,25 @@ train_basic:
   gat_hidden_dim_embed: 128
   gat_hidden_dim_concat: 128
   num_heads: 4
-  num_layers: 1
+  num_layers: 3
   dropout: 0.2
   use_batch_norm: true
   activation: "elu"
   weight_decay: 1.0e-4
+  persistent_workers: true
+  compile: false
+  norm_kind: "layer_norm"   # bypassa recommend_norm_kind, evita il branch graph_norm rotto
 
 train_time_aware:
   enabled: true
-  shards_dir: "Dataset/Train/shards"
+  train_dir: "Dataset/Train/shards/train"
+  val_dir: "Dataset/Train/shards/val"
   checkpoint: "Dataset/Train/checkpoints/time_aware"
   epochs: 50
   batch_size: 128
-  num_workers: 1
+  num_workers: 2
   prefetch_factor: 4
-  lr: 1.0e-3
+  lr: 2.45e-4
   seed: 42
   patience: 5
   embedding_dims: 64
@@ -47,21 +52,25 @@ train_time_aware:
   gat_hidden_dim_embed: 128
   gat_hidden_dim_concat: 128
   num_heads: 4
-  num_layers: 1
+  num_layers: 3
   dropout: 0.2
   use_batch_norm: true
   activation: "elu"
   lambda_decay: 0.01
-  weight_decay: 1.0e-4
+  weight_decay: 0.05e-4
+  persistent_workers: true
+  compile: false
+  norm_kind: "layer_norm"
 
 evaluate:
   enabled: true
-  test_data: "Dataset/Test/test_clean.pt"
+  test_dir: "Dataset/Train/test_clean"
+  model_basic_checkpoint: "Dataset/Train/checkpoints/basic_best.pt"
+  model_time_aware_checkpoint: "Dataset/Train/checkpoints/time_aware_best.pt"
   plots_dir: "Dataset/Test/plots"
   out_dir: "Dataset/Test/metrics"
-  max_n: 10
+  max_n: 5
   batch_size: 128
   num_workers: 2
   prefetch_factor: 4
-  model_basic_checkpoint: "Dataset/Train/checkpoints/basic_best.pt"
-  model_time_aware_checkpoint: "Dataset/Train/checkpoints/time_aware_best.pt"
+  seed: 42

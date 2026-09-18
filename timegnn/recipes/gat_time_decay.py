@@ -13,10 +13,10 @@ from ..data.encoding import (
     encode_label_event,
     encode_pad_event,
     encode_pad_sequence,
-    node_time_list,
     length_stratified_split,
+    scale_time_differences_fast_fixed,
 )
-from ..data.pyg import CustomDataset, custom_collate_fn, prepare_data_core, prepare_data_y
+from ..data.pyg import CustomDataset, custom_collate_fn, prepare_data_core_timedif, prepare_data_y
 from ..models.gat_time_decay import DualGATTimeAwareModel, evaluate_epoch
 from ..models.training import train_epoch
 from ..train.early_stopping import EarlyStopping
@@ -31,9 +31,10 @@ class GATTimeDecayConfig:
     gat_hidden_dim_embed: int = 128
     gat_hidden_dim_concat: int = 256
     num_heads: int = 4
-    num_layers: int = 1
-    dropout: float = 0.0
+    num_layers: int = 2          # >=2: con 1 solo layer per path non c'e' propagazione multi-hop
+    dropout: float = 0.2
     use_batch_norm: bool = False
+    norm_kind: str = "layer_norm"
     activation: str = "elu"
     lambda_decay: float = 0.01
     batch_size: int = 16
@@ -58,25 +59,6 @@ def train_gat_time_decay(
     device: Optional[str] = None,
     **overrides,
 ):
-    """Train the time-decay GAT model.
-
-    Args:
-        event: Event log dataframe.
-        case_index: Column identifying sequences/cases.
-        core_event: Column with event labels.
-        start_time_col: Timestamp column.
-        cat_col_event: Categorical event-level columns.
-        num_col_event: Numerical event-level columns.
-        seq_cols: Columns used to build sequence-level features.
-        cat_col_seq: Categorical sequence-level columns.
-        num_col_seq: Numerical sequence-level columns.
-        config: Optional configuration dataclass.
-        device: Torch device string.
-        **overrides: Config overrides (e.g., num_epochs=5).
-
-    Returns:
-        Dict with trained model, history, and attention.
-    """
     cfg = resolve_config(config, GATTimeDecayConfig, overrides)
     device = device or ("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -90,14 +72,18 @@ def train_gat_time_decay(
     )
     sequence_encode = encode_pad_sequence(sequence, cat_col_seq, num_col_seq)
 
-    node_times = node_time_list(event, start_time_col, case_index)
+    scaled_time_diffs = scale_time_differences_fast_fixed(
+        event, sequence, start_time_col, case_index
+    )
 
     max_num_events = event_encode.shape[1]
     sequence_features_expanded = np.expand_dims(sequence_encode, axis=1)
     sequence_features_expanded = np.repeat(sequence_features_expanded, max_num_events, axis=1)
     combined_features = np.concatenate((event_encode, sequence_features_expanded), axis=2)
 
-    event_feature_list = prepare_data_core(combined_features, core_encode, node_times)
+    event_feature_list = prepare_data_core_timedif(
+        combined_features, core_encode, scaled_time_diffs, node_times=scaled_time_diffs
+    )
     y_list = prepare_data_y(combined_features, y_encode)
 
     train_indices, test_indices = length_stratified_split(
@@ -129,6 +115,7 @@ def train_gat_time_decay(
         dropout=cfg.dropout,
         use_batch_norm=cfg.use_batch_norm,
         activation=cfg.activation,
+        norm_kind=cfg.norm_kind,
     ).to(device)
 
     optimizer = torch.optim.Adam(model.parameters(), lr=cfg.lr)

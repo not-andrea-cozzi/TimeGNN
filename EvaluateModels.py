@@ -16,10 +16,11 @@ from torch.utils.data import DataLoader
 from timegnn.models.gat_basic import DualGATModel
 from timegnn.models.gat_time_decay import DualGATTimeAwareModel
 from timegnn.data.pyg import custom_collate_graph
-from DatasetPipeline.Utils.position_pooling import pool_node_logits, apply_legal_move_mask
+from DatasetPipeline.Utils.position_pooling import apply_legal_move_mask
 
-# Utilità per la gestione dei dati
-from timegnn.data.pyg import custom_collate_graph
+# Dataset shardato (stesso usato da TrainMain.py per train/val/test)
+from TrainPipeline.Shard.ShardDataset import ShardedGraphDataset
+from Common.sparse_legal_moves import sparse_legal_argmax
 
 # Plotter
 from Common.EvaluatorPlotter import EvaluatorPlotter
@@ -73,32 +74,84 @@ def validate_config(cfg: Dict[str, Any]) -> None:
         if section not in cfg:
             raise ConfigError(f"Sezione mancante: '{section}'")
     eval_cfg = cfg["evaluation"]
-    for key in ["test_data", "checkpoint_basic", "checkpoint_time"]:
+    for key in ["test_dir", "checkpoint_basic", "checkpoint_time"]:
         if key not in eval_cfg:
             raise ConfigError(f"Chiave '{key}' mancante in 'evaluation'.")
 
 
-class SimpleTestDataset(torch.utils.data.Dataset):
-    """Dataset semplice che avvolge una lista di campioni (dizionari o tensori)."""
-    def __init__(self, data_list):
-        self.data = data_list
+def _require_sharded_dir(path: str, label: str) -> None:
+    """Verifica che `path` sia una cartella shardata con manifest.json.
 
-    def __len__(self):
-        return len(self.data)
+    Stessa funzione di TrainMain.py: il test set qui e' shardato
+    (ShardedGraphDataset), non un singolo file .pt caricabile con
+    torch.load — quel path andava bene per un test set piccolo/legacy,
+    ma non per la nuova struttura a shard usata da tutta la pipeline.
+    """
+    if not os.path.isdir(path):
+        raise ConfigError(f"{label}: cartella non trovata: {path}")
+    manifest = os.path.join(path, "manifest.json")
+    if not os.path.exists(manifest):
+        raise ConfigError(f"{label}: manifest.json non trovato in {path}")
 
-    def __getitem__(self, idx):
-        return self.data[idx]
+
+def build_dataloader(
+    dataset,
+    section: Dict[str, Any],
+    collate_fn,
+    shuffle: bool,
+    device: str = "cpu",
+) -> DataLoader:
+    """Identica a build_dataloader in TrainMain.py, duplicata qui per
+    mantenere questo script eseguibile in modo standalone."""
+    num_workers = int(section.get("num_workers", 0))
+    persistent = bool(section.get("persistent_workers", False)) and num_workers > 0
+    prefetch = int(section.get("prefetch_factor", 4)) if num_workers > 0 else None
+    pin_memory = bool(section.get("pin_memory", device == "cuda"))
+
+    kwargs = dict(
+        dataset=dataset,
+        batch_size=section["batch_size"],
+        shuffle=shuffle,
+        collate_fn=collate_fn,
+        num_workers=num_workers,
+        pin_memory=pin_memory,
+        persistent_workers=persistent,
+    )
+    if prefetch is not None:
+        kwargs["prefetch_factor"] = prefetch
+
+    return DataLoader(**kwargs)
 
 
 def load_model(
     checkpoint_path: str,
     model_class,
     model_params: Dict[str, Any],
-    edge_dim: int,
     extra_kwargs: Optional[Dict] = None,
     device: str = "cuda",
 ) -> nn.Module:
-    """Carica un modello dal checkpoint."""
+    """Carica un modello dal checkpoint.
+
+    NOTA su edge_dim: e' un parametro reale del costruttore di
+    DualGATModel (default 1), MA NON di DualGATTimeAwareModel, che lo
+    fissa internamente a 1 (vedi gat_time_decay.py). Per questo edge_dim
+    non e' tra i parametri comuni letti da model_params qui sotto: va
+    passato esplicitamente via extra_kwargs solo per il modello basic,
+    con lo stesso valore usato in training (run_training/TrainMain.py
+    passa edge_dim=NUM_EDGE_TYPES per "basic"). Se omesso, il modello
+    basic viene ricostruito con edge_dim=1 di default e load_state_dict
+    fallisce con size mismatch su gat_*.lin_edge.weight ([*, N] nel
+    checkpoint vs [*, 1] nel modello ricostruito).
+
+    norm_kind viene invece letto da model_params cosi' l'architettura
+    ricostruita in valutazione combacia con quella usata in training
+    (run_training passa norm_kind = tuning_meta["recommended_norm"]):
+    se qui restasse None/"none" mentre il checkpoint e' stato allenato
+    con, ad es., "graph_norm", i moduli di normalizzazione nel modello
+    ricostruito sarebbero nn.Identity invece di GraphAwareNormList/
+    LayerNorm, e load_state_dict fallirebbe (shape/keys mismatch) o
+    caricherebbe pesi fuori posto.
+    """
     if extra_kwargs is None:
         extra_kwargs = {}
 
@@ -111,16 +164,16 @@ def load_model(
         gat_hidden_dim_concat=model_params.get("gat_hidden_dim_concat", 128),
         output_dim=MOVE_VOCAB_SIZE,
         num_heads=model_params.get("num_heads", 4),
-        edge_dim=edge_dim,
         num_layers=model_params.get("num_layers", 1),
         dropout=model_params.get("dropout", 0.0),
         use_batch_norm=model_params.get("use_batch_norm", False),
         activation=model_params.get("activation", "elu"),
+        norm_kind=model_params.get("norm_kind"),
         **extra_kwargs,
     ).to(device)
 
     if os.path.exists(checkpoint_path):
-        state_dict = torch.load(checkpoint_path, map_location=device)
+        state_dict = torch.load(checkpoint_path, map_location=device, weights_only=False)
         # Il checkpoint può contenere l'intero stato del training (con optimizer, ecc.)
         if "model_state_dict" in state_dict:
             model.load_state_dict(state_dict["model_state_dict"])
@@ -146,6 +199,20 @@ def evaluate_model(
         - mate_true: array di profondità reali
         - mate_pred: array di profondità predette (placeholder se non disponibile)
         - mate_n: array di profondità reali (per stratificazione)
+
+    NOTA: entrambi i modelli (DualGATModel, DualGATTimeAwareModel) hanno
+    pool_before_head=True di default e restituiscono direttamente
+    graph_logits [B, output_dim] da model(batch_event). Non va richiamato
+    pool_node_logits/global_mean_pool sull'output: farlo di nuovo qui
+    causerebbe lo stesso RuntimeError da doppio pooling gia' risolto in
+    Loop.py/TrainMain.py ("Expected index [...] to be no larger than
+    self [...]").
+
+    Usa sparse_legal_argmax (stessa funzione di TrainMain.py) quando la
+    maschera delle mosse legali e' disponibile, invece di un argmax
+    seguito da un mascheramento manuale via apply_legal_move_mask: le due
+    strade sono equivalenti nel risultato finale, ma sparse_legal_argmax
+    e' la funzione gia' validata e usata nel resto della pipeline.
     """
     model.eval()
     move_correct_list = []
@@ -156,21 +223,20 @@ def evaluate_model(
 
     with torch.no_grad():
         for batch_event, labels in dataloader:
-            batch_event = batch_event.to(device)
-            labels = labels.to(device)
+            batch_event = batch_event.to(device, non_blocking=True)
+            labels = labels.to(device, non_blocking=True)
 
             if use_amp and device == "cuda":
-                with torch.cuda.amp.autocast():
-                    node_logits = model(batch_event)
+                with torch.autocast(device_type="cuda"):
+                    graph_logits = model(batch_event)
             else:
-                node_logits = model(batch_event)
-
-            graph_logits = pool_node_logits(node_logits, batch_event.batch)
+                graph_logits = model(batch_event)
 
             if hasattr(batch_event, "legal_move_mask") and batch_event.legal_move_mask is not None:
-                graph_logits = apply_legal_move_mask(graph_logits, batch_event.legal_move_mask)
+                pred = sparse_legal_argmax(graph_logits, batch_event.legal_move_mask)
+            else:
+                pred = graph_logits.argmax(dim=1)
 
-            pred = graph_logits.argmax(dim=1)
             correct_move = (pred == labels).cpu().numpy()
             move_correct_list.extend(correct_move)
 
@@ -180,6 +246,8 @@ def evaluate_model(
                 mate_true_list.extend(mate_n)
                 mate_pred_list.extend(np.zeros_like(mate_n))
                 mate_correct_list.extend(np.zeros_like(mate_n, dtype=bool))
+
+            del batch_event, labels, graph_logits, pred
 
     results = {
         "move_correct": np.array(move_correct_list),
@@ -216,30 +284,20 @@ def main(config_path: str = "Yaml/evaluate_models.yaml") -> None:
     use_amp = eval_cfg.get("use_amp", False) and device == "cuda"
     logger.info(f"Device: {device}, AMP: {use_amp}")
 
-    # Caricamento dataset di test
-    test_path = eval_cfg["test_data"]
-    if not os.path.exists(test_path):
-        raise ConfigError(f"File di test non trovato: {test_path}")
+    # Caricamento dataset di test (shardato, stessa struttura di train/val)
+    test_dir = eval_cfg["test_dir"]
+    _require_sharded_dir(test_dir, "test")
 
-    logger.info(f"Caricamento test set da {test_path}...")
-    test_data = torch.load(test_path, map_location="cpu", weights_only=False)
-    if not isinstance(test_data, list):
-        logger.warning("Il test set non è una lista; provo a convertirlo in lista di campioni.")
-        if isinstance(test_data, torch.Tensor):
-            raise ConfigError("Il dataset di test deve essere una lista di dizionari, non un tensore.")
-        else:
-            test_data = [test_data]
-
-    test_ds = SimpleTestDataset(test_data)
-    test_loader = DataLoader(
-        test_ds,
-        batch_size=eval_cfg.get("batch_size", 64),
-        shuffle=False,
-        collate_fn=custom_collate_graph,
-        num_workers=eval_cfg.get("num_workers", 2),
-        persistent_workers=eval_cfg.get("num_workers", 2) > 0,
+    logger.info(f"Caricamento test set shardato da {test_dir}...")
+    test_ds = ShardedGraphDataset(test_dir, shuffle=False, seed=eval_cfg.get("seed", 42))
+    test_loader = build_dataloader(
+        test_ds, eval_cfg, custom_collate_graph, shuffle=False, device=device
     )
-    logger.info(f"Test set caricato: {len(test_ds)} campioni.")
+    logger.info(
+        f"Test set: {len(test_ds):,} campioni in {len(test_loader)} batch | "
+        f"num_workers={eval_cfg.get('num_workers', 0)} | "
+        f"pin_memory={test_loader.pin_memory}"
+    )
 
     # Caricamento dei modelli
     logger.info("Caricamento modello basic...")
@@ -247,8 +305,14 @@ def main(config_path: str = "Yaml/evaluate_models.yaml") -> None:
         eval_cfg["checkpoint_basic"],
         DualGATModel,
         model_params,
-        edge_dim=NUM_EDGE_TYPES,
-        extra_kwargs={},
+        # edge_dim e' un parametro reale del costruttore di DualGATModel
+        # (default 1), a differenza di DualGATTimeAwareModel dove edge_dim
+        # e' fissato internamente a 1. Il checkpoint qui e' stato allenato
+        # con NUM_EDGE_TYPES=3 (vedi run_training/TrainMain.py, che passa
+        # edge_dim=NUM_EDGE_TYPES per il modello basic): senza specificarlo
+        # qui, load_state_dict fallisce per size mismatch su gat_*.lin_edge.weight
+        # (shape [*, 3] nel checkpoint vs [*, 1] nel modello ricostruito col default).
+        extra_kwargs={"edge_dim": NUM_EDGE_TYPES},
         device=device,
     )
 
@@ -257,7 +321,6 @@ def main(config_path: str = "Yaml/evaluate_models.yaml") -> None:
         eval_cfg["checkpoint_time"],
         DualGATTimeAwareModel,
         model_params,
-        edge_dim=TIME_EDGE_DIM,
         extra_kwargs={"lambda_decay": model_params.get("lambda_decay", 0.01)},
         device=device,
     )
@@ -268,10 +331,33 @@ def main(config_path: str = "Yaml/evaluate_models.yaml") -> None:
     res_basic = evaluate_model(model_basic, test_loader, device, use_amp)
     logger.info(f"Basic valutato in {time.monotonic() - t0:.2f}s, campioni: {len(res_basic['move_correct'])}")
 
-    logger.info("Valutazione modello time-aware...")
-    t0 = time.monotonic()
-    res_time = evaluate_model(model_time, test_loader, device, use_amp)
-    logger.info(f"Time-aware valutato in {time.monotonic() - t0:.2f}s, campioni: {len(res_time['move_correct'])}")
+    # skip_time_aware: stesso meccanismo di TrainMain.py/evaluate_models().
+    # Il try/except sotto e' comunque il guard primario: se la valutazione
+    # time_aware fallisce per qualsiasi motivo (es. incompatibilita' di
+    # propagate() con la versione di torch_geometric installata), il
+    # basic gia' valutato non va perso e lo script prosegue generando solo
+    # i grafici/metriche disponibili, invece di crashare tutto lo script.
+    skip_time_aware = bool(eval_cfg.get("skip_time_aware", False))
+    res_time = None
+    if not skip_time_aware:
+        logger.info("Valutazione modello time-aware...")
+        t0 = time.monotonic()
+        try:
+            res_time = evaluate_model(model_time, test_loader, device, use_amp)
+            logger.info(
+                f"Time-aware valutato in {time.monotonic() - t0:.2f}s, "
+                f"campioni: {len(res_time['move_correct'])}"
+            )
+        except TypeError as e:
+            logger.error(
+                f"[eval] Valutazione del modello time_aware saltata: {e}. "
+                f"TimeAwareGATConv.propagate() non e' compatibile con la versione di "
+                f"torch_geometric installata su questa macchina. Imposta "
+                f"'evaluation.skip_time_aware: true' nello YAML per saltarla "
+                f"esplicitamente senza passare da qui."
+            )
+    else:
+        logger.info("Valutazione del modello time_aware saltata (skip_time_aware=true).")
 
     # Generazione dei plot e metriche usando EvaluatorPlotter
     plots_dir = eval_cfg.get("plots_dir", "Dataset/Test/plots")
@@ -280,33 +366,43 @@ def main(config_path: str = "Yaml/evaluate_models.yaml") -> None:
 
     plotter = EvaluatorPlotter(plots_dir=plots_dir, out_dir=metrics_dir)
 
-    # Plot a barre per profondità
-    plotter.plot_depth_bars(res_time, res_basic, max_n=max_n, filename="bars_per_n.png")
-    # Curve di accuracy
-    plotter.plot_depth_curves(res_time, res_basic, max_n=max_n, filename="curves_per_n.png")
-    # CSV con metriche per n
-    plotter.save_depth_metrics(res_time, res_basic, max_n=max_n, filename="metrics_per_n.csv")
-    # Barre aggregate globali
-    plotter.plot_aggregate_bars(res_time, res_basic, filename="aggregate_bars.png")
+    if res_time is not None:
+        # Plot a barre per profondità
+        plotter.plot_depth_bars(res_time, res_basic, max_n=max_n, filename="bars_per_n.png")
+        # Curve di accuracy
+        plotter.plot_depth_curves(res_time, res_basic, max_n=max_n, filename="curves_per_n.png")
+        # CSV con metriche per n
+        plotter.save_depth_metrics(res_time, res_basic, max_n=max_n, filename="metrics_per_n.csv")
+        # Barre aggregate globali
+        plotter.plot_aggregate_bars(res_time, res_basic, filename="aggregate_bars.png")
 
-    # Matrici di confusione per la profondità (se disponibili)
-    if len(res_time.get("mate_true", [])) > 0:
-        plotter.plot_confusion_matrix(
-            res_time["mate_true"],
-            res_time["mate_pred"],
-            num_classes=max_n + 1,
-            title="Confusion matrix - Timed model",
-            filename="cm_timed.png"
-        )
-        plotter.plot_confusion_matrix(
-            res_basic["mate_true"],
-            res_basic["mate_pred"],
-            num_classes=max_n + 1,
-            title="Confusion matrix - Basic model",
-            filename="cm_untimed.png"
-        )
+        # Matrici di confusione per la profondità (se disponibili)
+        if len(res_time.get("mate_true", [])) > 0:
+            plotter.plot_confusion_matrix(
+                res_time["mate_true"],
+                res_time["mate_pred"],
+                num_classes=max_n + 1,
+                title="Confusion matrix - Timed model",
+                filename="cm_timed.png"
+            )
+            plotter.plot_confusion_matrix(
+                res_basic["mate_true"],
+                res_basic["mate_pred"],
+                num_classes=max_n + 1,
+                title="Confusion matrix - Basic model",
+                filename="cm_untimed.png"
+            )
+        else:
+            logger.warning("Nessun dato di profondità (mate_n) disponibile nel test set; matrici di confusione non generate.")
     else:
-        logger.warning("Nessun dato di profondità (mate_n) disponibile nel test set; matrici di confusione non generate.")
+        logger.warning(
+            "Solo il modello basic e' stato valutato "
+            f"(move accuracy = {np.mean(res_basic['move_correct']):.4f}). "
+            "Grafici comparativi basic/time_aware non generati."
+        )
+        os.makedirs(plots_dir, exist_ok=True)
+        with open(os.path.join(plots_dir, "bars_per_n.png"), "wb"):
+            pass
 
     # Opzionalmente salvare i risultati in un file pickle per analisi successive
     results_file = os.path.join(metrics_dir, "evaluation_results.pkl")

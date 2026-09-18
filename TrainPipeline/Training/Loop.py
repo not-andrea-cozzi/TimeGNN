@@ -5,17 +5,12 @@ from typing import Optional, Tuple
 
 import torch
 import torch.nn as nn
-from torch_geometric.nn import global_mean_pool
 
 from Common.progress import LiveStats, stage_bar
 from Common.sparse_legal_moves import sparse_legal_cross_entropy
 from TrainPipeline.Training.State import TrainState
 
 logger = logging.getLogger("train_loop")
-
-
-def pool_node_logits(node_logits: torch.Tensor, batch_index: torch.Tensor) -> torch.Tensor:
-    return global_mean_pool(node_logits, batch_index)
 
 
 def _masked_for_accuracy(graph_logits: torch.Tensor, legal_move_mask: torch.Tensor) -> torch.Tensor:
@@ -43,7 +38,7 @@ def train_epoch(
     class_weights: Optional[torch.Tensor] = None,
     warmup_scheduler: Optional[torch.optim.lr_scheduler.LRScheduler] = None,
 ) -> Tuple[float, float]:
-   
+
     model.train()
     total_loss = torch.zeros((), device=device)
     correct = torch.zeros((), device=device)
@@ -62,8 +57,9 @@ def train_epoch(
             optimizer.zero_grad(set_to_none=True)
 
             with torch.autocast(device_type="cuda" if amp_enabled else "cpu", enabled=amp_enabled):
-                node_logits = model(batch_event)
-                graph_logits = pool_node_logits(node_logits, batch_event.batch)
+                # Il modello (pool_before_head=True) pool-a gia' internamente:
+                # ritorna [B, output_dim], NON serve pool_node_logits qui.
+                graph_logits = model(batch_event)
                 loss = sparse_legal_cross_entropy(
                     graph_logits, batch_event.legal_move_mask, labels,
                     class_weights=class_weights,
@@ -138,7 +134,7 @@ def evaluate_epoch(
     epoch_label: Optional[str] = None,
     class_weights: Optional[torch.Tensor] = None,
 ) -> Tuple[float, float, float]:
-    
+
     model.eval()
     total_loss = torch.zeros((), device=device)
     correct_top1 = torch.zeros((), device=device)
@@ -155,8 +151,7 @@ def evaluate_epoch(
             labels = labels.to(device, non_blocking=True)
 
             with torch.autocast(device_type="cuda" if amp_enabled else "cpu", enabled=amp_enabled):
-                node_logits = model(batch_event)
-                graph_logits = pool_node_logits(node_logits, batch_event.batch)
+                graph_logits = model(batch_event)  # gia' pooled, vedi train_epoch
                 loss = sparse_legal_cross_entropy(
                     graph_logits, batch_event.legal_move_mask, labels,
                     class_weights=class_weights,
