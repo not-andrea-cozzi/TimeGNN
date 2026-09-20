@@ -36,11 +36,20 @@ logger = logging.getLogger("build_external_holdout")
 
 @dataclass
 class ExternalHoldoutConfig:
-    csv_path: str = "RawData/club_games_data.csv"
+    # Accetta sia un CSV in stile Kaggle Chess.com (colonna 'pgn' per riga)
+    # sia un file .pgn testuale con partite concatenate (es. FICS/Lichess
+    # non compresso). Il formato viene rilevato dal CONTENUTO del file
+    # (non dall'estensione), vedi ChesscomHoldoutBuilder._detect_input_format.
+    csv_path: str = "RawData/ficsgamesdb_201001_standard_movetimes_4340144.pgn"
     source_tag: str = "chesscom_holdout"
 
+    # Rilevamento formato: "auto" (default) ispeziona il file; "csv" o
+    # "pgn" forzano esplicitamente un parser, saltando il rilevamento
+    # (utile se un file .csv contenesse per errore testo PGN o viceversa).
+    input_format: str = "auto"
+
     chunksize: int = 5_000
-    max_games: Optional[int] = 2_000
+    max_games: Optional[int] = 20_000
 
     allowed_rules: Tuple[str, ...] = ("chess",)
     require_rated: bool = False
@@ -205,14 +214,55 @@ class ChesscomHoldoutBuilder:
         )
 
         self._engine = None
+        self._input_format = self._detect_input_format()
+        logger.info(f"[holdout] Formato input rilevato: '{self._input_format}' (da '{self.config.csv_path}').")
 
     def _validate_config(self) -> None:
         cfg = self.config
         if not os.path.exists(cfg.csv_path):
-            raise ConfigError(f"CSV Kaggle non trovato: '{cfg.csv_path}'")
+            raise ConfigError(f"File di input non trovato: '{cfg.csv_path}'")
         if cfg.mate_range[0] < 1 or cfg.mate_range[1] < cfg.mate_range[0]:
             raise ConfigError(f"mate_range non valido: {cfg.mate_range}")
+        if cfg.input_format not in ("auto", "csv", "pgn"):
+            raise ConfigError(
+                f"input_format non valido: '{cfg.input_format}'. Attesi: 'auto', 'csv', 'pgn'."
+            )
         require_executable(cfg.stockfish_path)
+
+    def _detect_input_format(self) -> str:
+        """Determina se csv_path va letto come CSV (stile Kaggle
+        Chess.com, colonna 'pgn' per riga) o come file .pgn testuale
+        (partite concatenate, header '[Event ...]').
+
+        Se config.input_format e' 'csv' o 'pgn', quella scelta e'
+        rispettata senza ispezionare il file. Con 'auto' (default), il
+        rilevamento guarda il CONTENUTO, non l'estensione: un file .pgn
+        rinominato .csv (o viceversa) viene comunque riconosciuto
+        correttamente, a differenza di un dispatch basato solo su
+        os.path.splitext.
+        """
+        cfg = self.config
+        if cfg.input_format in ("csv", "pgn"):
+            return cfg.input_format
+
+        try:
+            with open(cfg.csv_path, "r", encoding="utf-8", errors="replace") as f:
+                for _ in range(50):
+                    line = f.readline()
+                    if not line:
+                        break
+                    stripped = line.strip()
+                    if not stripped:
+                        continue
+                    if stripped.startswith("[Event "):
+                        return "pgn"
+                    # Prima riga non vuota, non PGN: trattala come header
+                    # CSV e ferma l'ispezione (una riga basta per un header).
+                    break
+        except OSError as e:
+            raise ConfigError(f"Impossibile leggere '{cfg.csv_path}' per rilevare il formato: {e}")
+
+        return "csv"
 
     def _start_engine(self) -> None:
         import chess.engine
@@ -241,6 +291,19 @@ class ChesscomHoldoutBuilder:
             return None
 
     def _iter_rows(self):
+        """Dispatcher unico: produce record in un formato uniforme
+        (un dict con almeno la chiave 'pgn'), indipendentemente dal fatto
+        che l'input sia un CSV Kaggle o un file .pgn testuale. Tutto il
+        codice a valle (_process_game) legge sempre row['pgn'],
+        row.get('white_rating'), row.get('black_rating'), row.get('time_class'):
+        non deve sapere da quale formato il record proviene.
+        """
+        if self._input_format == "pgn":
+            yield from self._iter_rows_from_pgn()
+        else:
+            yield from self._iter_rows_from_csv()
+
+    def _iter_rows_from_csv(self):
         reader = pd.read_csv(self.config.csv_path, chunksize=self.config.chunksize)
         yielded = 0
         for chunk in reader:
@@ -253,6 +316,57 @@ class ChesscomHoldoutBuilder:
                 yielded += 1
                 if self.config.max_games is not None and yielded >= self.config.max_games:
                     return
+
+    def _iter_rows_from_pgn(self):
+        """Legge un file .pgn testuale con partite concatenate, spezzando
+        sul marcatore '[Event ' che apre ogni nuova partita (stessa logica
+        di GamesBuilder._iter_pgn_texts). Ogni partita diventa un record
+        con chiave 'pgn' contenente il testo PGN completo (header + mosse),
+        cosi' _process_game puo' trattarlo esattamente come farebbe con
+        row['pgn'] proveniente da un CSV.
+
+        require_rated e allowed_rules (pensati per le colonne 'rated' e
+        'rules' del CSV Kaggle) non hanno un equivalente diretto negli
+        header PGN standard: vengono ignorati qui, loggando un avviso una
+        sola volta se richiesti esplicitamente, invece di fallire
+        silenziosamente o filtrare in modo scorretto.
+        """
+        cfg = self.config
+        if cfg.require_rated:
+            logger.warning(
+                "[holdout] require_rated=True non e' applicabile a input .pgn "
+                "(nessuna colonna 'rated' negli header PGN): ignorato."
+            )
+        if cfg.allowed_rules and cfg.allowed_rules != ("chess",):
+            logger.warning(
+                f"[holdout] allowed_rules={cfg.allowed_rules} non e' applicabile a input .pgn: ignorato."
+            )
+
+        yielded = 0
+        current_game_lines: List[str] = []
+
+        def _flush_current():
+            if not current_game_lines:
+                return None
+            return {"pgn": "".join(current_game_lines)}
+
+        with open(cfg.csv_path, "r", encoding="utf-8", errors="replace") as f:
+            for line in f:
+                if line.startswith("[Event ") and current_game_lines:
+                    record = _flush_current()
+                    if record is not None:
+                        yield record
+                        yielded += 1
+                        if cfg.max_games is not None and yielded >= cfg.max_games:
+                            return
+                    current_game_lines = [line]
+                else:
+                    current_game_lines.append(line)
+
+            if current_game_lines and (cfg.max_games is None or yielded < cfg.max_games):
+                record = _flush_current()
+                if record is not None:
+                    yield record
 
     def _simulated_clock(self, rating: Optional[float], ply_idx: int) -> float:
         base = self.config.default_move_seconds
@@ -308,10 +422,14 @@ class ChesscomHoldoutBuilder:
         if game_end_ply < cfg.min_game_plies:
             return []
 
-        white_rating = parse_rating_strict(str(row.get("white_rating", ""))) or parse_rating_strict(
+        # row['white_rating']/row['black_rating'] esistono solo per record
+        # provenienti dal CSV Kaggle; per record da .pgn (dove il dict ha
+        # solo la chiave 'pgn', vedi _iter_rows_from_pgn) row.get(...)
+        # ritorna None e si cade direttamente sugli header PGN sotto.
+        white_rating = parse_rating_strict(str(row.get("white_rating") or "")) or parse_rating_strict(
             game.headers.get("WhiteElo", "")
         )
-        black_rating = parse_rating_strict(str(row.get("black_rating", ""))) or parse_rating_strict(
+        black_rating = parse_rating_strict(str(row.get("black_rating") or "")) or parse_rating_strict(
             game.headers.get("BlackElo", "")
         )
         mover_rating = {chess.WHITE: white_rating, chess.BLACK: black_rating}
@@ -539,7 +657,7 @@ def main() -> Dict[str, Any]:
     setup_logging(cfg.log_level, cfg.log_file)
 
     logger.info("=" * 70)
-    logger.info("BUILD EXTERNAL HOLDOUT (Chess.com 60k games, Kaggle)")
+    logger.info("BUILD EXTERNAL HOLDOUT (CSV Kaggle Chess.com o file .pgn)")
     logger.info("=" * 70)
 
     os.makedirs(cfg.output_dir, exist_ok=True)
