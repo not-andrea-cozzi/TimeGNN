@@ -45,7 +45,7 @@ class ExternalHoldoutConfig:
     allowed_rules: Tuple[str, ...] = ("chess",)
     require_rated: bool = False
 
-    stockfish_path: str = "/usr/games/stockfish"
+    stockfish_path: str = "stockfish"
     threads: int = 1
     hash_mb: int = 128
     search_depth: int = 12

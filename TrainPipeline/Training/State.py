@@ -1,6 +1,7 @@
 """
 TrainState - Gestione dello stato di training con supporto per last/best checkpoint.
 """
+from __future__ import annotations
 
 import logging
 import os
