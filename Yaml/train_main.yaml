@@ -67,8 +67,8 @@ evaluate:
   test_dir: "Dataset/ExternalHoldout/holdout_clean"
   model_basic_checkpoint: "Models/basic_best.pt"
   model_time_aware_checkpoint: "Models/time_aware_best.pt"
-  plots_dir: "Dataset/Test_330/plots"
-  out_dir: "Dataset/Test_330/metrics"
+  plots_dir: "Dataset/Heldout/plots"
+  out_dir: "Dataset/Heldout/metrics"
   max_n: 5
   batch_size: 128
   num_workers: 2
