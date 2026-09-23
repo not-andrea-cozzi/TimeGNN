@@ -175,6 +175,5 @@ pyrightconfig.json
 RawData/
 Dataset/
 Temp/
-timegnn/
 Models/*.pt
-Result/*
+.DS_Store

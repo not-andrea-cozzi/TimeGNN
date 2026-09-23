@@ -2,7 +2,10 @@ torch
 torchvision
 torchaudio
 
-# Dipendenze generalipython-chess
+# Dipendenze generali
+python-chess
+torch_geometric
+zstandard
 pandas
 tqdm
 scikit-learn

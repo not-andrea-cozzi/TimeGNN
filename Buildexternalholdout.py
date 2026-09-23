@@ -136,11 +136,7 @@ class ExternalHoldoutConfig:
     allowed_rules: Tuple[str, ...] = ("chess",)
     require_rated: bool = False
 
-    only_decisive_games: bool = True
-    skip_time_forfeit: bool = True
-    min_game_plies: int = 20
-
-    stockfish_path: str = "/usr/games/stockfish"
+    stockfish_path: str = "stockfish"
     threads: int = 1
     hash_mb: int = 32
     search_depth: int = 12
@@ -225,7 +221,16 @@ def setup_logging(log_level: str = "INFO", log_file: Optional[str] = None) -> No
 
 
 def require_executable(path: str) -> None:
-    if not (os.path.exists(path) and os.access(path, os.X_OK)):
+    # os.path.exists tratta 'path' come percorso letterale (relativo alla
+    # cwd se non assoluto): non cerca nel PATH di sistema. Per permettere
+    # un valore generico come "stockfish" (installato via brew, quindi
+    # gia' nel PATH) proviamo prima cosi', e solo se fallisce cerchiamo
+    # nel PATH con shutil.which.
+    if os.path.exists(path) and os.access(path, os.X_OK):
+        return
+    import shutil
+    resolved = shutil.which(path)
+    if resolved is None:
         raise ConfigError(f"Eseguibile non trovato o non eseguibile: {path}")
 
 
@@ -810,6 +815,10 @@ class ChesscomHoldoutBuilder:
                     mate_n=int(mate_n),
                 )
                 data = apply_edge_type_time_weighting(data)
+                # FEN salvato esplicitamente: serve per il confronto con l'LLM
+                # (GroqLLMSolver prende in input il FEN testuale, non il grafo),
+                # e build_position_data non lo salva di default sull'oggetto Data.
+                data.fen = board.fen()
             except ValueError as e:
                 logger.warning(f"[holdout] {full_game_id} ply={node.ply()}: scarto posizione ({e}).")
                 node = next_node

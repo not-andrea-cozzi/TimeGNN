@@ -18,6 +18,7 @@ logger = logging.getLogger("clean")
 KEEP_FIELDS = (
     "event_ids", "x", "edge_index", "edge_attr",
     "time", "y", "legal_move_mask", "position_mate_n", "num_nodes",
+    "fen",  # necessario per il confronto con l'LLM (GroqLLMSolver usa il FEN testuale)
 )
 SHARD_FILENAME_TEMPLATE = "shard_{:05d}.pt"
 MANIFEST_FILENAME = "manifest.json"
