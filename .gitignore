@@ -177,3 +177,4 @@ Dataset/
 Temp/
 Models/*.pt
 .DS_Store
+Result/*
