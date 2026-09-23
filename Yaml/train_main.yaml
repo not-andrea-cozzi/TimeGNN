@@ -64,7 +64,7 @@ train_time_aware:
 
 evaluate:
   enabled: true
-  test_dir: "Dataset/Train/test_clean"
+  test_dir: "Dataset/ExternalHoldout/holdout_clean"
   model_basic_checkpoint: "Models/basic_best.pt"
   model_time_aware_checkpoint: "Models/time_aware_best.pt"
   plots_dir: "Result/TestSet/plots"

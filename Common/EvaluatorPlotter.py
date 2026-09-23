@@ -10,6 +10,30 @@ import numpy as np
 
 logger = logging.getLogger("evaluator_plotter")
 
+# Palette uniforme con PlotComparison.py: basic = blu scuro, time_aware = azzurrino.
+COLOR_UNTIMED = "#1E3A8A"   # basic, blu scuro
+COLOR_TIMED = "#7DD3FC"     # time_aware, azzurrino
+TEXT_DARK = "#2B2D33"
+TEXT_MUTED = "#8A8D94"
+GRID_COLOR = "#DCDCE2"
+
+plt.rcParams["font.family"] = "DejaVu Sans"
+plt.rcParams["axes.unicode_minus"] = True
+plt.rcParams["text.color"] = TEXT_DARK
+plt.rcParams["axes.labelcolor"] = TEXT_DARK
+plt.rcParams["xtick.color"] = TEXT_DARK
+plt.rcParams["ytick.color"] = TEXT_DARK
+
+
+def _style_axes(ax):
+    ax.grid(True, axis="y", color=GRID_COLOR, linewidth=0.9, zorder=0)
+    ax.set_axisbelow(True)
+    for spine_name in ("top", "right", "left"):
+        ax.spines[spine_name].set_visible(False)
+    ax.spines["bottom"].set_color(GRID_COLOR)
+    ax.tick_params(axis="both", length=0)
+
+
 class EvaluatorPlotter:
     """
     Helper per calcolare metriche e generare grafici/CSV per la valutazione dei modelli.
@@ -69,38 +93,45 @@ class EvaluatorPlotter:
         depths, acc_t, _, counts, corrects_t = self._extract_depth_arrays(res_t, max_n)
         _, acc_u, _, _, corrects_u = self._extract_depth_arrays(res_u, max_n)
 
-        width = 0.35
+        width = 0.36
         x = np.arange(len(depths))
-        fig, ax = plt.subplots(figsize=(10, 6))
+        fig, ax = plt.subplots(figsize=(12, 7), dpi=150)
+        fig.patch.set_facecolor("white")
+        ax.set_facecolor("white")
 
         acc_t_plot = np.nan_to_num(acc_t, nan=0.0)
         acc_u_plot = np.nan_to_num(acc_u, nan=0.0)
 
-        rects1 = ax.bar(x - width / 2, acc_t_plot * 100, width, label="Timed", color="royalblue")
-        rects2 = ax.bar(x + width / 2, acc_u_plot * 100, width, label="Untimed", color="coral")
+        rects1 = ax.bar(x - width / 2, acc_t_plot * 100, width, label="Time-aware",
+                         color=COLOR_TIMED, edgecolor="white", linewidth=1.2, zorder=3)
+        rects2 = ax.bar(x + width / 2, acc_u_plot * 100, width, label="Basic",
+                         color=COLOR_UNTIMED, edgecolor="white", linewidth=1.2, zorder=3)
 
         ax.set_xticks(x)
-        ax.set_xticklabels([f"n={d}" for d in depths])
-        ax.set_ylabel("Accuracy (%)")
-        ax.set_xlabel("Profondità di matto (n)")
-        ax.set_title("Risposte Giuste / Totale per ogni n")
-        ax.set_ylim(0, 115)
-        ax.legend()
-        ax.grid(axis="y", linestyle=":", alpha=0.6)
+        ax.set_xticklabels([f"n = {d}" for d in depths], fontsize=10.5)
+        ax.set_ylabel("Accuracy (%)", fontsize=12)
+        ax.set_xlabel("Profondità di matto (n)", fontsize=12, labelpad=14)
+        ax.set_title("Risposte giuste / totale per profondità di matto",
+                     fontsize=15, fontweight="bold", pad=16, loc="left")
+        ax.set_ylim(0, 118)
+        legend = ax.legend(loc="upper right", frameon=False, fontsize=10.5)
+        _style_axes(ax)
 
         for i, rect in enumerate(rects1):
             if counts[i] > 0:
-                ax.text(rect.get_x() + rect.get_width() / 2, rect.get_height() + 2,
-                        f"{corrects_t[i]}/{counts[i]}", ha="center", va="bottom", fontsize=8, rotation=90)
+                ax.text(rect.get_x() + rect.get_width() / 2, rect.get_height() + 3,
+                        f"{corrects_t[i]}/{counts[i]}", ha="center", va="bottom",
+                        fontsize=8, rotation=90, color=TEXT_DARK)
 
         for i, rect in enumerate(rects2):
             if counts[i] > 0:
-                ax.text(rect.get_x() + rect.get_width() / 2, rect.get_height() + 2,
-                        f"{corrects_u[i]}/{counts[i]}", ha="center", va="bottom", fontsize=8, rotation=90)
+                ax.text(rect.get_x() + rect.get_width() / 2, rect.get_height() + 3,
+                        f"{corrects_u[i]}/{counts[i]}", ha="center", va="bottom",
+                        fontsize=8, rotation=90, color=TEXT_DARK)
 
         fig.tight_layout()
         out_path = os.path.join(self.plots_dir, filename)
-        fig.savefig(out_path, dpi=200)
+        fig.savefig(out_path, dpi=220, facecolor="white")
         plt.close(fig)
         logger.info(f"Salvato {out_path}")
 
@@ -109,19 +140,25 @@ class EvaluatorPlotter:
         depths, acc_t, _, _, _ = self._extract_depth_arrays(res_t, max_n)
         _, acc_u, _, _, _ = self._extract_depth_arrays(res_u, max_n)
 
-        fig, ax = plt.subplots(figsize=(8, 5))
-        ax.plot(depths, acc_t * 100, marker="o", label="Timed", color="royalblue")
-        ax.plot(depths, acc_u * 100, marker="s", label="Untimed", color="coral")
+        fig, ax = plt.subplots(figsize=(10, 6.5), dpi=150)
+        fig.patch.set_facecolor("white")
+        ax.set_facecolor("white")
+
+        ax.plot(depths, acc_t * 100, marker="o", markersize=7, linewidth=2.4,
+                label="Time-aware", color=COLOR_TIMED, zorder=3)
+        ax.plot(depths, acc_u * 100, marker="s", markersize=7, linewidth=2.4,
+                label="Basic", color=COLOR_UNTIMED, zorder=3)
         ax.set_xticks(depths)
-        ax.set_xlabel("Profondità di matto (n)")
-        ax.set_ylabel("Accuracy (%)")
-        ax.set_title("Andamento Accuracy per ogni n")
-        ax.legend()
-        ax.grid(True, alpha=0.3)
+        ax.set_xlabel("Profondità di matto (n)", fontsize=12, labelpad=14)
+        ax.set_ylabel("Accuracy (%)", fontsize=12)
+        ax.set_title("Andamento dell'accuracy per profondità di matto",
+                     fontsize=15, fontweight="bold", pad=16, loc="left")
+        ax.legend(loc="upper right", frameon=False, fontsize=10.5)
+        _style_axes(ax)
 
         fig.tight_layout()
         out_path = os.path.join(self.plots_dir, filename)
-        fig.savefig(out_path, dpi=200)
+        fig.savefig(out_path, dpi=220, facecolor="white")
         plt.close(fig)
         logger.info(f"Salvato {out_path}")
 
@@ -160,28 +197,36 @@ class EvaluatorPlotter:
         global_move_u = np.average(move_u[valid_u], weights=counts_u[valid_u]) if valid_u.any() else 0.0
         global_mate_u = np.average(mate_u[valid_u], weights=counts_u[valid_u]) if valid_u.any() else 0.0
 
-        metrics = ["move_acc", "mate_acc"]
+        metrics = ["Move Accuracy", "Mate Accuracy"]
         x = np.arange(len(metrics))
-        width = 0.35
-        fig, ax = plt.subplots(figsize=(6, 4.5))
+        width = 0.34
+        fig, ax = plt.subplots(figsize=(8, 6), dpi=150)
+        fig.patch.set_facecolor("white")
+        ax.set_facecolor("white")
 
         vals_t = [global_move_t, global_mate_t]
         vals_u = [global_move_u, global_mate_u]
 
-        ax.bar(x - width / 2, vals_t, width, label="Timed", color="royalblue")
-        ax.bar(x + width / 2, vals_u, width, label="Untimed", color="coral")
+        ax.bar(x - width / 2, vals_t, width, label="Time-aware", color=COLOR_TIMED,
+               edgecolor="white", linewidth=1.2, zorder=3)
+        ax.bar(x + width / 2, vals_u, width, label="Basic", color=COLOR_UNTIMED,
+               edgecolor="white", linewidth=1.2, zorder=3)
         ax.set_xticks(x)
-        ax.set_xticklabels(metrics)
+        ax.set_xticklabels(metrics, fontsize=11)
         ax.set_ylim(0, 1)
-        ax.set_ylabel("Accuracy")
-        ax.set_title(f"Test set — Timed vs Untimed (N={total})")
+        ax.set_ylabel("Accuracy", fontsize=12)
+        ax.set_title(f"Test set — Time-aware vs Basic (N={total})",
+                     fontsize=15, fontweight="bold", pad=16, loc="left")
         for i, (vt, vu) in enumerate(zip(vals_t, vals_u)):
-            ax.text(i - width / 2, vt + 0.01, f"{vt:.3f}", ha="center", fontsize=9)
-            ax.text(i + width / 2, vu + 0.01, f"{vu:.3f}", ha="center", fontsize=9)
-        ax.legend()
+            ax.text(i - width / 2, vt + 0.015, f"{vt:.3f}", ha="center", fontsize=10,
+                    color=TEXT_DARK, fontweight="bold")
+            ax.text(i + width / 2, vu + 0.015, f"{vu:.3f}", ha="center", fontsize=10,
+                    color=TEXT_DARK, fontweight="bold")
+        ax.legend(loc="upper right", frameon=False, fontsize=10.5)
+        _style_axes(ax)
         fig.tight_layout()
         out_path = os.path.join(self.plots_dir, filename)
-        fig.savefig(out_path, dpi=200)
+        fig.savefig(out_path, dpi=220, facecolor="white")
         plt.close(fig)
         logger.info(f"Salvato {out_path}")
 
@@ -193,11 +238,12 @@ class EvaluatorPlotter:
         row_sums = cm.sum(axis=1, keepdims=True)
         cm_norm = np.divide(cm, row_sums, out=np.zeros_like(cm, dtype=float), where=row_sums != 0)
 
-        fig, ax = plt.subplots(figsize=(7, 6))
-        im = ax.imshow(cm_norm, cmap="Blues", vmin=0, vmax=1)
-        ax.set_xlabel("Mate-in-N predetto")
-        ax.set_ylabel("Mate-in-N reale")
-        ax.set_title(title)
+        fig, ax = plt.subplots(figsize=(8, 7), dpi=150)
+        fig.patch.set_facecolor("white")
+        im = ax.imshow(cm_norm, cmap="PuBu", vmin=0, vmax=1)
+        ax.set_xlabel("Mate-in-N predetto", fontsize=12, labelpad=12)
+        ax.set_ylabel("Mate-in-N reale", fontsize=12)
+        ax.set_title(title, fontsize=15, fontweight="bold", pad=16, loc="left")
         ax.set_xticks(range(num_classes))
         ax.set_yticks(range(num_classes))
         for i in range(num_classes):
@@ -205,11 +251,14 @@ class EvaluatorPlotter:
                 if cm[i, j] > 0:
                     ax.text(j, i, f"{cm_norm[i, j]:.2f}",
                             ha="center", va="center",
-                            color="white" if cm_norm[i, j] > 0.5 else "black",
-                            fontsize=7)
-        fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04, label="Frazione (row-normalized)")
+                            color="white" if cm_norm[i, j] > 0.5 else TEXT_DARK,
+                            fontsize=8, fontweight="medium")
+        cbar = fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04, label="Frazione (row-normalized)")
+        cbar.outline.set_visible(False)
+        for spine in ax.spines.values():
+            spine.set_visible(False)
         fig.tight_layout()
         out_path = os.path.join(self.plots_dir, filename)
-        fig.savefig(out_path, dpi=200)
+        fig.savefig(out_path, dpi=220, facecolor="white")
         plt.close(fig)
         logger.info(f"Salvato {out_path}")

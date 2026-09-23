@@ -26,8 +26,12 @@ from timegnn.models.gat_basic import DualGATModel
 from timegnn.models.gat_time_decay import DualGATTimeAwareModel
 from timegnn.data.pyg import custom_collate_graph
 from timegnn.train.early_stopping import EarlyStopping
+import chess
+import chess.engine
+
 from Common.EvaluatorPlotter import EvaluatorPlotter
 from Common.sparse_legal_moves import sparse_legal_argmax
+from DatasetPipeline.Model.PositionGraphSchema import decode_move
 
 from TrainPipeline.Steps.TuningStep import run_tuning_step, build_warmup_cosine_lambda, recommend_norm_kind
 
@@ -152,6 +156,9 @@ def validate_config(cfg: Dict[str, Any]) -> None:
 
 
 def run_step(state: PipelineState, step_name: str, is_ready_fn, do_fn) -> None:
+    if state.is_done(step_name) and is_ready_fn():
+        logger.info(f"[SKIP] Step '{step_name}' già completato.")
+        return
     if state.is_done(step_name) and not is_ready_fn():
         logger.warning(f"[REDO] Step '{step_name}' marcato ma output mancante.")
     logger.info(f"[RUN] Avvio step '{step_name}'...")
@@ -573,6 +580,54 @@ def evaluate_models(cfg: Dict[str, Any], device: str, use_amp: bool) -> None:
 
     skip_time_aware = bool(eval_cfg.get("skip_time_aware", False))
 
+    # Motore Stockfish condiviso per verificare se la mossa prevista (anche se
+    # diversa da quella etichettata) mantiene comunque la posizione su una
+    # traiettoria di matto forzato in mate_n - 1 semimosse. Prima di questo
+    # fix, mate_pred/mate_correct erano sempre azzerati (placeholder mai
+    # completato): la move accuracy resta il criterio "stretto" (match
+    # esatto), mate_correct e' il criterio "largo" (qualsiasi mossa che
+    # preserva il matto, non solo quella canonica trovata da Stockfish in
+    # fase di costruzione dataset).
+    stockfish_path = eval_cfg.get("stockfish_path", "stockfish")
+    mate_engine: Optional["chess.engine.SimpleEngine"] = None
+    mate_check_enabled = eval_cfg.get("mate_check_enabled", True)
+    if mate_check_enabled:
+        try:
+            mate_engine = chess.engine.SimpleEngine.popen_uci(stockfish_path)
+        except Exception as e:
+            logger.warning(
+                f"[eval] Impossibile avviare Stockfish ({stockfish_path}): {e}. "
+                f"mate_correct restera' a False ovunque (nessuna verifica possibile)."
+            )
+            mate_engine = None
+    mate_check_limit = chess.engine.Limit(depth=12, time=0.2) if mate_engine else None
+
+    def _verify_mate_preserved(fen: str, pred_move_idx: int, mate_n: int) -> Optional[int]:
+        """Ritorna la profondita' di matto osservata dopo la mossa prevista
+        (se la posizione risultante e' ancora un matto forzato), oppure 0 se
+        il matto e' andato perso, oppure None se la mossa era illegale o la
+        verifica non e' disponibile."""
+        if mate_engine is None:
+            return None
+        try:
+            board = chess.Board(fen)
+            from_sq, to_sq, promo = decode_move(int(pred_move_idx))
+            move = chess.Move(from_sq, to_sq, promotion=promo)
+            if move not in board.legal_moves:
+                return None
+            board.push(move)
+            info = mate_engine.analyse(board, mate_check_limit)
+            score = info.get("score")
+            if score is None:
+                return 0
+            rel = score.relative
+            if rel.is_mate():
+                observed_n = -rel.mate() + 1  # +1 per includere la mossa appena giocata
+                return observed_n
+            return 0
+        except Exception:
+            return None
+
     def evaluate_model(model, loader, name: str):
         logger.info(f"Valutazione del modello {name}...")
         move_correct_list = []
@@ -599,9 +654,34 @@ def evaluate_models(cfg: Dict[str, Any], device: str, use_amp: bool) -> None:
                 if hasattr(batch_event, "position_mate_n") and batch_event.position_mate_n is not None:
                     mate_n = batch_event.position_mate_n.cpu().numpy()
                     mate_true_list.extend(mate_n)
-                    mate_pred_list.extend(np.zeros_like(mate_n))
-                    mate_correct_list.extend(np.zeros_like(mate_n, dtype=bool))
                     mate_n_list.extend(mate_n)
+
+                    fens = getattr(batch_event, "fen", None)
+                    pred_np = pred.cpu().numpy()
+                    correct_np = correct_move
+
+                    for i in range(len(mate_n)):
+                        n_true = int(mate_n[i])
+                        if bool(correct_np[i]):
+                            # Match esatto con la mossa etichettata: e' per
+                            # costruzione un matto valido in n_true, nessun
+                            # bisogno di richiamare Stockfish.
+                            mate_pred_list.append(n_true)
+                            mate_correct_list.append(True)
+                            continue
+
+                        if fens is None or i >= len(fens) or fens[i] is None:
+                            mate_pred_list.append(0)
+                            mate_correct_list.append(False)
+                            continue
+
+                        observed = _verify_mate_preserved(fens[i], int(pred_np[i]), n_true)
+                        if observed is None:
+                            mate_pred_list.append(0)
+                            mate_correct_list.append(False)
+                        else:
+                            mate_pred_list.append(observed)
+                            mate_correct_list.append(observed == n_true)
 
                 if batch_idx % 10 == 0:
                     logger.debug(f"  batch {batch_idx+1}/{len(loader)} processato")
@@ -679,6 +759,11 @@ def evaluate_models(cfg: Dict[str, Any], device: str, use_amp: bool) -> None:
             f"Valutazione completata. Output salvati in {eval_cfg['plots_dir']} e {eval_cfg['out_dir']}"
         )
     finally:
+        if mate_engine is not None:
+            try:
+                mate_engine.quit()
+            except Exception:
+                pass
         del test_loader, test_ds
         del model_basic, model_time
         free_memory(verbose=True, force_gc=True)
