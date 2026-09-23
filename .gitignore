@@ -177,3 +177,4 @@ Dataset/
 Temp/
 timegnn/
 Models/*.pt
+Result/*

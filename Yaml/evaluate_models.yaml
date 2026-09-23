@@ -2,8 +2,8 @@ evaluation:
   test_dir: "Dataset/ExternalHoldout/holdout_clean"      # cartella shardata, non più un file .pt
   checkpoint_basic: "Dataset/Train/checkpoints/basic_best.pt"
   checkpoint_time: "Dataset/Train/checkpoints/time_aware_best.pt"
-  plots_dir: "Dataset/Test/plots"
-  metrics_dir: "Dataset/Test/metrics"
+  plots_dir: "Result/Heldout/plots"
+  metrics_dir: "Result/Heldout/metrics"
   max_n: 5
   batch_size: 128
   num_workers: 2

@@ -152,9 +152,6 @@ def validate_config(cfg: Dict[str, Any]) -> None:
 
 
 def run_step(state: PipelineState, step_name: str, is_ready_fn, do_fn) -> None:
-    if state.is_done(step_name) and is_ready_fn():
-        logger.info(f"[SKIP] Step '{step_name}' già completato.")
-        return
     if state.is_done(step_name) and not is_ready_fn():
         logger.warning(f"[REDO] Step '{step_name}' marcato ma output mancante.")
     logger.info(f"[RUN] Avvio step '{step_name}'...")

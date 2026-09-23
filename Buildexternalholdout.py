@@ -1,19 +1,25 @@
 from __future__ import annotations
 
+import atexit
 import io
 import json
 import logging
 import os
 import random
+import re
+import signal
 import sys
+import threading
+import time
+import multiprocessing as mp
 from collections import defaultdict
-from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Tuple
+from dataclasses import dataclass, field
+from typing import Any, Dict, Generator, List, Optional, Tuple
 
 import chess
+import chess.engine
 import chess.pgn
 import pandas as pd
-from tqdm import tqdm
 
 from DatasetPipeline.Model.ChessConstants import PIECE_VALUES
 from DatasetPipeline.Model.PositionGraphSchema import build_position_data
@@ -22,61 +28,157 @@ from DatasetPipeline.TimeStatBuilder import load_avg_time_by_rating
 from DatasetPipeline.Utils.compatibility_filters import (
     QualityFilterConfig,
     has_mating_material,
+    has_valid_ratings,
     is_trivially_drawn_endgame,
+    is_window_hard_valid,
     mover_has_heavy_piece,
     parse_rating_strict,
     validate_kings,
-    window_is_forced_single_move_throughout,
+)
+from DatasetPipeline.Utils.ipc_safe_data import (
+    decode_from_ipc,
+    encode_for_ipc,
+    harden_process_for_ipc,
 )
 from DatasetPipeline.Utils.time_edge_weighting import apply_edge_type_time_weighting
 from TrainPipeline.CleanDataset import clean_sharded_directory
 
 logger = logging.getLogger("build_external_holdout")
 
+_CLK_RE = re.compile(r"\[\s*%clk\s+(\d+):(\d+):(\d+(?:\.\d+)?)\s*\]")
+
+# ----------------------------------------------------------------------
+# Stato globale per-worker (stesso pattern di GamesBuilder: un engine per
+# processo, avviato dall'initializer del Pool, con watchdog dedicato per
+# uccidere Stockfish se una singola analisi si impianta).
+# ----------------------------------------------------------------------
+_engine: Optional[chess.engine.SimpleEngine] = None
+_engine_pid: Optional[int] = None
+
+_watchdog_lock = threading.Lock()
+_watchdog_deadline: Optional[float] = None
+_watchdog_stop = threading.Event()
+_watchdog_thread: Optional[threading.Thread] = None
+_WATCHDOG_POLL_SECONDS = 1.0
+_WATCHDOG_MARGIN_SECONDS = 3.0
+
+
+def _watchdog_arm(time_limit: float, margin: Optional[float] = None) -> None:
+    global _watchdog_deadline
+    eff_margin = _WATCHDOG_MARGIN_SECONDS if margin is None else margin
+    with _watchdog_lock:
+        _watchdog_deadline = time.monotonic() + time_limit + eff_margin
+
+
+def _watchdog_disarm() -> None:
+    global _watchdog_deadline
+    with _watchdog_lock:
+        _watchdog_deadline = None
+
+
+def _watchdog_loop() -> None:
+    global _engine, _engine_pid, _watchdog_deadline
+    while not _watchdog_stop.is_set():
+        with _watchdog_lock:
+            deadline = _watchdog_deadline
+        if deadline is not None and time.monotonic() > deadline:
+            pid = _engine_pid
+            if pid is not None:
+                try:
+                    import psutil
+                    psutil.Process(pid).kill()
+                except Exception:
+                    try:
+                        os.kill(pid, 9)
+                    except Exception:
+                        pass
+            _engine = None
+            _engine_pid = None
+            with _watchdog_lock:
+                _watchdog_deadline = None
+        _watchdog_stop.wait(_WATCHDOG_POLL_SECONDS)
+
+
+def _close_engine() -> None:
+    global _engine, _engine_pid
+    _watchdog_stop.set()
+    if _engine is not None:
+        try:
+            _engine.quit()
+        except Exception:
+            pass
+        finally:
+            _engine = None
+            _engine_pid = None
+
+
+def _worker_sigterm_handler(signum, frame) -> None:
+    _watchdog_stop.set()
+    pid = _engine_pid
+    if pid is not None:
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except Exception:
+            pass
+    os._exit(0)
+
 
 @dataclass
 class ExternalHoldoutConfig:
-    # Accetta sia un CSV in stile Kaggle Chess.com (colonna 'pgn' per riga)
-    # sia un file .pgn testuale con partite concatenate (es. FICS/Lichess
-    # non compresso). Il formato viene rilevato dal CONTENUTO del file
-    # (non dall'estensione), vedi ChesscomHoldoutBuilder._detect_input_format.
     csv_path: str = "RawData/ficsgamesdb_201001_standard_movetimes_4340144.pgn"
-    source_tag: str = "chesscom_holdout"
+    source_tag: str = "heldout_00_fcis"
 
-    # Rilevamento formato: "auto" (default) ispeziona il file; "csv" o
-    # "pgn" forzano esplicitamente un parser, saltando il rilevamento
-    # (utile se un file .csv contenesse per errore testo PGN o viceversa).
     input_format: str = "auto"
 
     chunksize: int = 5_000
-    max_games: Optional[int] = 20_000
+    max_games: Optional[int] = 100_000
 
     allowed_rules: Tuple[str, ...] = ("chess",)
     require_rated: bool = False
 
+    only_decisive_games: bool = True
+    skip_time_forfeit: bool = True
+    min_game_plies: int = 20
+
     stockfish_path: str = "/usr/games/stockfish"
     threads: int = 1
-    hash_mb: int = 128
+    hash_mb: int = 32
     search_depth: int = 12
     analysis_time: Optional[float] = 0.2
-    mate_range: Tuple[int, int] = (1, 10)
+    mate_range: Tuple[int, int] = (1, 3)
 
-    min_game_plies: int = 8
+    stockfish_retry_attempts: int = 2
+    stockfish_retry_backoff_seconds: float = 0.5
 
     skip_forced_single_move_window: bool = True
     require_heavy_piece: bool = False
     skip_trivial_endgame: bool = True
-    min_material_for_mate_attempt: int = 2
-    min_material_diff_for_mate_attempt: int = 2
+    # ALLINEATO: dataset_main.yaml -> games_pipeline.min_material_for_mate_attempt = 3
+    min_material_for_mate_attempt: int = 3
+    min_material_diff_for_mate_attempt: int = 3
     max_piece_count: Optional[int] = None
     candidate_min_legal_moves: int = 1
     candidate_max_legal_moves: Optional[int] = None
     skip_if_in_check: bool = False
 
     min_ply: int = 6
-    ply_sample_step: int = 8
-    max_positions_per_game: Optional[int] = 10
+    # ALLINEATO: dataset_main.yaml -> games_pipeline.ply_sample_step = 12
+    # (era 8: l'holdout campionava piu' densamente del main, cambiando la
+    # distribuzione delle posizioni per partita rispetto al training).
+    ply_sample_step: int = 12
+    # ALLINEATO: dataset_main.yaml -> games_pipeline.max_positions_per_game = 20
+    max_positions_per_game: Optional[int] = 20
     dedupe_positions: bool = True
+
+    # NUOVO: dataset_main.yaml non imposta esplicitamente min_rating in
+    # games_pipeline, quindi usa il default 1200 di GamesBuilderConfig.
+    # L'holdout prima non aveva alcuna soglia minima di rating (solo
+    # has_valid_ratings, che verifica presenza/validita', non la soglia):
+    # partite con rating < 1200 potevano quindi entrare nell'holdout ma
+    # mai nel train/val, causando distribution shift. Applicato come
+    # filtro soft in _headers_are_eligible.
+    min_rating: Optional[int] = 1200
+    max_rating: Optional[int] = None
 
     time_stats_json: Optional[str] = "Dataset/avg_time_by_rating.json"
     default_move_seconds: float = 15.0
@@ -87,7 +189,15 @@ class ExternalHoldoutConfig:
     save_debug_jsonl: bool = True
 
     state_file: str = "external_holdout_state.json"
+    resume_state_file: str = "external_holdout_resume.json"
     force_recompute: bool = False
+
+    # --- Multiprocessing (allineato a GamesBuilderConfig) ---
+    workers: Optional[int] = None
+    pool_join_timeout: Optional[float] = 20.0
+    auto_resume: bool = True
+    resume_checkpoint_every: int = 500
+    skip_games: int = 0
 
     log_level: str = "INFO"
     log_file: Optional[str] = "Dataset/ExternalHoldout/build_external_holdout.log"
@@ -213,9 +323,25 @@ class ChesscomHoldoutBuilder:
             skip_if_in_check=config.skip_if_in_check,
         )
 
-        self._engine = None
         self._input_format = self._detect_input_format()
         logger.info(f"[holdout] Formato input rilevato: '{self._input_format}' (da '{self.config.csv_path}').")
+
+        # --- Resume state (stesso schema di GamesBuilder: contatore di
+        # partite gia' processate con successo per questa sorgente,
+        # persistito su disco e sommato a skip_games ad ogni riavvio). ---
+        self._resume_state_path = os.path.join(config.output_dir, config.resume_state_file)
+        self._resume_key = f"{self._input_format}:{config.csv_path}"
+        self._resume_confirmed = 0
+        self._effective_skip_games = config.skip_games
+        if config.auto_resume:
+            saved = self._load_resume_state()
+            already_done = saved.get(self._resume_key, 0)
+            if already_done:
+                self._effective_skip_games += already_done
+                logger.info(
+                    f"[holdout] Resume attivo per '{self._resume_key}': skip_games portato a "
+                    f"{self._effective_skip_games} ({already_done} gia' processate in run precedenti)."
+                )
 
     def _validate_config(self) -> None:
         cfg = self.config
@@ -227,6 +353,8 @@ class ChesscomHoldoutBuilder:
             raise ConfigError(
                 f"input_format non valido: '{cfg.input_format}'. Attesi: 'auto', 'csv', 'pgn'."
             )
+        if cfg.min_rating is not None and cfg.max_rating is not None and cfg.min_rating > cfg.max_rating:
+            raise ConfigError("min_rating non puo' essere maggiore di max_rating.")
         require_executable(cfg.stockfish_path)
 
     def _detect_input_format(self) -> str:
@@ -236,10 +364,7 @@ class ChesscomHoldoutBuilder:
 
         Se config.input_format e' 'csv' o 'pgn', quella scelta e'
         rispettata senza ispezionare il file. Con 'auto' (default), il
-        rilevamento guarda il CONTENUTO, non l'estensione: un file .pgn
-        rinominato .csv (o viceversa) viene comunque riconosciuto
-        correttamente, a differenza di un dispatch basato solo su
-        os.path.splitext.
+        rilevamento guarda il CONTENUTO, non l'estensione.
         """
         cfg = self.config
         if cfg.input_format in ("csv", "pgn"):
@@ -256,124 +381,144 @@ class ChesscomHoldoutBuilder:
                         continue
                     if stripped.startswith("[Event "):
                         return "pgn"
-                    # Prima riga non vuota, non PGN: trattala come header
-                    # CSV e ferma l'ispezione (una riga basta per un header).
                     break
         except OSError as e:
             raise ConfigError(f"Impossibile leggere '{cfg.csv_path}' per rilevare il formato: {e}")
 
         return "csv"
 
-    def _start_engine(self) -> None:
-        import chess.engine
-        self._engine = chess.engine.SimpleEngine.popen_uci(self.config.stockfish_path)
-        self._engine.configure({"Threads": self.config.threads, "Hash": self.config.hash_mb})
+    # ------------------------------------------------------------------
+    # Resume state (persistenza su disco, stesso pattern di GamesBuilder)
+    # ------------------------------------------------------------------
+    def _load_resume_state(self) -> Dict[str, int]:
+        if not os.path.exists(self._resume_state_path):
+            return {}
+        try:
+            with open(self._resume_state_path, "r", encoding="utf-8") as f:
+                raw = json.load(f)
+            return {str(k): int(v) for k, v in raw.items()}
+        except (json.JSONDecodeError, OSError, ValueError, TypeError) as e:
+            logger.warning(
+                f"[holdout] Stato di resume in {self._resume_state_path} illeggibile ({e}), "
+                f"riparto senza resume."
+            )
+            return {}
 
-    def _stop_engine(self) -> None:
-        if self._engine is not None:
+    def _persist_resume_state(self) -> None:
+        try:
+            merged = self._load_resume_state()
+            merged[self._resume_key] = self.config.skip_games + self._resume_confirmed
+            os.makedirs(os.path.dirname(os.path.abspath(self._resume_state_path)) or ".", exist_ok=True)
+            tmp_path = self._resume_state_path + ".tmp"
+            with open(tmp_path, "w", encoding="utf-8") as f:
+                json.dump(merged, f, indent=2, ensure_ascii=False)
+            os.replace(tmp_path, self._resume_state_path)
+        except Exception as e:
+            logger.warning(f"[holdout] Impossibile salvare lo stato di resume: {e}")
+
+    # ------------------------------------------------------------------
+    # Worker init/teardown (un processo Stockfish per worker, con watchdog)
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _init_worker(stockfish_path: str, threads: int, hash_mb: int) -> None:
+        global _engine, _engine_pid, _watchdog_thread
+
+        harden_process_for_ipc()
+        signal.signal(signal.SIGINT, signal.SIG_IGN)
+        signal.signal(signal.SIGTERM, _worker_sigterm_handler)
+
+        try:
+            os.setpgrp()
+        except AttributeError:
+            pass
+
+        try:
+            _engine = chess.engine.SimpleEngine.popen_uci(stockfish_path)
+            _engine.configure({"Threads": threads, "Hash": hash_mb})
             try:
-                self._engine.quit()
+                _engine_pid = _engine.transport.get_pid()
             except Exception:
-                pass
-            self._engine = None
+                _engine_pid = None
+        except Exception as e:
+            _engine = None
+            _engine_pid = None
+            raise RuntimeError(f"Impossibile avviare Stockfish: {e}")
 
-    def _analyse(self, board: "chess.Board"):
-        import chess.engine
-        if self._engine is None:
+        atexit.register(_close_engine)
+
+        _watchdog_stop.clear()
+        _watchdog_thread = threading.Thread(target=_watchdog_loop, daemon=True)
+        _watchdog_thread.start()
+
+    # ------------------------------------------------------------------
+    # Parsing header / clock (stesso comportamento di GamesBuilder)
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _parse_clk(comment: str) -> Optional[float]:
+        if not comment:
+            return None
+        m = _CLK_RE.search(comment)
+        if not m:
+            return None
+        h, mi, s = m.groups()
+        return int(h) * 3600 + int(mi) * 60 + float(s)
+
+    @staticmethod
+    def _parse_rating(raw: str) -> Optional[int]:
+        if not raw:
             return None
         try:
-            if self.config.analysis_time is not None:
-                limit = chess.engine.Limit(time=self.config.analysis_time, mate=self.config.mate_range[1])
-            else:
-                limit = chess.engine.Limit(depth=self.config.search_depth, mate=self.config.mate_range[1])
-            return self._engine.analyse(board, limit)
-        except Exception:
-            return None
+            return int(raw)
+        except (TypeError, ValueError):
+            digits = "".join(ch for ch in raw if ch.isdigit())
+            return int(digits) if digits else None
 
-    def _iter_rows(self):
-        """Dispatcher unico: produce record in un formato uniforme
-        (un dict con almeno la chiave 'pgn'), indipendentemente dal fatto
-        che l'input sia un CSV Kaggle o un file .pgn testuale. Tutto il
-        codice a valle (_process_game) legge sempre row['pgn'],
-        row.get('white_rating'), row.get('black_rating'), row.get('time_class'):
-        non deve sapere da quale formato il record proviene.
-        """
-        if self._input_format == "pgn":
-            yield from self._iter_rows_from_pgn()
-        else:
-            yield from self._iter_rows_from_csv()
+    def _headers_are_eligible(self, headers, pgn_result: Optional[str] = None) -> bool:
+        """HARD/SOFT a livello di header, allineato a
+        GamesBuilder._headers_are_eligible: only_decisive_games,
+        skip_time_forfeit e ora anche min_rating/max_rating, applicati
+        PRIMA di qualunque replay/analisi.
 
-    def _iter_rows_from_csv(self):
-        reader = pd.read_csv(self.config.csv_path, chunksize=self.config.chunksize)
-        yielded = 0
-        for chunk in reader:
-            if "rules" in chunk.columns:
-                chunk = chunk[chunk["rules"].astype(str).str.lower().isin(self.config.allowed_rules)]
-            if self.config.require_rated and "rated" in chunk.columns:
-                chunk = chunk[chunk["rated"].astype(str).str.lower() == "true"]
-            for record in chunk.to_dict("records"):
-                yield record
-                yielded += 1
-                if self.config.max_games is not None and yielded >= self.config.max_games:
-                    return
-
-    def _iter_rows_from_pgn(self):
-        """Legge un file .pgn testuale con partite concatenate, spezzando
-        sul marcatore '[Event ' che apre ogni nuova partita (stessa logica
-        di GamesBuilder._iter_pgn_texts). Ogni partita diventa un record
-        con chiave 'pgn' contenente il testo PGN completo (header + mosse),
-        cosi' _process_game puo' trattarlo esattamente come farebbe con
-        row['pgn'] proveniente da un CSV.
-
-        require_rated e allowed_rules (pensati per le colonne 'rated' e
-        'rules' del CSV Kaggle) non hanno un equivalente diretto negli
-        header PGN standard: vengono ignorati qui, loggando un avviso una
-        sola volta se richiesti esplicitamente, invece di fallire
-        silenziosamente o filtrare in modo scorretto.
+        ALLINEATO: il filtro di rating (min_rating/max_rating) mancava
+        completamente in precedenza; GamesBuilder._headers_are_eligible
+        lo applica sul MASSIMO tra i due rating (best_rating), qui viene
+        replicata la stessa logica per coerenza tra le due pipeline.
         """
         cfg = self.config
-        if cfg.require_rated:
-            logger.warning(
-                "[holdout] require_rated=True non e' applicabile a input .pgn "
-                "(nessuna colonna 'rated' negli header PGN): ignorato."
-            )
-        if cfg.allowed_rules and cfg.allowed_rules != ("chess",):
-            logger.warning(
-                f"[holdout] allowed_rules={cfg.allowed_rules} non e' applicabile a input .pgn: ignorato."
-            )
 
-        yielded = 0
-        current_game_lines: List[str] = []
+        if cfg.only_decisive_games:
+            result = (headers.get("Result", "") if headers is not None else pgn_result) or ""
+            if result not in ("1-0", "0-1"):
+                return False
 
-        def _flush_current():
-            if not current_game_lines:
-                return None
-            return {"pgn": "".join(current_game_lines)}
+        if cfg.skip_time_forfeit and headers is not None:
+            termination = headers.get("Termination", "") or ""
+            if "Time forfeit" in termination:
+                return False
 
-        with open(cfg.csv_path, "r", encoding="utf-8", errors="replace") as f:
-            for line in f:
-                if line.startswith("[Event ") and current_game_lines:
-                    record = _flush_current()
-                    if record is not None:
-                        yield record
-                        yielded += 1
-                        if cfg.max_games is not None and yielded >= cfg.max_games:
-                            return
-                    current_game_lines = [line]
-                else:
-                    current_game_lines.append(line)
+        if headers is not None and (cfg.min_rating is not None or cfg.max_rating is not None):
+            white_elo = self._parse_rating(headers.get("WhiteElo", ""))
+            black_elo = self._parse_rating(headers.get("BlackElo", ""))
+            ratings = [r for r in (white_elo, black_elo) if r is not None]
+            if ratings:
+                best_rating = max(ratings)
+                worst_rating = min(ratings)
+                if cfg.min_rating is not None and best_rating < cfg.min_rating:
+                    return False
+                if cfg.max_rating is not None and worst_rating > cfg.max_rating:
+                    return False
 
-            if current_game_lines and (cfg.max_games is None or yielded < cfg.max_games):
-                record = _flush_current()
-                if record is not None:
-                    yield record
+        return True
 
-    def _simulated_clock(self, rating: Optional[float], ply_idx: int) -> float:
+    # ------------------------------------------------------------------
+    # Filtri di posizione (soft, invariati rispetto alla versione precedente)
+    # ------------------------------------------------------------------
+    def _simulated_clock(self, rating: Optional[float], ply_idx: int, game_id: str) -> float:
         base = self.config.default_move_seconds
         if rating is not None and self._avg_time_by_rating:
             bucket = round(rating / 100) * 100
             base = self._avg_time_by_rating.get(bucket, base)
-        noise = random.Random(f"holdout:{ply_idx}").gauss(1.0, 0.15)
+        noise = random.Random(f"{game_id}:{ply_idx}").gauss(1.0, 0.15)
         return max(0.5, base * max(0.3, noise))
 
     def _position_passes_quality_filters(self, board: "chess.Board") -> bool:
@@ -401,14 +546,142 @@ class ChesscomHoldoutBuilder:
             return None
         return legal_moves
 
-    def _process_game(self, local_id: int, row: Dict[str, Any]) -> List[Any]:
+    def _analyse_position(self, board: "chess.Board"):
+        """Analisi con retry e watchdog, allineata a
+        GamesBuilder._analyse_position (stessi parametri di retry/backoff)."""
+        global _engine
+        cfg = self.config
+
+        for attempt in range(1, cfg.stockfish_retry_attempts + 1):
+            if _engine is None:
+                return None
+            try:
+                if cfg.analysis_time is not None:
+                    limit = chess.engine.Limit(time=cfg.analysis_time, mate=cfg.mate_range[1])
+                    _watchdog_arm(cfg.analysis_time)
+                else:
+                    limit = chess.engine.Limit(depth=cfg.search_depth, mate=cfg.mate_range[1])
+                    _watchdog_arm(5.0)
+                return _engine.analyse(board, limit)
+            except Exception:
+                if attempt >= cfg.stockfish_retry_attempts:
+                    return None
+                if cfg.stockfish_retry_backoff_seconds > 0:
+                    time.sleep(cfg.stockfish_retry_backoff_seconds * attempt)
+                continue
+            finally:
+                _watchdog_disarm()
+        return None
+
+    # ------------------------------------------------------------------
+    # Iterazione input (CSV Kaggle o .pgn concatenato), con skip_games
+    # ------------------------------------------------------------------
+    def _iter_rows(self, skip_games: int, max_games: Optional[int]):
+        if self._input_format == "pgn":
+            yield from self._iter_rows_from_pgn(skip_games, max_games)
+        else:
+            yield from self._iter_rows_from_csv(skip_games, max_games)
+
+    def _iter_rows_from_csv(self, skip_games: int, max_games: Optional[int]):
+        reader = pd.read_csv(self.config.csv_path, chunksize=self.config.chunksize)
+        local_id = 0
+        yielded = 0
+        for chunk in reader:
+            if "rules" in chunk.columns:
+                chunk = chunk[chunk["rules"].astype(str).str.lower().isin(self.config.allowed_rules)]
+            if self.config.require_rated and "rated" in chunk.columns:
+                chunk = chunk[chunk["rated"].astype(str).str.lower() == "true"]
+            for record in chunk.to_dict("records"):
+                local_id += 1
+                if local_id <= skip_games:
+                    continue
+                yield local_id, record
+                yielded += 1
+                if max_games is not None and yielded >= max_games:
+                    return
+
+    def _iter_rows_from_pgn(self, skip_games: int, max_games: Optional[int]):
+        """Stessa logica di split di GamesBuilder._iter_pgn_texts: spezza
+        sul marcatore '[Event ' che apre ogni nuova partita."""
+        cfg = self.config
+        if cfg.require_rated:
+            logger.warning(
+                "[holdout] require_rated=True non e' applicabile a input .pgn "
+                "(nessuna colonna 'rated' negli header PGN): ignorato."
+            )
+        if cfg.allowed_rules and cfg.allowed_rules != ("chess",):
+            logger.warning(
+                f"[holdout] allowed_rules={cfg.allowed_rules} non e' applicabile a input .pgn: ignorato."
+            )
+
+        local_id = 0
+        yielded = 0
+        current_game_lines: List[str] = []
+
+        def _flush_current():
+            if not current_game_lines:
+                return None
+            return {"pgn": "".join(current_game_lines)}
+
+        with open(cfg.csv_path, "r", encoding="utf-8", errors="replace") as f:
+            for line in f:
+                if line.startswith("[Event ") and current_game_lines:
+                    record = _flush_current()
+                    if record is not None:
+                        local_id += 1
+                        if local_id > skip_games:
+                            yield local_id, record
+                            yielded += 1
+                            if max_games is not None and yielded >= max_games:
+                                return
+                    current_game_lines = [line]
+                else:
+                    current_game_lines.append(line)
+
+            if current_game_lines:
+                record = _flush_current()
+                if record is not None:
+                    local_id += 1
+                    if local_id > skip_games and (max_games is None or yielded < max_games):
+                        yield local_id, record
+
+    def _count_tasks_estimate(self) -> Optional[int]:
+        return self.config.max_games
+
+    # ------------------------------------------------------------------
+    # Elaborazione di una singola partita (eseguita nel WORKER)
+    # ------------------------------------------------------------------
+    def _process_game(self, local_id: int, row: Dict[str, Any]) -> List[Dict[str, Any]]:
         cfg = self.config
         pgn_text = row.get("pgn")
         if not isinstance(pgn_text, str) or not pgn_text.strip():
             return []
 
         try:
-            game = chess.pgn.read_game(io.StringIO(pgn_text))
+            pgn_io = io.StringIO(pgn_text)
+            headers = chess.pgn.read_headers(pgn_io)
+        except Exception as e:
+            logger.warning(f"[holdout] game locale={local_id}: header PGN illeggibile ({e}), scartata.")
+            return []
+
+        if headers is None:
+            return []
+
+        # --- HARD: rating validi su entrambi i lati (allineato a
+        # compatibility_filters.has_valid_ratings, richiesto esplicitamente
+        # come requisito di progetto, non negoziabile). ---
+        if not has_valid_ratings(headers):
+            return []
+
+        # --- SOFT (default ON, allineato a GamesBuilder): only_decisive_games,
+        # skip_time_forfeit e ora min_rating/max_rating, controllati
+        # sull'header PRIMA del replay. ---
+        if not self._headers_are_eligible(headers):
+            return []
+
+        pgn_io.seek(0)
+        try:
+            game = chess.pgn.read_game(pgn_io)
         except Exception as e:
             logger.warning(f"[holdout] game locale={local_id}: PGN illeggibile ({e}), scartata.")
             return []
@@ -422,10 +695,6 @@ class ChesscomHoldoutBuilder:
         if game_end_ply < cfg.min_game_plies:
             return []
 
-        # row['white_rating']/row['black_rating'] esistono solo per record
-        # provenienti dal CSV Kaggle; per record da .pgn (dove il dict ha
-        # solo la chiave 'pgn', vedi _iter_rows_from_pgn) row.get(...)
-        # ritorna None e si cade direttamente sugli header PGN sotto.
         white_rating = parse_rating_strict(str(row.get("white_rating") or "")) or parse_rating_strict(
             game.headers.get("WhiteElo", "")
         )
@@ -435,7 +704,7 @@ class ChesscomHoldoutBuilder:
         mover_rating = {chess.WHITE: white_rating, chess.BLACK: black_rating}
 
         full_game_id = f"{cfg.source_tag}_{local_id}"
-        collected: List[Any] = []
+        collected: List[Dict[str, Any]] = []
         seen_positions: set = set()
         window_group_key: Optional[int] = None
 
@@ -469,6 +738,15 @@ class ChesscomHoldoutBuilder:
             if legal_moves is None:
                 node = next_node
                 continue
+
+            # --- SOFT: skip_forced_moves sulla SINGOLA posizione, stessa
+            # semantica di GamesBuilder.cfg.skip_forced_moves (non su
+            # finestra multi-ply: qui non esiste ancora una finestra
+            # finche' non si trova un matto valido). ---
+            if cfg.skip_forced_single_move_window and len(legal_moves) == 1:
+                node = next_node
+                continue
+
             if not self._position_passes_quality_filters(board):
                 node = next_node
                 continue
@@ -478,7 +756,7 @@ class ChesscomHoldoutBuilder:
                 node = next_node
                 continue
 
-            info = self._analyse(board)
+            info = self._analyse_position(board)
             if not info:
                 node = next_node
                 continue
@@ -493,11 +771,6 @@ class ChesscomHoldoutBuilder:
                 continue
 
             mate_n = relative_score.mate()
-            lo, hi = cfg.mate_range
-            if mate_n is None or not (mate_n > 0 and lo <= mate_n <= hi):
-                node = next_node
-                continue
-
             pv = info.get("pv")
             if not pv:
                 node = next_node
@@ -507,11 +780,24 @@ class ChesscomHoldoutBuilder:
                 node = next_node
                 continue
 
-            if cfg.skip_forced_single_move_window and window_is_forced_single_move_throughout([board]):
+            # --- HARD: la board successiva alla sequenza PV deve essere un
+            # matto REALE, con Re presenti, e mate_n nel range configurato
+            # (allineato a compatibility_filters.is_window_hard_valid). Il
+            # replay dell'intera PV verifica che il matto sia effettivamente
+            # raggiungibile dalla posizione corrente, non solo dichiarato
+            # dallo score dell'engine sulla singola mossa. ---
+            pv_board = board.copy(stack=False)
+            pv_valid = True
+            for pv_move in pv:
+                if pv_move not in pv_board.legal_moves:
+                    pv_valid = False
+                    break
+                pv_board.push(pv_move)
+            if not pv_valid or not is_window_hard_valid(pv_board, mate_n, cfg.mate_range):
                 node = next_node
                 continue
 
-            clock_seconds = self._simulated_clock(mover_rating_val, node.ply())
+            clock_seconds = self._simulated_clock(mover_rating_val, node.ply(), full_game_id)
 
             try:
                 data = build_position_data(
@@ -532,28 +818,60 @@ class ChesscomHoldoutBuilder:
             if window_group_key is None:
                 window_group_key = int(mate_n)
 
-            collected.append(data)
+            debug_entry = {
+                "problem_id": f"{full_game_id}_{node.ply()}",
+                "fen": board.fen(),
+                "best_move_uci": best_move.uci(),
+                "mate_n": int(mate_n),
+                "mate_n_window": window_group_key,
+                "ply": int(node.ply()),
+                "source": cfg.source_tag,
+                "clock_seconds": float(clock_seconds),
+                "clock_is_real": False,
+                "rating": mover_rating_val,
+                "game_id": full_game_id,
+                "time_class": row.get("time_class"),
+                "split": "holdout",
+            }
 
-            if cfg.save_debug_jsonl:
-                self._debug_records.append({
-                    "problem_id": f"{full_game_id}_{node.ply()}",
-                    "fen": board.fen(),
-                    "best_move_uci": best_move.uci(),
-                    "mate_n": int(mate_n),
-                    "mate_n_window": window_group_key,
-                    "ply": int(node.ply()),
-                    "source": cfg.source_tag,
-                    "clock_seconds": float(clock_seconds),
-                    "clock_is_real": False,
-                    "rating": mover_rating_val,
-                    "game_id": full_game_id,
-                    "time_class": row.get("time_class"),
-                    "split": "holdout",
-                })
-
+            collected.append({"data": data, "debug": debug_entry})
             node = next_node
 
         return collected
+
+    def _worker(self, args: Tuple[int, Dict[str, Any]]) -> Tuple[int, bytes]:
+        """Eseguito nel processo worker: costruisce le posizioni per una
+        partita e ritorna un payload serializzato IPC-safe (bytes via
+        torch.save), stesso schema di GamesBuilder._worker, cosi' nessun
+        tensore attraversa il Pool con la reduction custom di torch
+        (evita il crash 'received 0 items of ancdata')."""
+        local_id, row = args
+        empty_payload = encode_for_ipc([])
+
+        if _engine is None:
+            return local_id, empty_payload
+
+        try:
+            records = self._process_game(local_id, row)
+        except Exception as e:
+            logger.warning(
+                f"[holdout] Worker: eccezione durante l'analisi di game locale={local_id} "
+                f"({type(e).__name__}: {e}); partita scartata.",
+                exc_info=True,
+            )
+            records = []
+
+        try:
+            payload = encode_for_ipc(records)
+        except Exception as e:
+            logger.error(
+                f"[holdout] Worker: impossibile serializzare i risultati per game locale={local_id} "
+                f"({type(e).__name__}: {e}); partita scartata ({len(records)} posizioni perse).",
+                exc_info=True,
+            )
+            payload = empty_payload
+
+        return local_id, payload
 
     def _write_debug_jsonl(self) -> Optional[str]:
         if not self._debug_jsonl_path or not self._debug_records:
@@ -565,43 +883,172 @@ class ChesscomHoldoutBuilder:
         os.replace(tmp_path, self._debug_jsonl_path)
         return self._debug_jsonl_path
 
+    # ------------------------------------------------------------------
+    # Orchestrazione multiprocessing (allineata a GamesBuilder.run())
+    # ------------------------------------------------------------------
     def run(self) -> Dict[str, Any]:
         cfg = self.config
+        harden_process_for_ipc()
+
+        cpu_count = os.cpu_count() or 2
+        workers = cfg.workers or max(1, cpu_count - 1)
+
         processed_games = 0
         accepted_games = 0
         enqueued_positions = 0
         mate_n_counts: Dict[int, int] = defaultdict(int)
+        skipped_on_parent_error = 0
 
         writer = _ShardWriter(cfg.output_dir, "holdout_raw", cfg.output_shard_size)
 
-        self._start_engine()
+        pool = mp.Pool(
+            processes=workers,
+            initializer=self._init_worker,
+            initargs=(cfg.stockfish_path, cfg.threads, cfg.hash_mb),
+        )
+
+        estimate = self._count_tasks_estimate()
+        shutdown_in_progress = threading.Event()
+
+        def _panic_kill() -> None:
+            for proc in getattr(pool, "_pool", []):
+                try:
+                    os.kill(proc.pid, signal.SIGKILL)
+                except Exception:
+                    pass
+            os._exit(1)
+
+        def _sigint_handler(signum, frame) -> None:
+            if shutdown_in_progress.is_set():
+                _panic_kill()
+            shutdown_in_progress.set()
+            raise KeyboardInterrupt
+
+        previous_sigint = signal.signal(signal.SIGINT, _sigint_handler)
+
+        def _shutdown_pool(graceful_first: bool) -> None:
+            try:
+                if graceful_first:
+                    timeout = cfg.pool_join_timeout if cfg.pool_join_timeout is not None else 15.0
+                    deadline = time.monotonic() + timeout
+                    for proc in pool._pool:
+                        remaining = deadline - time.monotonic()
+                        if remaining <= 0:
+                            break
+                        proc.join(timeout=remaining)
+
+                pool.terminate()
+
+                kill_deadline = time.monotonic() + 5.0
+                for proc in pool._pool:
+                    remaining = kill_deadline - time.monotonic()
+                    proc.join(timeout=max(remaining, 0.1))
+
+                for proc in pool._pool:
+                    if proc.is_alive():
+                        logger.warning(
+                            f"[holdout] Worker pid={proc.pid} ancora vivo dopo terminate(): "
+                            f"invio SIGKILL diretto."
+                        )
+                        try:
+                            os.kill(proc.pid, signal.SIGKILL)
+                        except ProcessLookupError:
+                            pass
+                        except Exception as e:
+                            logger.warning(f"[holdout] SIGKILL su pid={proc.pid} fallito: {e}")
+
+                for proc in pool._pool:
+                    proc.join(timeout=2.0)
+            except Exception:
+                logger.exception(
+                    "[holdout] Errore imprevisto nello shutdown del pool: forzo SIGKILL su tutti i worker."
+                )
+                for proc in getattr(pool, "_pool", []):
+                    try:
+                        os.kill(proc.pid, signal.SIGKILL)
+                    except Exception:
+                        pass
+
         try:
-            rows = self._iter_rows()
-            for local_id, row in enumerate(
-                tqdm(rows, desc="[ExternalHoldout] Analisi partite Chess.com", unit="game"), start=1
+            task_stream = self._iter_rows(self._effective_skip_games, cfg.max_games)
+            results = pool.imap_unordered(self._worker, task_stream, chunksize=1)
+
+            from Common.progress import wrap_iter
+
+            for local_id, payload in wrap_iter(
+                results,
+                desc="[ExternalHoldout] Analisi partite Chess.com",
+                unit="game",
+                total=estimate,
             ):
                 processed_games += 1
-                try:
-                    positions = self._process_game(local_id, row)
-                except Exception:
-                    logger.exception(f"[holdout] game locale={local_id}: eccezione non gestita, partita scartata.")
-                    positions = []
+                self._resume_confirmed += 1
 
-                if positions:
+                if cfg.auto_resume and processed_games % cfg.resume_checkpoint_every == 0:
+                    self._persist_resume_state()
+
+                try:
+                    records: List[Dict[str, Any]] = decode_from_ipc(payload)
+                except Exception:
+                    skipped_on_parent_error += 1
+                    logger.error(
+                        f"[holdout] decode_from_ipc fallito per game locale={local_id} "
+                        f"(game processato #{processed_games}): payload scartato, run() continua.",
+                        exc_info=True,
+                    )
+                    continue
+
+                if not records:
+                    continue
+
+                try:
                     accepted_games += 1
-                    enqueued_positions += len(positions)
-                    for data in positions:
-                        writer.append(data)
+                    for rec in records:
+                        writer.append(rec["data"])
+                        enqueued_positions += 1
+                        mate_n_counts[rec["debug"]["mate_n"]] += 1
+                        if cfg.save_debug_jsonl:
+                            self._debug_records.append(rec["debug"])
+                except Exception:
+                    skipped_on_parent_error += 1
+                    logger.error(
+                        f"[holdout] Errore nella scrittura dei record per game locale={local_id} "
+                        f"(game processato #{processed_games}): partita scartata, run() continua.",
+                        exc_info=True,
+                    )
+                    continue
+
+        except KeyboardInterrupt:
+            print("\n[WARNING] Interruzione richiesta: arresto forzato dei worker in corso...")
+            _shutdown_pool(graceful_first=False)
+            self._persist_resume_state()
+            signal.signal(signal.SIGINT, previous_sigint)
+            raise
+        except Exception:
+            logger.exception(
+                "[holdout] Errore FATALE durante l'analisi: arresto forzato dei worker in corso."
+            )
+            _shutdown_pool(graceful_first=False)
+            self._persist_resume_state()
+            signal.signal(signal.SIGINT, previous_sigint)
+            raise
+        else:
+            pool.close()
+            _shutdown_pool(graceful_first=True)
         finally:
-            self._stop_engine()
+            self._persist_resume_state()
+            signal.signal(signal.SIGINT, previous_sigint)
 
         raw_files = writer.close()
 
-        for rec in self._debug_records:
-            mate_n_counts[rec["mate_n"]] += 1
-
         if cfg.save_debug_jsonl:
             self._write_debug_jsonl()
+
+        if skipped_on_parent_error:
+            logger.warning(
+                f"[holdout] {skipped_on_parent_error} game scartati per errori lato padre "
+                f"(decode/scrittura) durante questa run."
+            )
 
         raw_dir = writer.split_dir
         clean_dir = os.path.join(cfg.output_dir, "holdout_clean")
@@ -617,6 +1064,7 @@ class ChesscomHoldoutBuilder:
             "accepted_games": accepted_games,
             "enqueued_positions": enqueued_positions,
             "mate_n_counts": dict(mate_n_counts),
+            "skipped_games_on_parent_error": skipped_on_parent_error,
             "raw_dir": raw_dir,
             "raw_files": raw_files,
             "clean_dir": clean_dir,
@@ -629,10 +1077,6 @@ def _step_build_external_holdout(cfg: ExternalHoldoutConfig, state: PipelineStat
 
     def _is_ready() -> bool:
         return os.path.exists(clean_manifest_path) and os.path.getsize(clean_manifest_path) > 0
-
-    if state.is_done("external_holdout", skip=cfg.force_recompute) and _is_ready():
-        logger.info("[external_holdout] Gia' completato: skip.")
-        return state.get_meta("external_holdout")
 
     builder = ChesscomHoldoutBuilder(cfg)
     try:
@@ -684,7 +1128,10 @@ if __name__ == "__main__":
         logging.getLogger("build_external_holdout").error(f"Errore di configurazione: {e}")
         sys.exit(2)
     except KeyboardInterrupt:
-        logging.getLogger("build_external_holdout").warning("Interrotto dall'utente.")
+        logging.getLogger("build_external_holdout").warning(
+            "Interrotto dall'utente. Il resume (skip_games + resume file) permette di "
+            "riprendere da dove eri arrivato rilanciando lo stesso comando."
+        )
         sys.exit(130)
     except Exception as e:
         logging.getLogger("build_external_holdout").error(f"Interruzione imprevista: {e}")
