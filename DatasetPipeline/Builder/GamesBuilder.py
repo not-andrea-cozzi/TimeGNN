@@ -19,6 +19,7 @@ from typing import Any, Dict, Generator, List, Optional, Tuple
 import chess
 import chess.engine
 import chess.pgn
+import chess.syzygy
 import pandas as pd
 import zstandard as zstd
 
@@ -30,7 +31,6 @@ from DatasetPipeline.Utils.ipc_safe_data import (
     decode_from_ipc,
     harden_process_for_ipc,
 )
-
 from DatasetPipeline.Utils.time_edge_weighting import apply_edge_type_time_weighting
 
 logger = logging.getLogger(__name__)
@@ -49,16 +49,19 @@ _WATCHDOG_MARGIN_SECONDS = 3.0
 _CLK_RE = re.compile(r"\[\s*%clk\s+(\d+):(\d+):(\d+(?:\.\d+)?)\s*\]")
 _EMT_RE = re.compile(r"\[\s*%emt\s+(\d+):(\d+):(\d+(?:\.\d+)?)\s*\]")
 
+
 def _watchdog_arm(time_limit: float, margin: Optional[float] = None) -> None:
     global _watchdog_deadline
     eff_margin = _WATCHDOG_MARGIN_SECONDS if margin is None else margin
     with _watchdog_lock:
         _watchdog_deadline = time.monotonic() + time_limit + eff_margin
 
+
 def _watchdog_disarm() -> None:
     global _watchdog_deadline
     with _watchdog_lock:
         _watchdog_deadline = None
+
 
 def _watchdog_loop() -> None:
     global _engine, _engine_pid, _watchdog_deadline
@@ -82,6 +85,7 @@ def _watchdog_loop() -> None:
                 _watchdog_deadline = None
         _watchdog_stop.wait(_WATCHDOG_POLL_SECONDS)
 
+
 def _close_engine() -> None:
     global _engine, _engine_pid, _tablebase
     _watchdog_stop.set()
@@ -101,6 +105,7 @@ def _close_engine() -> None:
         finally:
             _tablebase = None
 
+
 def _worker_sigterm_handler(signum, frame) -> None:
     _watchdog_stop.set()
     pid = _engine_pid
@@ -116,6 +121,7 @@ def _worker_sigterm_handler(signum, frame) -> None:
             pass
     os._exit(0)
 
+
 @dataclass
 class SourceSpec:
     kind: str
@@ -130,6 +136,7 @@ class SourceSpec:
             raise ValueError(f"SourceSpec.kind non valido: {self.kind}")
         if self.tag is None:
             self.tag = self.kind
+
 
 class _ClosingStream:
     def __init__(self, text_stream, raw_file):
@@ -147,18 +154,19 @@ class _ClosingStream:
                 self._raw_file.close()
         return False
 
+
 @dataclass
 class GamesBuilderConfig:
     sources: List[SourceSpec]
     stockfish_path: str
     mate_range: Tuple[int, int] = (1, 5)
-    search_depth: int = 6
-    analysis_time: Optional[float] = None
+    search_depth: int = 16
+    analysis_time: Optional[float] = 0.5
 
     workers: Optional[int] = None
     threads: int = 1
     hash_mb: int = 128
-    multipv: int = 1
+    multipv: int = 2
     syzygy_path: Optional[str] = None
 
     stockfish_retry_attempts: int = 2
@@ -209,6 +217,7 @@ class GamesBuilderConfig:
     resume_state_path: Optional[str] = None
     resume_checkpoint_every: int = 2000
     flush_every_seconds: Optional[float] = None
+
 
 class GamesBuilder:
     _PIECE_VALUES: Dict[int, int] = {
@@ -267,13 +276,12 @@ class GamesBuilder:
 
     def __getstate__(self) -> dict:
         state = self.__dict__.copy()
-        if '_registry' in state:
-            del state['_registry']
+        if "_registry" in state:
+            del state["_registry"]
         return state
 
     def __setstate__(self, state: dict) -> None:
         self.__dict__.update(state)
-        from DatasetPipeline.PositionQueue import PositionQueueRegistry
         self._registry = PositionQueueRegistry.instance(
             state_path=self.config.queue_state_path,
             shard_size=self.config.shard_size,
@@ -285,11 +293,7 @@ class GamesBuilder:
             if src.tag in tags_seen:
                 raise ValueError(
                     f"Tag sorgente duplicato: '{src.tag}' usato sia da "
-                    f"'{tags_seen[src.tag].path}' che da '{src.path}'. Ogni "
-                    f"SourceSpec deve avere un tag univoco: il game_id finale "
-                    f"e' costruito come '{{tag}}_{{local_id}}', e local_id "
-                    f"riparte da 1 in OGNI sorgente — tag duplicati "
-                    f"produrrebbero game_id identici tra file diversi."
+                    f"'{tags_seen[src.tag].path}' che da '{src.path}'."
                 )
             tags_seen[src.tag] = src
 
@@ -332,44 +336,55 @@ class GamesBuilder:
 
     @staticmethod
     def _parse_clk(comment: str) -> Optional[float]:
-        if not comment: return None
+        if not comment:
+            return None
         m = _CLK_RE.search(comment)
-        if not m: return None
+        if not m:
+            return None
         h, mi, s = m.groups()
         return int(h) * 3600 + int(mi) * 60 + float(s)
 
     @staticmethod
     def _parse_emt(comment: str) -> Optional[float]:
-        if not comment: return None
+        if not comment:
+            return None
         m = _EMT_RE.search(comment)
-        if not m: return None
+        if not m:
+            return None
         h, mi, s = m.groups()
         return int(h) * 3600 + int(mi) * 60 + float(s)
 
     @staticmethod
     def _parse_time_control(time_control: str) -> Tuple[float, float]:
-        if not time_control or time_control == "-": return 0.0, 0.0
+        if not time_control or time_control == "-":
+            return 0.0, 0.0
         m = re.match(r"^(\d+)\+(\d+)$", time_control)
-        if m: return float(m.group(1)), float(m.group(2))
+        if m:
+            return float(m.group(1)), float(m.group(2))
         m = re.match(r"^(\d+)$", time_control)
-        if m: return float(m.group(1)), 0.0
+        if m:
+            return float(m.group(1)), 0.0
         return 0.0, 0.0
 
     @staticmethod
     def _compute_move_duration(previous_clock: Optional[float], current_clock: Optional[float], increment: float) -> Optional[float]:
-        if previous_clock is None or current_clock is None: return None
+        if previous_clock is None or current_clock is None:
+            return None
         return max(0.0, previous_clock - current_clock + increment)
 
     @staticmethod
     def _parse_rating(raw: str) -> Optional[int]:
-        if not raw: return None
-        try: return int(raw)
+        if not raw:
+            return None
+        try:
+            return int(raw)
         except (TypeError, ValueError):
             digits = "".join(ch for ch in raw if ch.isdigit())
             return int(digits) if digits else None
 
     def _closest_bucket_time(self, rating: Optional[int]) -> Optional[float]:
-        if rating is None or not self.config.avg_time_by_rating: return None
+        if rating is None or not self.config.avg_time_by_rating:
+            return None
         closest = min(self.config.avg_time_by_rating.keys(), key=lambda b: abs(b - rating))
         return self.config.avg_time_by_rating[closest]
 
@@ -391,28 +406,38 @@ class GamesBuilder:
             ratings = [r for r in (white_elo, black_elo) if r is not None]
             if ratings:
                 best_rating = max(ratings)
-                if cfg.min_rating is not None and best_rating < cfg.min_rating: return False
-                if cfg.max_rating is not None and min(ratings) > cfg.max_rating: return False
+                if cfg.min_rating is not None and best_rating < cfg.min_rating:
+                    return False
+                if cfg.max_rating is not None and min(ratings) > cfg.max_rating:
+                    return False
         return True
 
     def _get_candidate_legal_moves(self, board: "chess.Board") -> Optional[List["chess.Move"]]:
         cfg = self.config
-        if board.is_checkmate() or board.is_stalemate() or board.is_insufficient_material(): return None
-        if cfg.max_piece_count is not None and len(board.piece_map()) > cfg.max_piece_count: return None
+        if board.is_checkmate() or board.is_stalemate() or board.is_insufficient_material():
+            return None
+        if cfg.max_piece_count is not None and len(board.piece_map()) > cfg.max_piece_count:
+            return None
 
         legal_moves = list(board.legal_moves)
-        if len(legal_moves) < cfg.candidate_min_legal_moves: return None
-        if cfg.candidate_max_legal_moves is not None and len(legal_moves) > cfg.candidate_max_legal_moves: return None
-        if cfg.skip_if_in_check and board.is_check(): return None
-        if len(legal_moves) > 255: return None
+        if len(legal_moves) < cfg.candidate_min_legal_moves:
+            return None
+        if cfg.candidate_max_legal_moves is not None and len(legal_moves) > cfg.candidate_max_legal_moves:
+            return None
+        if cfg.skip_if_in_check and board.is_check():
+            return None
+        if len(legal_moves) > 255:
+            return None
         return legal_moves
 
     def _material_by_color(self, board: "chess.Board") -> Tuple[int, int]:
         white_mat = black_mat = 0
         for p in board.piece_map().values():
             val = self._PIECE_VALUES.get(p.piece_type, 0)
-            if p.color == chess.WHITE: white_mat += val
-            else: black_mat += val
+            if p.color == chess.WHITE:
+                white_mat += val
+            else:
+                black_mat += val
         return white_mat, black_mat
 
     def _has_mating_material(self, board: "chess.Board") -> bool:
@@ -422,74 +447,87 @@ class GamesBuilder:
         mover_mat = white_mat if mover == chess.WHITE else black_mat
         opp_mat = black_mat if mover == chess.WHITE else white_mat
 
-        if mover_mat < cfg.min_material_for_mate_attempt: return False
-        if (mover_mat - opp_mat) < cfg.min_material_diff_for_mate_attempt: return False
+        if mover_mat < cfg.min_material_for_mate_attempt:
+            return False
+        if (mover_mat - opp_mat) < cfg.min_material_diff_for_mate_attempt:
+            return False
         return True
 
     def _mover_has_heavy_piece(self, board: "chess.Board") -> bool:
         mover = board.turn
         for piece_type in (chess.QUEEN, chess.ROOK):
-            if board.pieces(piece_type, mover): return True
+            if board.pieces(piece_type, mover):
+                return True
         return False
 
     def _is_trivially_drawn_endgame(self, board: "chess.Board") -> bool:
         piece_map = board.piece_map()
         has_heavy_or_pawn = any(p.piece_type in (chess.QUEEN, chess.ROOK, chess.PAWN) for p in piece_map.values())
-        if has_heavy_or_pawn: return False
+        if has_heavy_or_pawn:
+            return False
         white_minors = sum(1 for p in piece_map.values() if p.color == chess.WHITE and p.piece_type in (chess.BISHOP, chess.KNIGHT))
         black_minors = sum(1 for p in piece_map.values() if p.color == chess.BLACK and p.piece_type in (chess.BISHOP, chess.KNIGHT))
         return white_minors <= 1 and black_minors <= 1
 
     def _syzygy_says_no_mate(self, board: "chess.Board") -> bool:
         global _tablebase
-        if _tablebase is None: return False
-        if board.has_castling_rights(chess.WHITE) or board.has_castling_rights(chess.BLACK): return False
-        try: wdl = _tablebase.probe_wdl(board)
-        except Exception: return False
+        if _tablebase is None:
+            return False
+        if board.has_castling_rights(chess.WHITE) or board.has_castling_rights(chess.BLACK):
+            return False
+        try:
+            wdl = _tablebase.probe_wdl(board)
+        except Exception:
+            return False
         return wdl is not None and wdl <= 0
 
     def _analyse_position(self, board: "chess.Board"):
         global _engine
         cfg = self.config
+        multipv = max(2, cfg.multipv)
 
         for attempt in range(1, cfg.stockfish_retry_attempts + 1):
-            if _engine is None: return None
+            if _engine is None:
+                return None
             try:
                 if cfg.analysis_time is not None:
-                    limit = chess.engine.Limit(time=cfg.analysis_time, mate=cfg.mate_range[1])
+                    limit = chess.engine.Limit(time=cfg.analysis_time)
                     _watchdog_arm(cfg.analysis_time)
                 else:
-                    limit = chess.engine.Limit(depth=cfg.search_depth, mate=cfg.mate_range[1])
-                    _watchdog_arm(5.0)
-                return _engine.analyse(board, limit, multipv=cfg.multipv)
+                    limit = chess.engine.Limit(depth=cfg.search_depth)
+                    _watchdog_arm(10.0)
+                return _engine.analyse(board, limit, multipv=multipv)
             except Exception:
-                if attempt >= cfg.stockfish_retry_attempts: return None
-                if cfg.stockfish_retry_backoff_seconds > 0: time.sleep(cfg.stockfish_retry_backoff_seconds * attempt)
+                if attempt >= cfg.stockfish_retry_attempts:
+                    return None
+                if cfg.stockfish_retry_backoff_seconds > 0:
+                    time.sleep(cfg.stockfish_retry_backoff_seconds * attempt)
                 continue
             finally:
                 _watchdog_disarm()
         return None
 
+    @staticmethod
+    def _second_line_ties_mate(info, mate_n: int) -> bool:
+        if len(info) < 2:
+            return False
+        second_score = info[1].get("score")
+        if second_score is None:
+            return False
+        second_rel = second_score.relative
+        if not second_rel.is_mate():
+            return False
+        second_mate = second_rel.mate()
+        return second_mate is not None and 0 < second_mate <= mate_n
+
     def _worker(self, args: Tuple[int, str, str, str]) -> Tuple[int, str, bytes]:
-        """
-        FIX: l'intero corpo era gia' avvolto in un unico try/except Exception
-        che ritornava silenziosamente `records` parziali in caso di errore
-        a meta' partita — quello resta. La modifica qui e' aggiungere un
-        secondo livello di try/except attorno all'INIZIO della funzione
-        (parsing header/game), perche' un game_id o pgn_text corrotto in
-        ingresso poteva propagare un'eccezione NON catturata fuori dal
-        try esistente (che iniziava dopo il parsing), facendo fallire
-        imap_unordered lato padre con un'eccezione non gestita — questo e'
-        il candidato piu' probabile per il crash silenzioso osservato in
-        run(), dato che il padre logga solo "Errore durante l'analisi"
-        senza mai vedere il traceback originale del worker.
-        """
         global _engine
         cfg = self.config
         game_id, pgn_text, source_tag, resume_key = args
 
         empty_payload = encode_for_ipc([])
-        if _engine is None: return game_id, resume_key, empty_payload
+        if _engine is None:
+            return game_id, resume_key, empty_payload
 
         try:
             pgn_io = io.StringIO(pgn_text)
@@ -513,12 +551,15 @@ class GamesBuilder:
         except Exception:
             return game_id, resume_key, empty_payload
 
-        if game is None: return game_id, resume_key, empty_payload
+        if game is None:
+            return game_id, resume_key, empty_payload
 
         try:
             game_end_ply = game.end().ply()
-            if game_end_ply < cfg.min_game_plies: return game_id, resume_key, empty_payload
-        except Exception: return game_id, resume_key, empty_payload
+            if game_end_ply < cfg.min_game_plies:
+                return game_id, resume_key, empty_payload
+        except Exception:
+            return game_id, resume_key, empty_payload
 
         time_control = game.headers.get("TimeControl", "")
         base_time, increment = self._parse_time_control(time_control)
@@ -549,7 +590,8 @@ class GamesBuilder:
                 if cfg.dedupe_positions:
                     position_key = " ".join(board.fen().split(" ")[:4])
                     if position_key in seen_positions:
-                        node = next_node; continue
+                        node = next_node
+                        continue
                     seen_positions.add(position_key)
 
                 emt_seconds = self._parse_emt(comment)
@@ -564,7 +606,8 @@ class GamesBuilder:
                     duration_is_real = move_duration is not None
                     clock_source = "real_clk" if duration_is_real else None
 
-                if current_clock is not None: previous_clock[mover_color] = current_clock
+                if current_clock is not None:
+                    previous_clock[mover_color] = current_clock
 
                 is_in_dense_tail = (
                     cfg.dense_tail_plies > 0
@@ -573,55 +616,93 @@ class GamesBuilder:
                 effective_step = cfg.ply_sample_step_tail if is_in_dense_tail else cfg.ply_sample_step
 
                 if node.ply() < cfg.min_ply:
-                    node = next_node; continue
+                    node = next_node
+                    continue
                 if (node.ply() - cfg.min_ply) % effective_step != 0:
-                    node = next_node; continue
+                    node = next_node
+                    continue
                 if cfg.require_clock and not duration_is_real:
-                    node = next_node; continue
+                    node = next_node
+                    continue
                 if cfg.max_positions_per_game is not None and positions_analysed >= cfg.max_positions_per_game:
                     break
 
                 legal_moves = self._get_candidate_legal_moves(board)
-                if legal_moves is None: node = next_node; continue
-                if cfg.skip_forced_moves and len(legal_moves) == 1: node = next_node; continue
-                if cfg.require_heavy_piece and not self._mover_has_heavy_piece(board): node = next_node; continue
-                if not self._has_mating_material(board): node = next_node; continue
-                if cfg.skip_trivial_endgame and self._is_trivially_drawn_endgame(board): node = next_node; continue
+                if legal_moves is None:
+                    node = next_node
+                    continue
+                if cfg.skip_forced_moves and len(legal_moves) == 1:
+                    node = next_node
+                    continue
+                if cfg.require_heavy_piece and not self._mover_has_heavy_piece(board):
+                    node = next_node
+                    continue
+                if not self._has_mating_material(board):
+                    node = next_node
+                    continue
+                if cfg.skip_trivial_endgame and self._is_trivially_drawn_endgame(board):
+                    node = next_node
+                    continue
 
                 mover_rating_val = mover_rating[mover_color]
-                if mover_rating_val is None: node = next_node; continue
+                if mover_rating_val is None:
+                    node = next_node
+                    continue
 
-                if self._syzygy_says_no_mate(board): node = next_node; continue
+                if self._syzygy_says_no_mate(board):
+                    node = next_node
+                    continue
 
                 info = self._analyse_position(board)
                 positions_analysed += 1
-                if not info: node = next_node; continue
+                if not info:
+                    node = next_node
+                    continue
 
                 best_info = info[0]
                 score = best_info.get("score")
-                if score is None: node = next_node; continue
+                if score is None:
+                    node = next_node
+                    continue
 
                 relative_score = score.relative
-                if not relative_score.is_mate(): node = next_node; continue
+                if not relative_score.is_mate():
+                    node = next_node
+                    continue
 
                 mate_n = relative_score.mate()
-                if mate_n is None or not (mate_n > 0 and mate_lo <= mate_n <= mate_hi): node = next_node; continue
+                if mate_n is None or not (mate_n > 0 and mate_lo <= mate_n <= mate_hi):
+                    node = next_node
+                    continue
+
+                if self._second_line_ties_mate(info, int(mate_n)):
+                    node = next_node
+                    continue
 
                 pv = best_info.get("pv")
-                if not pv: node = next_node; continue
+                if not pv:
+                    node = next_node
+                    continue
 
                 best_move = pv[0]
-                if best_move not in legal_moves: node = next_node; continue
+                if best_move not in legal_moves:
+                    node = next_node
+                    continue
 
-                if duration_is_real: clock_seconds = move_duration
+                if duration_is_real:
+                    clock_seconds = move_duration
                 else:
                     bucket_time = self._closest_bucket_time(mover_rating_val)
                     if bucket_time is not None:
-                        clock_seconds = bucket_time; clock_source = "rating_bucket"
+                        clock_seconds = bucket_time
+                        clock_source = "rating_bucket"
                     else:
-                        clock_seconds = cfg.default_move_seconds; clock_source = "default_constant"
+                        clock_seconds = cfg.default_move_seconds
+                        clock_source = "default_constant"
 
-                if cfg.drop_zero_clock and clock_seconds == 0.0 and not duration_is_real: node = next_node; continue
+                if cfg.drop_zero_clock and clock_seconds == 0.0 and not duration_is_real:
+                    node = next_node
+                    continue
 
                 try:
                     data = build_position_data(
@@ -633,13 +714,10 @@ class GamesBuilder:
                         ply=node.ply(),
                         mate_n=int(mate_n),
                     )
-                    # FIX: differenzia il tempo costante per tipo di arco
-                    # (legal_move/attack/pin) invece di lasciarlo identico
-                    # su tutti gli E archi della board. Vedi docstring di
-                    # modulo in time_edge_weighting.py per la motivazione
-                    # completa. Non tocca build_position_data.
                     data = apply_edge_type_time_weighting(data)
-                except ValueError: node = next_node; continue
+                except ValueError:
+                    node = next_node
+                    continue
 
                 if window_group_key is None:
                     window_group_key = int(mate_n)
@@ -673,10 +751,6 @@ class GamesBuilder:
         try:
             payload = encode_for_ipc(records)
         except Exception as e:
-            # FIX: se la serializzazione IPC stessa fallisce (es. un
-            # tensore corrotto/non serializzabile in uno dei record), non
-            # deve far esplodere l'intero worker/pool: si scarta la
-            # partita e si ritorna un payload vuoto, loggando il motivo.
             logger.error(
                 "[GamesBuilder] Worker: impossibile serializzare i risultati per game_id=%s "
                 "(%s: %s); partita scartata (%d posizioni perse).",
@@ -715,7 +789,8 @@ class GamesBuilder:
                 if local_id > skip_games:
                     yield (local_id, "".join(current_game))
                     yielded += 1
-                    if max_games is not None and yielded >= max_games: return
+                    if max_games is not None and yielded >= max_games:
+                        return
                 current_game = [line]
             else:
                 current_game.append(line)
@@ -742,7 +817,9 @@ class GamesBuilder:
             yield (int(local_id) + 1, pgn_text)
 
     def _iter_source(self, src: SourceSpec) -> Generator[Tuple[int, str], None, None]:
-        if src.kind == "club": yield from self._iter_club_csv(src); return
+        if src.kind == "club":
+            yield from self._iter_club_csv(src)
+            return
         with self._open_pgn_text_stream(src.path, src.kind) as text_stream:
             yield from self._iter_pgn_texts(text_stream, src.skip_games, src.max_games)
 
@@ -788,8 +865,10 @@ class GamesBuilder:
     def _count_tasks_estimate(self) -> Optional[int]:
         total = 0
         for src in self.config.sources:
-            if src.max_games is not None: total += src.max_games
-            else: return None
+            if src.max_games is not None:
+                total += src.max_games
+            else:
+                return None
         return total
 
     def run(self) -> Dict[str, Any]:
@@ -800,12 +879,6 @@ class GamesBuilder:
         mate_n_counts: Dict[int, int] = defaultdict(int)
         source_counts: Dict[str, int] = defaultdict(int)
         clock_source_counts: Dict[str, int] = defaultdict(int)
-        # FIX: contatore di game "processati" (dal Pool) su cui e' fallita
-        # la gestione lato PADRE (decode payload, enqueue, ecc.), separato
-        # dagli errori lato worker (gia' gestiti dentro _worker). Prima
-        # un'eccezione qui abortiva l'intera run(); ora viene isolata per
-        # singolo game e la run prosegue, ma il conteggio resta visibile
-        # nel riepilogo finale cosi' non sparisce silenziosamente.
         skipped_games_on_parent_error = 0
 
         pool = mp.Pool(
@@ -815,9 +888,7 @@ class GamesBuilder:
         )
 
         estimate = self._count_tasks_estimate()
-
         last_flush_time = time.monotonic()
-
         shutdown_in_progress = threading.Event()
 
         def _panic_kill() -> None:
@@ -898,23 +969,7 @@ class GamesBuilder:
                 if cfg.flush_every_seconds and (time.monotonic() - last_flush_time) >= cfg.flush_every_seconds:
                     self._registry.flush()
                     last_flush_time = time.monotonic()
-                    logger.debug(
-                        "[GamesBuilder] Flush periodico eseguito (flush_every_seconds=%.1f).",
-                        cfg.flush_every_seconds,
-                    )
 
-                # FIX: tutto il corpo di gestione del singolo risultato e'
-                # ora avvolto in un try/except isolato. Prima, una singola
-                # eccezione qui dentro (es. decode_from_ipc corrotto,
-                # PositionQueueError da enqueue, KeyError su debug_entry)
-                # si propagava FUORI dal for loop, veniva presa dal blocco
-                # `except Exception:` esterno di run() e abortiva l'INTERA
-                # estrazione (100.000 game), con il pool ucciso a forza e
-                # il solo messaggio generico "Errore durante l'analisi"
-                # stampato — nessun traceback, nessuna indicazione di quale
-                # game avesse causato il problema. Ora l'errore e' isolato
-                # al singolo game: viene loggato con traceback completo e
-                # la run prosegue sul prossimo risultato.
                 try:
                     records: List[Dict[str, Any]] = decode_from_ipc(payload)
                 except Exception:
@@ -966,15 +1021,8 @@ class GamesBuilder:
             _shutdown_pool(graceful_first=False)
             raise
         except Exception:
-            # FIX: prima si stampava solo un print() generico senza
-            # traceback, quindi la causa reale del crash restava invisibile
-            # nel log. Ora logger.exception() scrive lo stack trace
-            # completo (tipo eccezione, messaggio, file/riga) sia su
-            # console che nel log file, se configurato in logging.basicConfig
-            # a monte (vedi setup_logging in BuildGamesShard.py/DatasetMain.py).
             logger.exception(
-                "[GamesBuilder] Errore FATALE e non recuperabile durante l'analisi "
-                "(fuori dal loop principale, non isolabile per singolo game): "
+                "[GamesBuilder] Errore FATALE e non recuperabile durante l'analisi: "
                 "arresto forzato dei worker in corso."
             )
             print("\n[WARNING] Errore durante l'analisi: arresto forzato dei worker in corso...")
@@ -994,8 +1042,7 @@ class GamesBuilder:
 
         if skipped_games_on_parent_error:
             logger.warning(
-                "[GamesBuilder] %d game scartati per errori lato padre (decode/enqueue) "
-                "durante questa run: vedi i log ERROR sopra per i dettagli per singolo game.",
+                "[GamesBuilder] %d game scartati per errori lato padre (decode/enqueue) durante questa run.",
                 skipped_games_on_parent_error,
             )
 
@@ -1059,9 +1106,7 @@ class GamesBuilder:
 
         if missing_game_ids:
             logger.warning(
-                "[GamesBuilder] %d game_id presenti nel debug JSONL ma assenti "
-                "dallo split_assignment reale (probabile game_id scartato dal "
-                "registry prima di build_splits): esclusi dal file scritto.",
+                "[GamesBuilder] %d game_id presenti nel debug JSONL ma assenti dallo split_assignment reale: esclusi.",
                 len(missing_game_ids),
             )
 
@@ -1089,9 +1134,7 @@ class GamesBuilder:
 
         if missing_game_ids:
             logger.warning(
-                "[GamesBuilder] %d game_id presenti nel debug JSONL ma assenti "
-                "dallo split_assignment reale (probabile game_id scartato dal "
-                "registry prima di build_splits): esclusi dal file scritto.",
+                "[GamesBuilder] %d game_id presenti nel debug JSONL ma assenti dallo split_assignment reale: esclusi.",
                 len(missing_game_ids),
             )
 

@@ -6,14 +6,17 @@ import os
 from collections import defaultdict
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
+
 import chess
 import pandas as pd
-import torch
 from tqdm import tqdm
 
+from DatasetPipeline.ClockStatsBuilder import ClockSampler
+from DatasetPipeline.Model.ChessConstants import PIECE_VALUES as _CLASS_PIECE_VALUES
 from DatasetPipeline.Model.PositionGraphSchema import build_position_data
 from DatasetPipeline.PositionQueue import PositionQueueRegistry
 from DatasetPipeline.Utils.compatibility_filters import (
+    QualityFilterConfig,
     has_mating_material,
     is_trivially_drawn_endgame,
     mover_has_heavy_piece,
@@ -54,9 +57,14 @@ class PuzzleBuilderConfig:
     skip_trivial_endgame: bool = False
     dedupe_positions: bool = True
 
-from DatasetPipeline.Model.ChessConstants import PIECE_VALUES as _CLASS_PIECE_VALUES
-class PuzzleBuilder:
+    clock_stats_path: Optional[str] = None
+    clock_mode: str = "lognormal"
+    clock_condition_on_mate_n: bool = True
+    clock_min_seconds: float = 0.5
+    clock_cap_seconds: float = 300.0
 
+
+class PuzzleBuilder:
     _PIECE_VALUES: Dict[int, int] = _CLASS_PIECE_VALUES
 
     def __init__(self, config: PuzzleBuilderConfig):
@@ -65,8 +73,10 @@ class PuzzleBuilder:
 
         self._registry = PositionQueueRegistry.instance(
             state_path=config.queue_state_path,
-            shard_size=config.shard_size
+            shard_size=config.shard_size,
         )
+
+        self._clock_sampler = self._build_clock_sampler()
 
         self._debug_records: List[Dict] = []
         self._debug_jsonl_path = None
@@ -98,7 +108,29 @@ class PuzzleBuilder:
         if cfg.min_rating is not None and cfg.max_rating is not None and cfg.min_rating > cfg.max_rating:
             raise ValueError("min_rating non puo' essere maggiore di max_rating.")
         if cfg.max_piece_count is not None and cfg.max_piece_count < 2:
-            raise ValueError("max_piece_count deve essere >= 2 se specificato (servono almeno i due Re).")
+            raise ValueError("max_piece_count deve essere >= 2 se specificato.")
+        if cfg.clock_mode not in ("lognormal", "constant"):
+            raise ValueError("clock_mode deve essere 'lognormal' o 'constant'.")
+
+    def _build_clock_sampler(self) -> ClockSampler:
+        cfg = self.config
+        kwargs = dict(
+            mode=cfg.clock_mode,
+            condition_on_mate_n=cfg.clock_condition_on_mate_n,
+            min_seconds=cfg.clock_min_seconds,
+            cap_seconds=cfg.clock_cap_seconds,
+        )
+        if cfg.clock_stats_path and os.path.exists(cfg.clock_stats_path):
+            logger.info("Clock puzzle: statistiche reali da %s (mode=%s).", cfg.clock_stats_path, cfg.clock_mode)
+            return ClockSampler.from_json(cfg.clock_stats_path, **kwargs)
+        if cfg.avg_time_by_rating:
+            logger.warning(
+                "clock_stats_path assente o non trovato: fallback su avg_time_by_rating (sigma fissa)."
+            )
+            return ClockSampler.from_avg_time(cfg.avg_time_by_rating, **kwargs)
+        raise ValueError(
+            "PuzzleBuilder: servono clock_stats_path (da ClockStatsBuilder) oppure avg_time_by_rating."
+        )
 
     def _load_filtered_rows(self) -> List[Dict]:
         lo, hi = self.config.mate_range
@@ -136,7 +168,7 @@ class PuzzleBuilder:
                 rows.append(record)
                 pbar.update(1)
             if self.config.max_puzzles and len(rows) >= self.config.max_puzzles:
-                rows = rows[:self.config.max_puzzles]
+                rows = rows[: self.config.max_puzzles]
                 break
         pbar.close()
         return rows
@@ -173,23 +205,19 @@ class PuzzleBuilder:
             found = len(rows_by_theme[theme])
             if found < cap:
                 logger.warning(
-                    f"Tema '{theme}': solo {found}/{cap} puzzle trovati nel CSV "
-                    f"(il dataset Lichess ne contiene meno di quanti richiesti, "
-                    f"anche considerando il filtro rating configurato)."
+                    f"Tema '{theme}': solo {found}/{cap} puzzle trovati nel CSV."
                 )
             all_rows.extend(rows_by_theme[theme])
 
         if self.config.max_puzzles is not None and len(all_rows) > self.config.max_puzzles:
             logger.info(
                 f"Campionamento stratificato ha prodotto {len(all_rows)} righe, "
-                f"troncate a max_puzzles={self.config.max_puzzles} (taglio finale, "
-                f"puo' rompere la stratificazione se applicato qui: valuta di "
-                f"alzare max_puzzles invece)."
+                f"troncate a max_puzzles={self.config.max_puzzles}."
             )
             all_rows = all_rows[: self.config.max_puzzles]
 
         logger.info(
-            "Distribuzione puzzle sorgente per tema (prima della generazione posizioni): "
+            "Distribuzione puzzle sorgente per tema: "
             + ", ".join(f"{t}={len(rows_by_theme[t])}" for t in themes_wanted)
         )
         return all_rows
@@ -209,12 +237,6 @@ class PuzzleBuilder:
                 return int(t.replace("mateIn", ""))
         return 0
 
-    def _simulated_clock(self, rating: float) -> float:
-        if self.config.avg_time_by_rating:
-            bucket = round(rating / 100) * 100
-            return self.config.avg_time_by_rating.get(bucket, 15.0)
-        return 5.0 + (rating / 3000.0) * 55.0
-
     def _material_by_color(self, board: "chess.Board") -> Tuple[int, int]:
         white_mat = black_mat = 0
         for p in board.piece_map().values():
@@ -231,7 +253,6 @@ class PuzzleBuilder:
         if cfg.max_piece_count is not None and len(board.piece_map()) > cfg.max_piece_count:
             return False
 
-        from DatasetPipeline.Utils.compatibility_filters import QualityFilterConfig
         quality_cfg = QualityFilterConfig(
             min_material_for_mate_attempt=cfg.min_material_for_mate_attempt,
             min_material_diff_for_mate_attempt=cfg.min_material_diff_for_mate_attempt,
@@ -282,7 +303,6 @@ class PuzzleBuilder:
 
             rating_raw = row.get("Rating")
             puzzle_rating = float(rating_raw) if pd.notna(rating_raw) else 1500.0
-            clock_base = self._simulated_clock(puzzle_rating)
 
             first_move = chess.Move.from_uci(uci_moves[0])
             if first_move not in board.legal_moves:
@@ -290,7 +310,6 @@ class PuzzleBuilder:
             board.push(first_move)
 
             game_id = f"{self.config.source_tag}_{puzzle_id_raw}"
-
             window_group_key = mate_n_iniziale
 
             puzzle_enqueued = 0
@@ -299,8 +318,9 @@ class PuzzleBuilder:
                 move = chess.Move.from_uci(uci)
 
                 if ply_idx % 2 == 0:
-                    if move in board.legal_moves:
-                        board.push(move)
+                    if move not in board.legal_moves:
+                        break
+                    board.push(move)
                     continue
 
                 if move not in board.legal_moves:
@@ -319,12 +339,10 @@ class PuzzleBuilder:
                     board.push(move)
                     continue
 
-                import random as _random
-
                 current_mate_n = max(1, mate_n_iniziale - (ply_idx // 2))
-                base_scaled = clock_base * (1 + 0.1 * ply_idx)
-                noise_factor = _random.Random(f"{game_id}:{ply_idx}").gauss(1.0, 0.15)
-                clock_seconds = max(0.5, base_scaled * max(0.3, noise_factor))
+                clock_seconds = self._clock_sampler.sample(
+                    puzzle_rating, mate_n_iniziale, f"{game_id}:{ply_idx}"
+                )
 
                 try:
                     data = build_position_data(
@@ -339,8 +357,7 @@ class PuzzleBuilder:
                     data = apply_edge_type_time_weighting(data)
                 except ValueError as e:
                     logger.warning(
-                        f"PuzzleId={row.get('PuzzleId')} ply={ply_idx}: "
-                        f"scarto la posizione ({e})."
+                        f"PuzzleId={row.get('PuzzleId')} ply={ply_idx}: scarto la posizione ({e})."
                     )
                     board.push(move)
                     continue
@@ -362,6 +379,7 @@ class PuzzleBuilder:
                         "mate_n_window": window_group_key,
                         "rating": puzzle_rating,
                         "ply_idx": ply_idx,
+                        "clock_seconds": float(clock_seconds),
                         "game_id": game_id,
                         "source": self.config.source_tag,
                     })
@@ -372,8 +390,10 @@ class PuzzleBuilder:
                 accepted_puzzles += 1
                 enqueued_positions += puzzle_enqueued
 
-            if (self.config.max_positions_per_puzzle is not None and
-                enqueued_positions >= self.config.max_positions_per_puzzle):
+            if (
+                self.config.max_positions_per_puzzle is not None
+                and enqueued_positions >= self.config.max_positions_per_puzzle
+            ):
                 break
 
         self._registry.flush()
@@ -446,9 +466,7 @@ class PuzzleBuilder:
 
         if missing_game_ids:
             logger.warning(
-                "[PuzzleBuilder] %d game_id presenti nel debug JSONL ma assenti "
-                "dallo split_assignment reale (probabile game_id scartato dal "
-                "registry prima di build_splits): esclusi dal file scritto.",
+                "[PuzzleBuilder] %d game_id presenti nel debug JSONL ma assenti dallo split_assignment reale: esclusi.",
                 len(missing_game_ids),
             )
 
@@ -476,18 +494,16 @@ class PuzzleBuilder:
 
         if missing_game_ids:
             logger.warning(
-                "[PuzzleBuilder] %d game_id presenti nel debug JSONL ma assenti "
-                "dallo split_assignment reale (probabile game_id scartato dal "
-                "registry prima di build_splits): esclusi dal file scritto.",
+                "[PuzzleBuilder] %d game_id presenti nel debug JSONL ma assenti dallo split_assignment reale: esclusi.",
                 len(missing_game_ids),
             )
 
         return self._debug_jsonl_path
 
     def _log_summary(self, processed, accepted, enqueued, mate_n_counts,
-                      source_mate_n_counts, quality_filtered_positions, deduped_positions):
+                     source_mate_n_counts, quality_filtered_positions, deduped_positions):
         logger.info("=" * 60)
-        logger.info("PUZZLE BUILDER — RIEPILOGO (allineato a GamesBuilder)")
+        logger.info("PUZZLE BUILDER - RIEPILOGO")
         logger.info("=" * 60)
         logger.info(f"Puzzle processati: {processed:,}")
         logger.info(f"Puzzle accettati (almeno una posizione): {accepted:,}")
@@ -495,11 +511,11 @@ class PuzzleBuilder:
         logger.info(f"Posizioni scartate da filtri di compatibilita': {quality_filtered_positions:,}")
         logger.info(f"Posizioni scartate da dedupe_positions: {deduped_positions:,}")
         if source_mate_n_counts:
-            logger.info("Puzzle SORGENTE per tema mateInN dichiarato (prima della generazione posizioni):")
+            logger.info("Puzzle SORGENTE per tema mateInN dichiarato:")
             for n in sorted(source_mate_n_counts.keys()):
                 logger.info(f"  mateIn{n}: {source_mate_n_counts[n]:,} puzzle")
         if mate_n_counts:
-            logger.info("Posizioni GENERATE per profondità mate REALE (current_mate_n, N mosse intere):")
+            logger.info("Posizioni GENERATE per profondita' mate (current_mate_n):")
             for n in sorted(mate_n_counts.keys()):
                 logger.info(f"  n={n}: {mate_n_counts[n]:,}")
         logger.info("=" * 60)

@@ -24,7 +24,7 @@ import pandas as pd
 from DatasetPipeline.Model.ChessConstants import PIECE_VALUES
 from DatasetPipeline.Model.PositionGraphSchema import build_position_data
 from DatasetPipeline.PipelineState import PipelineState
-from DatasetPipeline.TimeStatBuilder import load_avg_time_by_rating
+from DatasetPipeline.Clockstatbuilder import load_avg_time_by_rating
 from DatasetPipeline.Utils.compatibility_filters import (
     QualityFilterConfig,
     has_mating_material,
@@ -131,14 +131,14 @@ class ExternalHoldoutConfig:
     input_format: str = "auto"
 
     chunksize: int = 5_000
-    max_games: Optional[int] = 100_000
+    max_games: Optional[int] = 30_000
 
     allowed_rules: Tuple[str, ...] = ("chess",)
     require_rated: bool = False
 
     stockfish_path: str = "stockfish"
     threads: int = 1
-    hash_mb: int = 32
+    hash_mb: int = 8
     search_depth: int = 12
     analysis_time: Optional[float] = 0.2
     mate_range: Tuple[int, int] = (1, 3)
@@ -156,6 +156,16 @@ class ExternalHoldoutConfig:
     candidate_min_legal_moves: int = 1
     candidate_max_legal_moves: Optional[int] = None
     skip_if_in_check: bool = False
+
+    # FIX: campi usati da _headers_are_eligible/_process_game ma mancanti
+    # dalla dataclass (AttributeError a runtime in ogni worker, partita
+    # sempre scartata). Default allineati a GamesBuilderConfig e a
+    # dataset_main.yaml -> games_pipeline (only_decisive_games=true,
+    # skip_time_forfeit=true, min_game_plies=20), stessa logica gia'
+    # documentata nel docstring di _headers_are_eligible sopra.
+    only_decisive_games: bool = True
+    skip_time_forfeit: bool = True
+    min_game_plies: int = 20
 
     min_ply: int = 6
     # ALLINEATO: dataset_main.yaml -> games_pipeline.ply_sample_step = 12

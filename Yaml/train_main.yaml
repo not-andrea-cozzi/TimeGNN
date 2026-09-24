@@ -6,7 +6,7 @@ pipeline:
   force_recompute: false
   log_level: "INFO"
   log_file: "Dataset/train_pipeline.log"
-  step: "evaluate"               # valori: "train_basic", "train_time_aware", "evaluate"
+  step: "evaluate"
   no_amp: false
 
 train_basic:
@@ -33,12 +33,12 @@ train_basic:
   weight_decay: 1.0e-4
   persistent_workers: true
   compile: false
-  norm_kind: "layer_norm"   # bypassa recommend_norm_kind, evita il branch graph_norm rotto
+  norm_kind: "layer_norm"
 
 train_time_aware:
   enabled: true
-  train_dir: "Dataset/Train/shards/train"
-  val_dir: "Dataset/Train/shards/val"
+  train_dir: "Dataset/Train/train_clean"
+  val_dir: "Dataset/Train/val_clean"
   checkpoint: "Dataset/Train/checkpoints/time_aware"
   epochs: 50
   batch_size: 128
@@ -56,7 +56,7 @@ train_time_aware:
   dropout: 0.2
   use_batch_norm: true
   activation: "elu"
-  lambda_decay: 0.01
+  lambda_decay: 2.0
   weight_decay: 0.05e-4
   persistent_workers: true
   compile: false

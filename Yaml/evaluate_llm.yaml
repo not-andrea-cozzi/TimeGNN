@@ -1,31 +1,20 @@
-#holdout_dir: "Dataset/ExternalHoldout/holdout_clean"
-#out_dir: "Dataset/Test_LLM/metrics"
-#max_n: 10
-# --- LLM (Groq, OpenAI-compatible) ---
-#llm_enabled: true
-#llm_base_url: "https://api.groq.com/openai/v1/chat/completions"
-#llm_model: "openai/gpt-oss-20b"
-#llm_api_key_env: "GROQ_API_KEY"
-#llm_temperature: 0.0
-#llm_max_tokens: 1500
-#llm_timeout_seconds: 30
-#llm_max_retries: 3
-#llm_retry_backoff_seconds: 5.0
-#llm_request_delay_seconds: 3.0
-#llm_reasoning_effort: "low"
-#llm_reasoning_format: "hidden"
-
 holdout_dir: "Dataset/ExternalHoldout/holdout_clean"
 out_dir: "Dataset/Test_LLM/metrics"
 max_n: 10
-# --- LLM (Google Gemma, endpoint compatibile OpenAI) ---
+
 llm_enabled: true
 llm_base_url: "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions"
-llm_model: "gemma-4-26b-a4b-it"
+llm_model: "gemini-3.5-flash-lite"
+llm_request_delay_seconds: 4.0   # 15 RPM -> ~4s tra richieste
+llm_max_workers: 1                # evita di bruciare le RPM in parallelo
 llm_api_key_env: "GEMINI_API_KEY"
 llm_temperature: 0.0
-llm_max_tokens: 800
-llm_timeout_seconds: 30
-llm_max_retries: 3
-llm_retry_backoff_seconds: 5.0
-llm_request_delay_seconds: 2.0
+llm_max_tokens: 4000
+llm_timeout_seconds: 120                # <-- alzato da 30
+llm_max_retries: 4                      # <-- alzato da 3
+llm_retry_backoff_seconds: 3.0
+llm_request_delay_seconds: 0.5          # <-- abbassato da 2.0
+
+# Se avevi queste righe, mettile a null o rimuovile:
+llm_reasoning_effort: null
+llm_reasoning_format: null

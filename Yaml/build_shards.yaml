@@ -1,26 +1,19 @@
 pipeline:
-  dataset_dir: "Dataset"                          # STESSO di dataset_main.yaml
-  games_subfolder: "Games"                        # STESSO
-  queue_state_file: "position_queue_state.json"   
-  resume_state_file: "build_shard_resume.json"    
-  seed: 42                                        
-
-
+  dataset_dir: "Dataset"
+  games_subfolder: "Games"
+  queue_state_file: "position_queue_state.json"
+  resume_state_file: "build_shard_resume.json"
+  seed: 42
   time_stats_json: "Dataset/avg_time_by_rating.json"
 
 engine:
   stockfish_path: "/usr/games/stockfish"
   threads: 1
-  hash_mb: 32
+  hash_mb: 8
   syzygy_path: null
 
 games_pipeline:
   sources:
-    #- path: "RawData/lichess_db_standard_rated_2020-01.pgn.zst"
-    #  tag: "lichess_games_06"
-    #  skip_games: 0
-    #  max_games: 100000
-
     - path: "RawData/ficsgamesdb_2023_chess_movetimes_4339907.pgn"
       tag: "games_2023_02"
       skip_games: 0
@@ -29,11 +22,11 @@ games_pipeline:
   split_train_ratio: 0.65
   split_val_ratio: 0.15
   split_test_ratio: 0.20
- 
+
   mate_range_min: 1
   mate_range_max: 5
-  search_depth: 12
-  time_limit_seconds: 0.2
+  search_depth: 16
+  time_limit_seconds: 0.5
   max_piece_count: null
   min_material_for_mate_attempt: 2
   min_material_diff_for_mate_attempt: 2
@@ -44,7 +37,7 @@ games_pipeline:
   max_positions_per_game: 20
   require_clock: true
   drop_zero_clock: true
-  workers: null                 # null = auto (cpu_count - 1)
+  workers: null
   min_rating: 1200
   max_rating: null
   require_heavy_piece: false
@@ -58,9 +51,8 @@ games_pipeline:
   default_move_seconds: 15.0
   stockfish_retry_attempts: 2
   stockfish_retry_backoff_seconds: 0.5
-  shard_size: 5000
+  shard_size: 15000
   pool_join_timeout: 20.0
   save_debug_jsonl: true
- 
   auto_resume: true
   resume_checkpoint_every: 5000

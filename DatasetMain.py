@@ -16,6 +16,7 @@ except ImportError:
 
 from DatasetPipeline.Builder.GamesBuilder import GamesBuilder, GamesBuilderConfig, SourceSpec
 from DatasetPipeline.Builder.PuzzleBuilder import PuzzleBuilder, PuzzleBuilderConfig
+from DatasetPipeline.ClockStatsBuilder import ClockStatsBuilder
 from DatasetPipeline.TimeStatBuilder import TimeStatsBuilder, load_avg_time_by_rating
 from DatasetPipeline.PositionQueue import PositionQueueRegistry
 from DatasetPipeline.PipelineState import PipelineState
@@ -24,7 +25,7 @@ logger = logging.getLogger("dataset_main")
 
 
 class ConfigError(Exception):
-    """Errore bloccante di configurazione della pipeline."""
+    pass
 
 
 def setup_logging(log_level: str = "INFO", log_file: Optional[str] = None) -> None:
@@ -62,7 +63,6 @@ def require_executable(path: str) -> None:
 
 
 def free_memory() -> None:
-    """Forza GC e svuota la cache CUDA se disponibile."""
     import gc
     gc.collect()
     try:
@@ -73,13 +73,7 @@ def free_memory() -> None:
         pass
 
 
-# ---------------------------------------------------------------------------
-# ShardWriter per lo split finale (streaming su disco)
-# ---------------------------------------------------------------------------
 class _ShardWriter:
-    """Accumula fino a `shard_size` record e li salva in
-    <out_dir>/<split_name>/shard_NNNNN.pt."""
-
     def __init__(self, out_dir: str, split_name: str, shard_size: int) -> None:
         self.split_dir = os.path.join(out_dir, split_name)
         os.makedirs(self.split_dir, exist_ok=True)
@@ -121,9 +115,6 @@ class _ShardWriter:
         return self.files
 
 
-# ---------------------------------------------------------------------------
-# STEP 1: time_stats
-# ---------------------------------------------------------------------------
 def _step_time_stats(cfg: Dict[str, Any], state: PipelineState, dataset_dir: str) -> Optional[str]:
     pipe_cfg = cfg.get("pipeline", {})
     ts_cfg = cfg.get("time_stats", {})
@@ -137,7 +128,7 @@ def _step_time_stats(cfg: Dict[str, Any], state: PipelineState, dataset_dir: str
 
     games_zst = raw_cfg.get("games_zst")
     if not games_zst:
-        logger.warning("[time_stats] raw_data.games_zst non specificato: skip step (avg_time_by_rating resta vuoto).")
+        logger.warning("[time_stats] raw_data.games_zst non specificato: skip step.")
         return None
     if not os.path.exists(games_zst):
         raise ConfigError(f"[time_stats] raw_data.games_zst non trovato: {games_zst}")
@@ -157,9 +148,52 @@ def _step_time_stats(cfg: Dict[str, Any], state: PipelineState, dataset_dir: str
         raise
 
 
-# ---------------------------------------------------------------------------
-# STEP 2: games_pipeline
-# ---------------------------------------------------------------------------
+def _clock_stats_output_path(cfg: Dict[str, Any], dataset_dir: str) -> str:
+    cs_cfg = cfg.get("clock_stats", {})
+    return os.path.join(dataset_dir, cs_cfg.get("output_filename", "clock_stats.json"))
+
+
+def _step_clock_stats(cfg: Dict[str, Any], state: PipelineState, dataset_dir: str) -> Optional[str]:
+    pipe_cfg = cfg.get("pipeline", {})
+    cs_cfg = cfg.get("clock_stats", {})
+
+    if not cs_cfg.get("enabled", True):
+        logger.info("[clock_stats] Disabilitato da config: skip.")
+        return None
+
+    out_path = _clock_stats_output_path(cfg, dataset_dir)
+    games_dir = os.path.join(dataset_dir, pipe_cfg.get("games_subfolder", "Games"))
+    candidates = [
+        os.path.join(games_dir, "games_debug.jsonl"),
+        os.path.join(games_dir, "games_debug_records.pending.jsonl"),
+    ]
+    existing = [p for p in candidates if os.path.exists(p)]
+    if not existing:
+        logger.warning(f"[clock_stats] Nessun games_debug*.jsonl in {games_dir}: skip step.")
+        return None
+
+    builder = ClockStatsBuilder(
+        existing,
+        bucket_size=cs_cfg.get("bucket_size", 100),
+        min_count=cs_cfg.get("min_count", 30),
+        max_seconds=cs_cfg.get("max_seconds", 300.0),
+    )
+    try:
+        stats = builder.build_and_save(out_path)
+    except Exception as e:
+        state.mark_failed("clock_stats", str(e))
+        raise
+
+    state.mark_done(
+        "clock_stats",
+        output=out_path,
+        samples=int(stats["global"][2]),
+        cells=len(stats["by_rating_mate"]),
+    )
+    logger.info(f"[clock_stats] Completato: {out_path}")
+    return out_path
+
+
 def _build_game_sources(raw_cfg: Dict[str, Any], games_cfg: Dict[str, Any]) -> List[SourceSpec]:
     sources: List[SourceSpec] = []
 
@@ -215,7 +249,7 @@ def _step_games_pipeline(
     raw_cfg = cfg.get("raw_data", {})
 
     if pipe_cfg.get("use_existing_games", False):
-        logger.info("[games_pipeline] use_existing_games=true: skip (uso shard/queue gia' presenti).")
+        logger.info("[games_pipeline] use_existing_games=true: skip.")
         return {}
 
     if state.is_done("games_pipeline", skip=pipe_cfg.get("force_recompute", False)):
@@ -248,12 +282,12 @@ def _step_games_pipeline(
         sources=sources,
         stockfish_path=stockfish_path,
         mate_range=mate_range,
-        search_depth=games_cfg.get("search_depth", 8),
-        analysis_time=games_cfg.get("analysis_time", 0.2),
+        search_depth=games_cfg.get("search_depth", 16),
+        analysis_time=games_cfg.get("analysis_time", 0.5),
         workers=games_cfg.get("workers"),
         threads=engine_cfg.get("threads", 1),
         hash_mb=engine_cfg.get("hash_mb", 128),
-        multipv=1,
+        multipv=2,
         syzygy_path=engine_cfg.get("syzygy_path"),
         stockfish_retry_attempts=games_cfg.get("stockfish_retry_attempts", 2),
         stockfish_retry_backoff_seconds=games_cfg.get("stockfish_retry_backoff_seconds", 0.5),
@@ -310,9 +344,6 @@ def _step_games_pipeline(
     return result
 
 
-# ---------------------------------------------------------------------------
-# STEP 3: puzzle_pipeline
-# ---------------------------------------------------------------------------
 def _decompress_puzzle_csv_if_needed(raw_cfg: Dict[str, Any], puzzle_cfg: Dict[str, Any], dataset_dir: str) -> Optional[str]:
     puzzles_zst = raw_cfg.get("puzzles_zst")
     if not puzzles_zst:
@@ -360,6 +391,13 @@ def _step_puzzle_pipeline(
     if os.path.exists(time_stats_path):
         avg_time_by_rating = load_avg_time_by_rating(time_stats_path)
 
+    clock_stats_path = _clock_stats_output_path(cfg, dataset_dir)
+    if not os.path.exists(clock_stats_path):
+        logger.warning(
+            f"[puzzle_pipeline] {clock_stats_path} non trovato: esegui prima lo step clock_stats. "
+            f"Fallback su avg_time_by_rating."
+        )
+
     mate_range = (
         cfg.get("games_pipeline", {}).get("mate_range_min", 1),
         cfg.get("games_pipeline", {}).get("mate_range_max", 5),
@@ -390,6 +428,11 @@ def _step_puzzle_pipeline(
         require_heavy_piece=puzzle_cfg.get("require_heavy_piece", False),
         skip_trivial_endgame=puzzle_cfg.get("skip_trivial_endgame", True),
         dedupe_positions=puzzle_cfg.get("dedupe_positions", True),
+        clock_stats_path=clock_stats_path,
+        clock_mode=puzzle_cfg.get("clock_mode", "lognormal"),
+        clock_condition_on_mate_n=puzzle_cfg.get("clock_condition_on_mate_n", True),
+        clock_min_seconds=puzzle_cfg.get("clock_min_seconds", 0.5),
+        clock_cap_seconds=puzzle_cfg.get("clock_cap_seconds", 300.0),
     )
 
     builder = PuzzleBuilder(pb_config)
@@ -407,9 +450,6 @@ def _step_puzzle_pipeline(
     return result
 
 
-# ---------------------------------------------------------------------------
-# STEP 4: finalize_splits (streaming: pass 1 metadata + pass 2 scrittura a shard)
-# ---------------------------------------------------------------------------
 def _step_finalize_splits(
     cfg: Dict[str, Any], state: PipelineState, dataset_dir: str,
     queue_state_path: str,
@@ -432,13 +472,11 @@ def _step_finalize_splits(
     if abs(sum(split_ratios) - 1.0) > 1e-6:
         raise ConfigError(f"splits: le percentuali devono sommare a 1.0 (attuale: {split_ratios}).")
 
-    # quanti Data tenere in RAM per shard di output (abbassa se i Data sono grandi)
     output_shard_size = int(splits_cfg.get("output_shard_size", 20_000))
     seed = pipe_cfg.get("seed", 42)
 
     registry = PositionQueueRegistry.instance(state_path=queue_state_path)
 
-    # ---- Pass 1: metadata-only, niente Data in RAM ----
     logger.info("[finalize_splits] Pass 1/2: calcolo assegnazione split (metadata-only)...")
     try:
         assignment = registry.build_split_assignment(split_ratios=split_ratios, seed=seed)
@@ -446,7 +484,6 @@ def _step_finalize_splits(
         state.mark_failed("finalize_splits", str(e))
         raise
 
-    # ---- Pass 2: stream decompression -> shard writer ----
     logger.info(f"[finalize_splits] Pass 2/2: scrittura a shard (output_shard_size={output_shard_size:,})...")
     writers = {
         name: _ShardWriter(merged_dir, name, output_shard_size)
@@ -456,7 +493,7 @@ def _step_finalize_splits(
     try:
         for split_name, data in registry.iter_shard_positions(assignment):
             writers[split_name].append(data)
-            del data  # lascia andare subito il Data dopo la scrittura
+            del data
     except Exception as e:
         state.mark_failed("finalize_splits", str(e))
         raise
@@ -471,8 +508,7 @@ def _step_finalize_splits(
             f"[finalize_splits] {name}: {w.total:,} posizioni in {len(files)} shard -> {merged_dir}"
         )
 
-    # ---- Debug jsonl (se presenti) ----
-    split_assignment = assignment  # game_id -> split
+    split_assignment = assignment
     games_output_dir = os.path.join(dataset_dir, pipe_cfg.get("games_subfolder", "Games"))
     pending_games_debug = os.path.join(games_output_dir, "games_debug_records.pending.jsonl")
     if os.path.exists(pending_games_debug):
@@ -502,21 +538,9 @@ def _step_finalize_splits(
     return meta
 
 
-# ---------------------------------------------------------------------------
-# STEP 5: clean + reshard  (step 0 della pipeline di training)
-# ---------------------------------------------------------------------------
 def _step_clean_and_reshard(
     cfg: Dict[str, Any], state: PipelineState, dataset_dir: str,
 ) -> Dict[str, Any]:
-    """
-    Legge le cartelle shardate prodotte da `finalize_splits`
-    (Dataset/Train/<split>/shard_*.pt + manifest.json), pulisce ogni Data
-    e riscrive in nuove cartelle dedicate (Dataset/Train/<split>_clean/)
-    con la dimensione target `clean.target_shard_size`.
-
-    Sequenziale, shard-by-shard: non carica mai l'intero dataset in RAM.
-    Idempotente: se lo stato dice 'done' e i manifest di output esistono, salta.
-    """
     pipe_cfg = cfg.get("pipeline", {})
     clean_cfg = cfg.get("clean", {})
 
@@ -524,12 +548,10 @@ def _step_clean_and_reshard(
         logger.info("[clean] disabilitato da config: skip.")
         return {}
 
-    # Input (output di finalize_splits)
     in_train_dir = clean_cfg["input_dir_train"]
     in_val_dir = clean_cfg["input_dir_val"]
     in_test_dir = clean_cfg.get("input_dir_test")
 
-    # Output (nuove cartelle dedicate)
     out_train_dir = clean_cfg["output_dir_train"]
     out_val_dir = clean_cfg["output_dir_val"]
     out_test_dir = clean_cfg.get("output_dir_test")
@@ -537,7 +559,6 @@ def _step_clean_and_reshard(
     target_shard_size = int(clean_cfg.get("target_shard_size", 8000))
     workers = int(clean_cfg.get("workers", 0))
 
-    # Pre-check: i manifest di input devono esistere
     for d in [in_train_dir, in_val_dir] + ([in_test_dir] if in_test_dir else []):
         manifest = os.path.join(d, "manifest.json")
         if not os.path.exists(manifest):
@@ -549,9 +570,7 @@ def _step_clean_and_reshard(
             and os.path.exists(os.path.join(out_val_dir, "manifest.json"))
         )
         if out_test_dir:
-            ready = ready and os.path.exists(
-                os.path.join(out_test_dir, "manifest.json")
-            )
+            ready = ready and os.path.exists(os.path.join(out_test_dir, "manifest.json"))
         return ready
 
     if state.is_done("clean", skip=pipe_cfg.get("force_recompute", False)) and _is_ready():
@@ -564,23 +583,17 @@ def _step_clean_and_reshard(
 
     try:
         logger.info(f"[clean][train] {in_train_dir} -> {out_train_dir}")
-        m_train = clean_sharded_directory(
-            in_train_dir, out_train_dir, target_shard_size, workers
-        )
+        m_train = clean_sharded_directory(in_train_dir, out_train_dir, target_shard_size, workers)
         free_memory()
 
         logger.info(f"[clean][val] {in_val_dir} -> {out_val_dir}")
-        m_val = clean_sharded_directory(
-            in_val_dir, out_val_dir, target_shard_size, workers
-        )
+        m_val = clean_sharded_directory(in_val_dir, out_val_dir, target_shard_size, workers)
         free_memory()
 
         m_test: Dict[str, Any] = {}
         if in_test_dir and out_test_dir:
             logger.info(f"[clean][test] {in_test_dir} -> {out_test_dir}")
-            m_test = clean_sharded_directory(
-                in_test_dir, out_test_dir, target_shard_size, workers
-            )
+            m_test = clean_sharded_directory(in_test_dir, out_test_dir, target_shard_size, workers)
             free_memory()
 
     except Exception as e:
@@ -601,9 +614,6 @@ def _step_clean_and_reshard(
     return meta
 
 
-# ---------------------------------------------------------------------------
-# ORCHESTRAZIONE
-# ---------------------------------------------------------------------------
 def main(config_path: str) -> Dict[str, Any]:
     cfg = load_yaml_config(config_path)
     pipe_cfg = cfg.get("pipeline", {})
@@ -613,7 +623,7 @@ def main(config_path: str) -> Dict[str, Any]:
     setup_logging(log_level, log_file)
 
     logger.info("=" * 70)
-    logger.info("DATASET PIPELINE (time_stats -> games -> puzzles -> finalize_splits -> clean)")
+    logger.info("DATASET PIPELINE (time_stats -> games -> clock_stats -> puzzles -> finalize_splits -> clean)")
     logger.info("=" * 70)
 
     dataset_dir = pipe_cfg.get("dataset_dir", "Dataset")
@@ -631,9 +641,10 @@ def main(config_path: str) -> Dict[str, Any]:
     all_steps = [
         "time_stats",
         "games_pipeline",
+        "clock_stats",
         "puzzle_pipeline",
         "finalize_splits",
-        "clean",              # <-- step 0 della pipeline di training
+        "clean",
     ]
 
     if step == "all":
@@ -650,6 +661,8 @@ def main(config_path: str) -> Dict[str, Any]:
             results["games_pipeline"] = _step_games_pipeline(
                 cfg, state, dataset_dir, queue_state_path, resume_state_path
             )
+        elif s == "clock_stats":
+            results["clock_stats"] = _step_clock_stats(cfg, state, dataset_dir)
         elif s == "puzzle_pipeline":
             results["puzzle_pipeline"] = _step_puzzle_pipeline(
                 cfg, state, dataset_dir, queue_state_path
@@ -659,9 +672,7 @@ def main(config_path: str) -> Dict[str, Any]:
                 cfg, state, dataset_dir, queue_state_path
             )
         elif s == "clean":
-            results["clean"] = _step_clean_and_reshard(
-                cfg, state, dataset_dir
-            )
+            results["clean"] = _step_clean_and_reshard(cfg, state, dataset_dir)
         else:
             raise ConfigError(f"pipeline.step sconosciuto: '{s}'")
 
@@ -673,7 +684,7 @@ def main(config_path: str) -> Dict[str, Any]:
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
-        description="Pipeline completa: time_stats -> games_pipeline -> puzzle_pipeline -> finalize_splits -> clean."
+        description="Pipeline completa: time_stats -> games_pipeline -> clock_stats -> puzzle_pipeline -> finalize_splits -> clean."
     )
     parser.add_argument("--config", default="Yaml/dataset_main.yaml")
     args = parser.parse_args()
@@ -684,7 +695,7 @@ if __name__ == "__main__":
         logging.getLogger("dataset_main").error(f"Errore di configurazione: {e}")
         sys.exit(2)
     except KeyboardInterrupt:
-        logging.getLogger("dataset_main").warning("Interrotto dall'utente. Rilancia lo stesso comando per riprendere (resume/state).")
+        logging.getLogger("dataset_main").warning("Interrotto dall'utente. Rilancia lo stesso comando per riprendere.")
         sys.exit(130)
     except Exception as e:
         logging.getLogger("dataset_main").error(f"Interruzione imprevista: {e}")

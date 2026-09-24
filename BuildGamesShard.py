@@ -13,7 +13,7 @@ except ImportError:
     yaml = None
 
 from DatasetPipeline.Builder.GamesBuilder import GamesBuilder, GamesBuilderConfig, SourceSpec
-from DatasetPipeline.TimeStatBuilder import load_avg_time_by_rating
+from DatasetPipeline.Clockstatbuilder import load_avg_time_by_rating
 
 logger = logging.getLogger("build_shards_standalone")
 

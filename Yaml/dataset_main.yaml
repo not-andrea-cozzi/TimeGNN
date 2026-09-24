@@ -4,16 +4,16 @@ pipeline:
   merged_subfolder: "Train"
   games_subfolder: "Games"
   state_file: "pipeline_state.json"
-  force_recompute: false   # SEMPRE FALSE
+  force_recompute: false
   log_level: "INFO"
   log_file: "Dataset/pipeline.log"
-  step: "clean"  # "time_stats", "games_pipeline", "puzzle_pipeline", "finalize_splits", "clean", "all"
+  step: "clock_stats"
   use_existing_games: true
 
 engine:
   stockfish_path: "/usr/games/stockfish"
   threads: 1
-  hash_mb: 32
+  hash_mb: 8
   syzygy_path: null
 
 raw_data:
@@ -21,8 +21,8 @@ raw_data:
   puzzles_zst: "RawData/lichess_db_puzzle.csv.zst"
   fics_pgn: "RawData/ficsgamesdb_201001_standard_movetimes_4340144.pgn"
   club_csv: ""
-  games_source_tag: "games_lichess_time_5"        # to done 5
-  fics_source_tag: "fics_standard_2010_0"         # Made 100'000 --> turn to _1 (2023, 2017_chess is now 2, done 2017) -- 2015: 100'000
+  games_source_tag: "games_lichess_time_5"
+  fics_source_tag: "fics_standard_2010_0"
   club_source_tag: ""
   puzzles_source_tag: "licess_puzzles_0"
 
@@ -31,42 +31,47 @@ time_stats:
   max_games: 100000
   bucket_size: 100
 
+clock_stats:
+  enabled: true
+  output_filename: "clock_stats.json"
+  bucket_size: 100
+  min_count: 30
+  max_seconds: 300.0
+
 games_pipeline:
   output_base_filename: "games.pt"
-  max_games: 0                     # stesso, buon compromesso
-  skip_games_part1: 0              # (done 100'000 2017 and whole 2014, 100'000 2015) (200'000 games)
+  max_games: 0
+  skip_games_part1: 0
   fics_max_games: null
   fics_skip_games: 0
   fics_pgn_col: "pgn"
   club_max_games: 0
   club_skip_games: 0
   club_pgn_col: "pgn"
-  analysis_time: 0.2
-
-  # --- Parametri critici ---
+  analysis_time: 0.5
   mate_range_min: 1
-  mate_range_max: 10                     # invariato
-  search_depth: 12                       # ⬆ aumento per PV più lunga e accuratezza
-  time_limit_seconds: 0.2                # ⬇ leggero calo per bilanciare profondità
-  max_piece_count: null                  # ⬅ rimuovi filtro: accetta tutte le posizioni
-  min_material_for_mate_attempt: 3       # ⬇ abbassato per includere più matti
-  only_decisive_games: true              # invariato
-  skip_time_forfeit: true                # invariato
-  ply_sample_step: 12                    # invariato
-  min_ply: 6                             # invariato
-  max_positions_per_game: 20             # invariato
-  require_clock: true                    # SEMPRE TRUE
-  drop_zero_clock: true                  # invariato
-  workers: null                          # invariato (auto)
-  checkpoint_every: 2000                 # invariato
-  pool_join_timeout: 20.0                # invariato
-  min_rating: 1200                       # ⬆ alza leggermente per escludere partite troppo casuali
-  max_rating: null                       # invariato
-  min_material_diff_for_mate_attempt: 3  # ⬇ abbassato per accettare più sacrifici
-  require_heavy_piece: false             # ⬅ **FALSE** per includere matti con soli pezzi leggeri
-  skip_forced_moves: true                # ⬅ **TRUE** per saltare posizioni con una sola mossa (velocità)
-  dedupe_positions: true                 # invariato
-  skip_trivial_endgame: true             # invariato (ma se vuoi più dati, metti false)
+  mate_range_max: 5
+  search_depth: 16
+  time_limit_seconds: 0.5
+  max_piece_count: null
+  min_material_for_mate_attempt: 3
+  only_decisive_games: true
+  skip_time_forfeit: true
+  ply_sample_step: 12
+  min_ply: 6
+  max_positions_per_game: 20
+  require_clock: true
+  drop_zero_clock: true
+  workers: null
+  checkpoint_every: 2000
+  pool_join_timeout: 20.0
+  min_rating: 1200
+  max_rating: null
+  min_material_diff_for_mate_attempt: 3
+  require_heavy_piece: false
+  skip_forced_moves: true
+  dedupe_positions: true
+  skip_trivial_endgame: true
 
 puzzle_pipeline:
   decompressed_csv_filename: "lichess_puzzles.csv"
@@ -75,42 +80,29 @@ puzzle_pipeline:
   max_puzzles_per_theme: 1000000
   min_rating: 600
   max_rating: null
-
-  # max_piece_count: a livello di singola posizione solver. null =
-  # nessun limite (allineato a games_pipeline.max_piece_count: null).
   max_piece_count: null
-
   min_material_for_mate_attempt: 0
   min_material_diff_for_mate_attempt: 0
-
   require_heavy_piece: false
-
-  # skip_trivial_endgame: true, stesso valore di games_pipeline.
   skip_trivial_endgame: true
-
-  # dedupe_positions: true, stesso valore di games_pipeline (qui la
-  # deduplica opera all'interno del singolo puzzle, non su tutta una
-  # partita lunga).
   dedupe_positions: true
+  clock_mode: "lognormal"
+  clock_condition_on_mate_n: true
+  clock_min_seconds: 0.5
+  clock_cap_seconds: 300.0
 
 splits:
   train_ratio: 0.80
   val_ratio: 0.10
   test_ratio: 0.10
 
-# -----------------------------------------------------------------------------
-# STEP 0 della pipeline di training (clean + reshard shard-by-shard)
-# Eseguito DOPO finalize_splits, in DatasetMain.py.
-# Legge gli shard prodotti da finalize_splits e li riscrive puliti in
-# cartelle dedicate (<split>_clean/) con la dimensione target indicata.
-# -----------------------------------------------------------------------------
 clean:
   enabled: true
-  input_dir_train:  "Dataset/Train/train"
-  input_dir_val:    "Dataset/Train/val"
-  input_dir_test:   "Dataset/Train/test"
+  input_dir_train: "Dataset/Train/train"
+  input_dir_val: "Dataset/Train/val"
+  input_dir_test: "Dataset/Train/test"
   output_dir_train: "Dataset/Train/train_clean"
-  output_dir_val:   "Dataset/Train/val_clean"
-  output_dir_test:  "Dataset/Train/test_clean"
+  output_dir_val: "Dataset/Train/val_clean"
+  output_dir_test: "Dataset/Train/test_clean"
   target_shard_size: 15000
   workers: 0

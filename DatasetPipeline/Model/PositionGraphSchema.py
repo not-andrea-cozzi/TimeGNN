@@ -1,39 +1,26 @@
 from __future__ import annotations
 
+import math
 from typing import Dict, List, Optional, Tuple
 
 import chess
 import torch
 from torch_geometric.data import Data
 
-# ============================================================================
-# VOCABOLARI FISSI
-# ============================================================================
-
 _PROMOTION_TYPES: Tuple[Optional[int], ...] = (None, chess.QUEEN, chess.ROOK, chess.BISHOP, chess.KNIGHT)
 _PROMOTION_OFFSET: Dict[Optional[int], int] = {pt: i for i, pt in enumerate(_PROMOTION_TYPES)}
-NUM_PROMOTION_SLOTS = len(_PROMOTION_TYPES)  # 5
+NUM_PROMOTION_SLOTS = len(_PROMOTION_TYPES)
 
-MOVE_VOCAB_SIZE = 64 * 64 * NUM_PROMOTION_SLOTS  # 20480: (from*64+to)*5 + promo_slot
+MOVE_VOCAB_SIZE = 64 * 64 * NUM_PROMOTION_SLOTS
 
-# event_ids: 0 = casella vuota, 1..12 = piece_type*2+color+1
 EVENT_ID_EMPTY = 0
-NUM_EVENT_ID_CATEGORIES = 15  # SE NO CRASHA, LASCIARE 15
+NUM_EVENT_ID_CATEGORIES = 15
 
 EDGE_LEGAL_MOVE = 0
 EDGE_ATTACK = 1
 EDGE_PIN = 2
 NUM_EDGE_TYPES = 3
 
-# NUM_EVENT_FEATURES: colonne di Data.x per nodo.
-# is_occupied_by_mover, is_occupied_by_opponent, clock_norm (feature di
-# timing esplicita per nodo, aggiunta oltre allo scalare costante gia'
-# presente su edge_attr/time: vedi build_position_data e _clock_norm
-# sotto). Questa costante e' duplicata in DatasetPipeline/Model/
-# ChessConstants.py, che e' la fonte canonica per il lato training: se
-# cambia di nuovo, va aggiornata in ENTRAMBI i posti (qui perche' e' la
-# definizione originaria legata alla codifica, li' perche' e' quello che
-# importano TrainMain/TrainBasic/TimeAware/EvaluateModels).
 NUM_EVENT_FEATURES = 3
 
 _PIECE_VALUES = {
@@ -46,25 +33,12 @@ _PIECE_VALUES = {
 
 
 def encode_move(move: "chess.Move") -> int:
-    """Codifica una mossa nel vocabolario globale fisso (0..20479).
-
-    [MODIFICATO] Include lo slot di promozione: due mosse con stesso
-    from/to ma promozione diversa (o nessuna) ricevono ora id distinti,
-    a differenza della versione precedente che le collassava (vedi
-    NUM_PROMOTION_SLOTS sopra). move.promotion e' None per le mosse non
-    di promozione e vale chess.QUEEN/ROOK/BISHOP/KNIGHT altrimenti.
-    """
     base = move.from_square * 64 + move.to_square
     promo_slot = _PROMOTION_OFFSET[move.promotion]
     return base * NUM_PROMOTION_SLOTS + promo_slot
 
 
 def decode_move(move_id: int) -> Tuple[int, int, Optional[int]]:
-    """Inversa di encode_move: ritorna (from_square, to_square, promotion).
-
-    Utile per debug/ispezione e per ricostruire una chess.Move da un id
-    predetto dal modello (chess.Move(from_square, to_square, promotion)).
-    """
     promo_slot = move_id % NUM_PROMOTION_SLOTS
     base = move_id // NUM_PROMOTION_SLOTS
     from_square = base // 64
@@ -73,29 +47,6 @@ def decode_move(move_id: int) -> Tuple[int, int, Optional[int]]:
 
 
 def build_legal_move_mask(board: "chess.Board") -> torch.Tensor:
-    """Costruisce la maschera booleana [1, MOVE_VOCAB_SIZE] delle mosse
-    legali sulla posizione data, con la stessa codifica di encode_move.
-
-    Usata a valle (fuori da questo modulo) per mascherare i logit del
-    modello prima di softmax/argmax: senza questa maschera il modello
-    valuta 20480 classi assolute anche quando solo poche decine sono
-    fisicamente giocabili, il che rende il problema di apprendimento
-    molto piu' difficile del necessario a parita' di dati.
-
-    NOTA SHAPE [1, MOVE_VOCAB_SIZE] (non [MOVE_VOCAB_SIZE]):
-    torch_geometric.data.Batch.from_data_list concatena per default lungo
-    dim=0 gli attributi non riconosciuti come node/edge-level. Un tensore
-    [MOVE_VOCAB_SIZE] per singolo grafo verrebbe quindi appiattito in un
-    unico vettore [batch_size*MOVE_VOCAB_SIZE] invece di uno stack
-    [batch_size, MOVE_VOCAB_SIZE]. Salvandolo con una dimensione fittizia
-    iniziale, la concatenazione lungo dim=0 produce direttamente la shape
-    corretta [batch_size, MOVE_VOCAB_SIZE] attesa dal masking dopo il
-    pooling per-grafo (vedi TrainPipeline/Training/Loop.py).
-
-    Returns:
-        torch.BoolTensor di shape [1, MOVE_VOCAB_SIZE], True sugli indici
-        delle mosse legali sulla board data (board.turn = lato al comando).
-    """
     mask = torch.zeros(1, MOVE_VOCAB_SIZE, dtype=torch.bool)
     for move in board.legal_moves:
         mask[0, encode_move(move)] = True
@@ -103,12 +54,6 @@ def build_legal_move_mask(board: "chess.Board") -> torch.Tensor:
 
 
 def encode_square_event_id(board: "chess.Board", square: int) -> int:
-    """Categoria pezzo+colore per una casella (0 = vuota, 1..12 = occupata).
-
-    L'ordine di codifica (piece_type*2+color+1) e' arbitrario ma fisso:
-    l'importante e' che sia deterministico e coerente in tutto il dataset,
-    dato che alimenta un nn.Embedding che impara pesi per ciascun indice.
-    """
     piece = board.piece_at(square)
     if piece is None:
         return EVENT_ID_EMPTY
@@ -117,15 +62,6 @@ def encode_square_event_id(board: "chess.Board", square: int) -> int:
 
 
 def _build_spatial_edges(board: "chess.Board") -> Tuple[List[int], List[int], List[int]]:
-    """Costruisce gli archi spaziali (mossa-legale/attacco/pin) tra caselle
-    per la board data, stessa logica del vecchio
-    GraphBuilder.board_to_pyg_data._build (qui isolata come funzione pura,
-    piu' facile da testare in isolamento).
-
-    Returns:
-        (edge_src, edge_dst, edge_type): liste parallele di indici casella
-        0-63 e tipo di relazione (EDGE_LEGAL_MOVE/ATTACK/PIN).
-    """
     edge_src: List[int] = []
     edge_dst: List[int] = []
     edge_type: List[int] = []
@@ -159,8 +95,6 @@ def _build_spatial_edges(board: "chess.Board") -> Tuple[List[int], List[int], Li
 
 
 def encode_edge_type_onehot(edge_type: List[int]) -> torch.Tensor:
-    """One-hot [E, NUM_EDGE_TYPES] per soddisfare il contratto edge_dim di
-    GATConv (vedi NOTA EDGE_ATTR_ENCODING nel docstring di modulo)."""
     if not edge_type:
         return torch.zeros((0, NUM_EDGE_TYPES), dtype=torch.float)
     t = torch.tensor(edge_type, dtype=torch.long)
@@ -168,19 +102,6 @@ def encode_edge_type_onehot(edge_type: List[int]) -> torch.Tensor:
 
 
 def _clock_norm(clock_seconds: float, cap_seconds: float = 600.0) -> float:
-    """Normalizzazione log-scale (preserva la differenza tra clock brevi
-    senza schiacciare tutto cio' che supera pochi minuti come farebbe una
-    scala lineare).
-
-    Usata in due punti di build_position_data: (1) come colonna
-    clock_norm in x, ripetuta identica sui 64 nodi della board (feature
-    di timing esplicita per nodo, oltre al valore costante su edge_attr/
-    time); (2) disponibile per normalizzare clock_seconds prima di
-    passarlo come `time` sugli edge, se in futuro serve un time scalato
-    invece del valore grezzo in secondi attualmente usato in
-    build_position_data.
-    """
-    import math
     denom = math.log1p(cap_seconds)
     if denom <= 0:
         return 0.0
@@ -196,67 +117,6 @@ def build_position_data(
     ply: int,
     mate_n: Optional[int] = None,
 ) -> Data:
-    """Assembla un torch_geometric.data.Data a grana di SINGOLA POSIZIONE
-    (64 nodi = caselle), pronto per DualGATModel e DualGATTimeAwareModel
-    senza alcuna modifica a quei modelli (a parte NUM_EVENT_FEATURES=3,
-    vedi nota sopra).
-
-    Args:
-        board: posizione corrente (board.turn = lato che deve muovere).
-        best_move: la mossa migliore per questa posizione (target).
-        clock_seconds: tempo (secondi) impiegato per arrivare a questa
-            mossa. Entra nel Data in due forme: (1) come `time`, scalare
-            costante ripetuto su tutti gli archi della board (consumato
-            da TimeAwareGATConv come fattore di decadimento uniforme,
-            non differenziale tra archi); (2) come colonna clock_norm
-            normalizzata (via _clock_norm) in `x`, ripetuta identica sui
-            64 nodi (feature di timing esplicita che il modello puo'
-            usare senza passare dal meccanismo di decadimento sugli
-            edge). Le due rappresentazioni coesistono deliberatamente:
-            la prima alimenta i modelli time-decay esistenti senza
-            modificarne la forward, la seconda da' al modello un canale
-            diretto sul valore di clock indipendentemente dall'architettura
-            di attenzione usata.
-        rating: rating (Elo) del giocatore di turno (mover) in questa
-            posizione. OBBLIGATORIO (mai None): il chiamante deve
-            risolvere un valore reale o di fallback prima di chiamare
-            questa funzione (vedi docstring di modulo, campo `rating`).
-        game_id: identificatore leggibile "{fonte}_{id_originale}" della
-            finestra/partita/puzzle di provenienza (es. "lichess_142",
-            "puzzle_00sHx"). Stringa, non un tensore.
-        ply: indice del ply all'interno della finestra (tracciamento).
-        mate_n: profondita' di matto REALE a QUESTA specifica posizione
-            (non il group_key di finestra: vedi NOTA POSITION_MATE_N sotto).
-            Se fornito, salvato come data.position_mate_n (uint8). Se None
-            (default, per non rompere chiamanti esistenti), il campo non
-            viene scritto sul Data.
-
-    Returns:
-        Data con event_ids/x/edge_index/edge_attr/time/y/legal_move_mask/
-        rating/game_id/ply/[position_mate_n] come da docstring di modulo.
-        x ha ora shape [64, NUM_EVENT_FEATURES] con NUM_EVENT_FEATURES=3
-        (le prime due colonne come prima, la terza e' clock_norm).
-
-    Raises:
-        ValueError: se best_move non e' una mossa legale su board (il
-            target deve sempre essere verificabile sulla posizione data),
-            o se mate_n e' fornito ma fuori dal dominio uint8 [0,255].
-
-    NOTA POSITION_MATE_N (da non confondere con il "mate_n" scritto da
-    DatasetPipeline.Utils.position_compression.compress_position_data):
-    quest'ultimo e' il group_key di FINESTRA (costante per tutte le
-    posizioni di uno stesso game_id, usato per lo split stratificato in
-    PositionQueueRegistry.build_splits), passato come parametro separato
-    a compress_position_data, non letto da un attributo del Data.
-    position_mate_n invece e' la profondita' di matto REALE alla
-    posizione specifica: in un puzzle mateIn4, la prima mossa-solver ha
-    position_mate_n=4, l'ultima ha position_mate_n=1 (vedi
-    PuzzleBuilder.current_mate_n). Sono due numeri diversi per la stessa
-    posizione tranne che sulla prima mossa della finestra, dove
-    coincidono. Il nome distinto evita di sovrascrivere per errore il
-    group_key di finestra quando build_splits legge item.data per
-    determinare i bucket di stratificazione.
-    """
     if best_move not in board.legal_moves:
         raise ValueError(
             f"build_position_data: best_move={best_move.uci()} non e' legale "
@@ -285,16 +145,14 @@ def build_position_data(
     if not edge_src:
         raise ValueError(
             f"build_position_data: nessun arco spaziale prodotto per la "
-            f"posizione (fen={board.fen()}); una posizione con mate_n "
-            f"valido non dovrebbe mai essere priva di mosse legali per il "
-            f"lato al comando (sarebbe gia' scacco matto/stallo)."
+            f"posizione (fen={board.fen()})."
         )
 
     edge_index = torch.tensor([edge_src, edge_dst], dtype=torch.long)
     edge_attr = encode_edge_type_onehot(edge_type_list)
 
     num_edges = edge_index.shape[1]
-    time_tensor = torch.full((num_edges,), float(clock_seconds), dtype=torch.float)
+    time_tensor = torch.full((num_edges,), float(clock_feature), dtype=torch.float)
 
     y = torch.tensor(encode_move(best_move), dtype=torch.long)
     legal_move_mask = build_legal_move_mask(board)

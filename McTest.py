@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Sequence
 
 import numpy as np
+import torch
 from scipy.stats import binomtest, chi2
 
 
@@ -17,6 +19,7 @@ class AlignedResults:
     correct_b: np.ndarray
     mate_n: np.ndarray
     n_positions: int
+
 
 def align_model_results(
     res_a: Dict[str, Any],
@@ -72,6 +75,18 @@ def align_model_results(
         mate_n=mate_n_a,
         n_positions=n,
     )
+
+
+def align_gnn_llm_results(
+    res_gnn: Dict[str, Any],
+    res_llm: Dict[str, Any],
+    *,
+    strict: bool = True,
+) -> AlignedResults:
+    return align_model_results(
+        res_gnn, res_llm, strict=strict, name_a="GNN", name_b="LLM"
+    )
+
 
 def run_mcnemar(
     res_a: Dict[str, Any],
@@ -252,30 +267,122 @@ def run_mcnemar_gnn_vs_llm(
 ) -> List[McNemarResult]:
     aligned = align_gnn_llm_results(res_gnn, res_llm, strict=strict)
     return mcnemar_stratified_by_mate_n(
-        aligned.correct_gnn, aligned.correct_llm, aligned.mate_n,
+        aligned.correct_a, aligned.correct_b, aligned.mate_n,
         exact_threshold=exact_threshold, include_pooled=include_pooled,
     )
 
 
-HOLDOUT_DIR = "Dataset/ExternalHoldout/holdout_clean"
+# ----------------------------------------------------------------------
+# Caricamento risultati reali (sostituisce i dati simulati precedenti)
+# ----------------------------------------------------------------------
+
+DEFAULT_EVALUATION_RESULTS_PKL = "Result/Heldout/metrics/evaluation_results.pkl"
+DEFAULT_LLM_RESULTS_PKL = "Dataset/Test_LLM/metrics/llm_results.pkl"
+DEFAULT_MCNEMAR_OUT_DIR = "Result/McNemar"
+
+
+def _load_pickle(path: str) -> Dict[str, Any]:
+    if not os.path.exists(path):
+        raise FileNotFoundError(
+            f"File di risultati non trovato: '{path}'. Esegui prima lo script "
+            f"che lo produce (EvaluateModels.py per i modelli GNN, EvaluateLLM.py per l'LLM)."
+        )
+    return torch.load(path, weights_only=False)
+
+
+def load_gnn_results(path: str) -> Dict[str, Dict[str, Any]]:
+    """Carica {'timed': res_time_aware, 'untimed': res_basic} salvato da
+    EvaluateModels.py (torch.save su results_file). 'timed' puo' essere
+    None se la valutazione time_aware e' stata saltata a monte."""
+    payload = _load_pickle(path)
+    for key in ("timed", "untimed"):
+        if key not in payload:
+            raise KeyError(f"'{path}' non contiene la chiave '{key}' attesa da EvaluateModels.py.")
+    return payload
+
+
+def load_llm_results(path: str) -> Dict[str, Any]:
+    """Carica il dict di risultati LLM. Richiede che EvaluateLLM.py sia
+    stato esteso per salvare 'res' (move_correct, mate_n, ...) qui,
+    oltre al solo CSV per-n che produceva in precedenza."""
+    return _load_pickle(path)
+
+
+def main() -> None:
+    import argparse
+
+    parser = argparse.ArgumentParser(
+        description="Test di McNemar tra modelli GNN (basic/time_aware) e/o LLM, "
+                     "a partire dai pickle di risultati prodotti da EvaluateModels.py/EvaluateLLM.py."
+    )
+    parser.add_argument("--gnn-results", default=DEFAULT_EVALUATION_RESULTS_PKL,
+                         help="Path a evaluation_results.pkl (deve combaciare con 'metrics_dir' di evaluate_models.yaml).")
+    parser.add_argument("--llm-results", default=DEFAULT_LLM_RESULTS_PKL,
+                         help="Path a llm_results.pkl (deve combaciare con 'out_dir' di evaluate_llm.yaml).")
+    parser.add_argument("--out-dir", default=DEFAULT_MCNEMAR_OUT_DIR)
+    parser.add_argument("--skip-llm", action="store_true", help="Salta il confronto con l'LLM anche se il pickle esiste.")
+    args = parser.parse_args()
+
+    os.makedirs(args.out_dir, exist_ok=True)
+
+    gnn_results = load_gnn_results(args.gnn_results)
+    res_basic = gnn_results["untimed"]
+    res_time = gnn_results.get("timed")
+
+    print(f"[McTest] Caricati risultati GNN da '{args.gnn_results}': "
+          f"basic n={len(res_basic['move_correct'])}, "
+          f"time_aware {'n=' + str(len(res_time['move_correct'])) if res_time is not None else 'ASSENTE'}.")
+
+    all_rows: List[Dict] = []
+
+    if res_time is not None:
+        print("\n=== McNemar: TimeAware vs Basic ===")
+        results_tvb = run_mcnemar(
+            res_time, res_basic, strict=False, name_a="TimeAware", name_b="Basic"
+        )
+        print_report(results_tvb)
+        for row in results_to_rows(results_tvb):
+            row["comparison"] = "time_aware_vs_basic"
+            all_rows.append(row)
+    else:
+        print("\n[McTest] Modello time_aware non disponibile: confronto TimeAware vs Basic saltato.")
+
+    try:
+        if args.skip_llm:
+            raise FileNotFoundError("--skip-llm richiesto esplicitamente")
+        llm_results = load_llm_results(args.llm_results)
+        print(f"\n[McTest] Caricati risultati LLM da '{args.llm_results}': n={len(llm_results['move_correct'])}.")
+
+        print("\n=== McNemar: Basic (GNN) vs LLM ===")
+        results_basic_vs_llm = run_mcnemar_gnn_vs_llm(res_basic, llm_results, strict=False)
+        print_report(results_basic_vs_llm)
+        for row in results_to_rows(results_basic_vs_llm):
+            row["comparison"] = "basic_vs_llm"
+            all_rows.append(row)
+
+        if res_time is not None:
+            print("\n=== McNemar: TimeAware (GNN) vs LLM ===")
+            results_time_vs_llm = run_mcnemar_gnn_vs_llm(res_time, llm_results, strict=False)
+            print_report(results_time_vs_llm)
+            for row in results_to_rows(results_time_vs_llm):
+                row["comparison"] = "time_aware_vs_llm"
+                all_rows.append(row)
+
+    except FileNotFoundError as e:
+        print(f"\n[McTest] Confronto con LLM saltato: {e}")
+
+    if all_rows:
+        import csv
+        out_csv = os.path.join(args.out_dir, "mcnemar_results.csv")
+        fieldnames = list(all_rows[0].keys())
+        with open(out_csv, "w", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(f, fieldnames=fieldnames)
+            writer.writeheader()
+            writer.writerows(all_rows)
+        print(f"\n[McTest] Risultati salvati in '{out_csv}'.")
+    else:
+        print("\n[McTest] Nessun confronto eseguito: nessun risultato da salvare.")
 
 
 if __name__ == "__main__":
-    print(f"[mcnemar_eval] holdout di riferimento: {HOLDOUT_DIR}")
-
-    rng = np.random.default_rng(1)
-    n = 200
-    mate_n_demo = rng.integers(1, 6, size=n)
-    
-    # Simulazione dei risultati estratti dai due modelli
-    res_time_aware = {"move_correct": rng.random(n) < (0.9 - 0.1 * mate_n_demo), "mate_n": mate_n_demo}
-    res_basic = {"move_correct": rng.random(n) < (0.6 + 0.05 * mate_n_demo), "mate_n": mate_n_demo}
-
-    print("\nEsecuzione test McNemar: TimeAware vs Basic")
-    results_demo = run_mcnemar(
-        res_time_aware, 
-        res_basic, 
-        name_a="TimeAware", 
-        name_b="Basic"
-    )
-    print_report(results_demo)
+    main()

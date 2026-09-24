@@ -1,5 +1,5 @@
 evaluation:
-  test_dir: "Dataset/ExternalHoldout/holdout_clean"      # cartella shardata, non più un file .pt
+  test_dir: "Dataset/ExternalHoldout/holdout_clean"
   checkpoint_basic: "Dataset/Train/checkpoints/basic_best.pt"
   checkpoint_time: "Dataset/Train/checkpoints/time_aware_best.pt"
   plots_dir: "Result/Heldout/plots"
@@ -21,5 +21,5 @@ model_params:
   dropout: 0.0
   use_batch_norm: false
   activation: "elu"
-  norm_kind: "graph_norm"   # deve combaciare col norm_kind usato in training
-  lambda_decay: 0.01
+  norm_kind: "layer_norm"
+  lambda_decay: 2.0
